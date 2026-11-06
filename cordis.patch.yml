@@ -1,0 +1,18 @@
+# 把本插件插入 DSH 的插件树。
+#
+# 安装后可用 `dsh --profile web --dump-config | grep dsh-plugin-lrc` 确认它真的进了树。
+- insert:
+    - id: dsh-plugin-lrc
+      name: dsh-plugin-lrc
+      # 留空 = 自动探测已有 LRC，没有就下载并启动隔离实例
+      baseUrl: ''
+      # 服务端设置了 LRC_API_TOKEN 时填这里
+      token: ''
+      # 记忆归属项目
+      project: dsh
+      # 每 8 轮卸载一次
+      offloadTurns: 8
+      # 或累计 6000 字符卸载一次
+      offloadChars: 6000
+      # 单次最多提炼条数
+      maxItems: 40

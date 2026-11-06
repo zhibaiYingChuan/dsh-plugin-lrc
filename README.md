@@ -3,7 +3,8 @@
 把 [LRC](https://github.com/zhibaiYingChuan/LRC) 内置进 DeepSeek Harness（DSH），
 让对话**边聊边卸载**成长期记忆 —— 上下文不再需要压缩。
 
-> **状态：计划阶段。** 开发计划见 [docs/PLAN.md](docs/PLAN.md)。
+> **状态：M1–M3 已实现，三条硬性验收标准全绿。** 开发计划见 [docs/PLAN.md](docs/PLAN.md)，
+> 配置手册见 [docs/USER-GUIDE.md](docs/USER-GUIDE.md)。
 
 ## 它解决什么
 
