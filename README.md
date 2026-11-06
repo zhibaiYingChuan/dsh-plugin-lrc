@@ -1,30 +1,46 @@
 # dsh-plugin-lrc
 
-把 [LRC](https://github.com/zhibaiYingChuan/LRC) 的结构化记忆接进 DeepSeek Harness（DSH）的上下文压缩流程。
+把 [LRC](https://github.com/zhibaiYingChuan/LRC) 内置进 DeepSeek Harness（DSH），
+让对话**边聊边卸载**成长期记忆 —— 上下文不再需要压缩。
 
 > **状态：计划阶段。** 开发计划见 [docs/PLAN.md](docs/PLAN.md)。
 
 ## 它解决什么
 
-DSH 压缩上下文时，原生摘要会丢掉关键约束：
+DSH 的上下文会一直涨，涨到阈值就压缩，压缩就丢约束：
 
 ```
-原生摘要：  "前面聊了包管理器。"
-LRC 快照：  "已确定用 pnpm（放弃 npm 因兼容问题）。相关决策已归档至 LRC。"
+压缩前：  40 轮对话，其中 3 条关键决策
+压缩后：  "前面聊了包管理器。"        ← 决策没了
 ```
 
-本插件在压缩发生时，先把这段对话提炼成结构化记忆（决策 / 约束 / 结论 / 报错日志）
-写入 LRC，再把 LRC 的状态快照拼到摘要最前面。
+本插件的做法不是"压缩时抢救"，而是**根本不让它涨到需要压缩**：
 
-## 为什么能接管
+```
+对话（线性、易失）
+   ↓ 每 8 轮增量提炼
+结构化记忆（决策 / 约束 / 结论 / 报错）
+   ↓ 语义查重后写入
+LRC 长期记忆库（持久、可检索）
+   ↓ 回填一行状态快照
+上下文（始终很小）
+```
 
-DSH 的 `BasicCompactionEngine` 留了一个官方子类钩子：
+AI 看到的不再是几十轮原文，而是：
 
-> `summarize()` is the sole subclass customization hook; the replay and durable
-> mutation strategy stays fixed so every pricing decision uses the singleton token meter.
+```
+[LRC 状态] 已确定用 pnpm（放弃 npm 因兼容问题）；端口纪律 3099/3111。
+           细节在 LRC，需要时 recall。
+```
 
-所以本插件**只重写 `summarize()`**，不碰锁协议、不碰表层替换、不碰计价 ——
-那些是官方契约，改了就破坏回放确定性。
+## 插件内置 LRC
+
+不需要你先装 LRC。插件启动时：
+
+1. 探测本地已有 LRC（环境变量 / 3099 端口）→ 有就直接用
+2. 没有 → 检查内置二进制，缺失则按平台下载
+3. 启动**隔离实例**（独立数据目录，不碰你的生产记忆库）
+4. 失败 → 降级为纯客户端模式，静默跳过卸载
 
 ## 三条硬性验收标准
 
@@ -32,9 +48,16 @@ DSH 的 `BasicCompactionEngine` 留了一个官方子类钩子：
 |---|---|---|
 | 1 | 增量游标 | 第 2、3 次送进 distill 的字符数 < 第 1 次的 50% |
 | 2 | 语义查重 | 重复 migrate 3 次，库内总数不增长 |
-| 3 | 不线性膨胀 | 3 次压缩后总数 ≤ 首次的 1.2 倍，去重率 ≥ 80% |
+| 3 | 不线性膨胀 | 3 次卸载后总数 ≤ 首次的 1.2 倍，去重率 ≥ 80% |
 
 详见 [docs/PLAN.md §4](docs/PLAN.md)。
+
+## 诚实说明
+
+上下文仍会增长（用户消息、工具输出）。插件做的是把**结论性内容**持续搬走，
+让增速降到原来的 1/5 ~ 1/10，压缩**很少触发**；即使触发，摘要也是 LRC 状态快照。
+
+**不承诺"永不压缩"**，承诺"压缩频率大幅下降 + 压缩质量大幅提升"。
 
 ## 安装（M1 完成后可用）
 
@@ -47,10 +70,11 @@ dsh --profile web --dump-config | grep dsh-plugin-lrc
 
 | 环境变量 | 缺省 | 说明 |
 |---|---|---|
-| `LRC_BASE` | `http://127.0.0.1:3099` | LRC 服务地址 |
+| `LRC_BASE` | 空 | 指向已有 LRC 实例；留空则自动探测/启动 |
 | `LRC_TOKEN` | 空 | 服务端设了 `LRC_API_TOKEN` 时必填 |
 | `LRC_PROJECT` | `dsh` | 记忆归属项目 |
-| `LRC_MAX_ITEMS` | `40` | 单次迁移最多条数 |
+| `LRC_OFFLOAD_TURNS` | `8` | 每多少轮卸载一次 |
+| `LRC_OFFLOAD_CHARS` | `6000` | 累计多少字符卸载一次 |
 
 ## 许可
 

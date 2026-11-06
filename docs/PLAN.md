@@ -1,128 +1,136 @@
 # LRC × DSH 插件 · 开发计划
 
-> 版本：v0.1（2026-11-06）
+> 版本：v0.2（2026-11-06，架构修正）
 > 状态：**计划阶段**，未开始编码
 > 仓库：`zhibaiYingChuan/dsh-plugin-lrc`（独立于 LRC 主仓）
-> 目标：把 LRC 从"外部 Hook 旁路"升级为"DSH 内部上下文引擎"
+> 目标：**让 DSH 的上下文不再需要压缩** —— 对话边聊边卸载进 LRC 长期记忆
 
 ---
 
-## 一、定位
+## 〇、v0.1 → v0.2 的架构修正
 
-### 1.1 一句话
+v0.1 把插件设计成"压缩时调外部 LRC 服务"的薄客户端。**这是错的**：
 
-**用 LRC 的结构化记忆，替换 DSH 压缩时那句干瘪的摘要。**
+| 维度 | v0.1（错） | v0.2（对） |
+|---|---|---|
+| LRC 在哪 | 外部服务，用户自己装 | **插件内置**，随插件启动 |
+| 何时迁移 | 只在压缩触发时 | **持续卸载**，每轮/每 N 轮 |
+| 上下文 | 还是会涨，只是压缩时抢救 | **始终很小**，因为一直在往外搬 |
+| 压缩的角色 | 主路径 | **兜底**（万一还是涨到阈值） |
 
-DSH 原生压缩产出的是"前面聊了包管理器"这种摘要；LRC 要产出的是
-"已确定用 pnpm（放弃 npm 因兼容问题），相关决策已归档至 LRC"这种**状态快照**。
-
-### 1.2 与 LRC 主仓的关系
-
-| 项 | 说明 |
-|---|---|
-| 代码 | 完全独立仓库，不依赖 LRC 主仓源码 |
-| 依赖 | 只依赖 LRC 的 HTTP 接口（`/v1/context/*`、`/v1/memories/*`） |
-| 版本 | 独立发版，与 LRC 主仓解耦 |
-| 上架 | 目标上架 DSH 官方插件库 |
-
-### 1.3 不做的事
-
-- 不改 DSH 源码
-- 不碰 `compaction/start` / `compaction/end` 的锁协议
-- 不重写 `compactIfNeeded` / `compactNow` / `compactRegion`（见 §3.2）
+一句话：**不是"压缩时抢救"，是"根本不让它涨到需要压缩"。**
 
 ---
 
-## 二、为什么能接管（官方扩展点，不是黑）
+## 一、核心思路
 
-DSH 的压缩子系统把"做什么"和"怎么做"拆开了：
+### 1.1 线性纪要 → 长期记忆
 
 ```
-CompactionEngine（抽象契约）
-  ├─ compactIfNeeded   自动触发（pressure / context-overflow）
-  ├─ compactNow        按需触发（/compact）
-  └─ compactRegion     显式范围
-        ↓ 由 BasicCompactionEngine 实现
-        └─ summarize()   ← 唯一的子类钩子
+对话（线性、易失）
+   ↓ 每轮增量提炼
+结构化记忆（决策 / 约束 / 结论 / 报错）
+   ↓ 语义查重后写入
+LRC 长期记忆库（持久、可检索）
+   ↓ 回填一行状态快照
+上下文（始终很小）
 ```
 
-官方注释原文：
+**关键**：搬走的是"结论"，留下的是"索引"。
+AI 看到的不再是几十轮原文，而是：
 
-> `summarize()` is the sole subclass customization hook; the replay and durable
-> mutation strategy stays fixed so every pricing decision uses the singleton token meter.
+```
+[LRC 状态] 已确定用 pnpm（放弃 npm 因兼容问题）；端口纪律 3099/3111；
+           迁移分块 20 条 + 10s 预算。细节在 LRC，需要时 recall。
+```
 
-也就是说：**选范围、写锁标记、替换表层、计价**全部固定在 `compactSurfaceRegion` 里，
-子类只该改**摘要内容**。第三方插件（`dsh-compact-tuner` 等）改的是 Config 里的阈值，
-LRC 改的是摘要内容本身 —— 两者都在规则内。
+### 1.2 诚实说明：压缩不会"消失"，只会"变少变便宜"
+
+严格说，上下文仍会增长（用户消息、工具输出）。插件做的是：
+
+- 把**结论性内容**持续搬走，让上下文增速降到原来的 1/5 ~ 1/10
+- 让 DSH 的压缩**很少触发**；即使触发，摘要也是 LRC 状态快照而非干瘪概括
+
+**不承诺"永不压缩"**，承诺"压缩频率大幅下降 + 压缩质量大幅提升"。
 
 ---
 
-## 三、架构设计
+## 二、插件内置 LRC
 
-### 3.1 组件
+### 2.1 为什么必须内置
+
+用户不该为了用插件先装一个 LRC 桌面端。插件要开箱即用。
+
+### 2.2 运行时管理（`src/runtime.ts`）
 
 ```
-dsh-plugin-lrc/
-├── src/
-│   ├── index.ts              # 插件入口：注册工具 + 挂压缩后端
-│   ├── lrc-client.ts         # LRC HTTP 客户端（distill / migrate / index / lifecycle）
-│   ├── compaction-backend.ts # LrcCompactionEngine extends BasicCompactionEngine
-│   ├── cursor.ts             # 增量游标（只提炼新增对话）
-│   └── dedup.ts              # 语义查重与版本合并
-├── scripts/
-│   ├── smoke.ts              # 客户端冒烟（mock，不依赖真实 LRC）
-│   └── e2e-compact.ts        # 三次压缩不膨胀的验收脚本
-├── docs/
-│   ├── PLAN.md               # 本文件
-│   └── ACCEPTANCE.md         # 硬性验收标准与实测记录
-├── package.json
-├── cordis.patch.yml
-└── README.md
+启动插件
+  ↓
+① 探测本地 LRC
+   ├─ 环境变量 LRC_BASE 指向的服务可用？ → 直接用（用户已有实例）
+   ├─ 3099 端口有 LRC？ → 直接用
+   └─ 都没有 → 进入 ②
+  ↓
+② 检查内置二进制
+   $DSH_HOME/cache/lrc-plugin/bin/lrc-sidecar-<platform>-<arch>[.exe]
+   ├─ 存在且可执行 → 进入 ③
+   └─ 不存在 → 下载（见 2.3）
+  ↓
+③ 启动隔离实例
+   lrc-sidecar --port <随机空闲端口> --data-dir $DSH_HOME/cache/lrc-plugin/data
+  ↓
+④ 健康检查（/health，最多等 15s）
+   ├─ 成功 → 记录 baseUrl，插件就绪
+   └─ 失败 → 降级为"纯客户端模式"（只调外部 LRC，没有就静默跳过）
 ```
 
-### 3.2 关键决策：不重写 `compactIfNeeded`
+**数据隔离**：插件自己的实例用独立数据目录，**不碰**用户 `~/.loong-recall/global/data`。
+避免插件把测试数据写进用户的生产记忆库。
 
-**需求原文**要求"拦截 `compactIfNeeded`"。技术上不需要，也不该这么做：
+### 2.3 二进制分发策略（待定，见 §9 决策点）
 
-| 做法 | 后果 |
+| 方案 | 包体积 | 体验 | 风险 |
+|---|---|---|---|
+| A. 随 npm 包分发全平台二进制 | ~300MB+ | 开箱即用 | npm 安装慢；包体积劝退 |
+| B. 首次运行按平台下载 | ~1MB | 首次需联网 | 需要托管地址；离线不可用 |
+| C. 只支持"用户已装 LRC" | ~1MB | 需先装 LRC | 与"内置"目标冲突 |
+
+**倾向 B**：包小、体验可接受；下载失败时降级为 C（提示用户装 LRC）。
+
+---
+
+## 三、持续卸载（核心机制）
+
+### 3.1 触发时机
+
+DSH 的 `BasicCompactionEngine` 用 `ctx.on('agent/pre-step', ...)` 做压力检查。
+插件用同一套事件做**增量卸载**：
+
+| 事件 | 用途 |
 |---|---|
-| 重写 `compactIfNeeded` | 要自己实现选范围、写 `compaction/start` 锁、替换表层、计价 —— 任何一处偏差都会破坏**回放确定性**（DSH 靠日志重放重建会话） |
-| 只重写 `summarize()` + 调 Config | 官方保证的路径，锁与回放由框架负责 |
+| `session/event`（`assistant/message`） | 累计本轮新增文本 |
+| `agent/pre-step` | 若累计超过阈值（默认 8 轮或 6000 字符），执行一次卸载 |
+| `agent/status`（`idle`） | 会话空闲时补一次卸载，避免残留 |
 
-**等价效果怎么拿到**：
+### 3.2 卸载流程
 
-| 想要的效果 | 官方给的开关 |
+```
+① 增量游标：取上次之后的新增对话
+② POST /v1/context/distill   → 结构化记忆
+③ POST /v1/context/migrate   → 语义查重后写入（dedup）
+④ 生成状态快照（一行索引）
+⑤ 把快照注入下一轮上下文（通过 agent/pre-step 的附加上下文能力）
+```
+
+### 3.3 与压缩的关系
+
+| 场景 | 行为 |
 |---|---|
-| 提前触发（20% 而不是 80%） | `Config.thresholdRatio` |
-| 压缩后保留最近 20% 原文 | `Config.retainRatio` |
-| 预留输出 token | `Config.headroomTokens` |
-| 用哪个模型写摘要 | `Config.summarizationProvider` / `summarizationModel` |
-| 重试次数 | `Config.compactionRetries` / `maxOverflowRetries` |
+| 正常对话 | 持续卸载，上下文增速降到 1/5~1/10 |
+| 仍触发压缩 | `summarize()` 被重写：先卸载，再返回"LRC 状态快照 + 模型摘要" |
+| LRC 不可用 | 静默跳过卸载，压缩退回官方行为 |
 
-所以"调参"和"换内容"是两件正交的事，各用各的开关。
-
-### 3.3 数据流
-
-```
-DSH 触发压缩
-   ↓
-BasicCompactionEngine 选出待压缩区间
-   ↓
-LrcCompactionEngine.summarize(input, agent, signal)
-   ├─ ① 从 input.messages 抽纯文本
-   ├─ ② 增量游标：只取上次之后的新增部分
-   ├─ ③ POST /v1/context/distill   → 结构化记忆（决策/约束/结论/报错）
-   ├─ ④ POST /v1/context/migrate   → 语义查重后写入（update / superseded / insert）
-   ├─ ⑤ 调 super.summarize()       → 模型摘要（保留原有质量）
-   └─ ⑥ 把 LRC 状态快照拼到摘要最前面
-   ↓
-DSH 用我们的摘要替换旧区间
-```
-
-**为什么还要调 `super.summarize()`**：LRC 的提炼是规则式的，能抓决策与约束，
-但抓不住"当前正在做什么"。模型摘要补这一块。两者拼起来才是完整的状态快照。
-
-**失败策略**：LRC 不可达 → 记 `warn`，返回模型原始摘要，**不阻断压缩**。
+**压缩后端仍然要重写 `summarize()`** —— 它是兜底，不是主路径。
 
 ---
 
@@ -132,48 +140,32 @@ DSH 用我们的摘要替换旧区间
 
 ### 标准 1：增量游标 —— 只提炼新增对话
 
-**问题**：每次压缩都把整段 transcript 重新提炼一遍，同一句话被反复写入。
-
-**设计**：
-
 ```ts
 interface CursorState {
   sessionId: string;
   lastLine: number;      // 已处理到第几行
-  lastHash: string;      // 该行内容的哈希（校验 transcript 是否被重写）
+  lastHash: string;      // 该行内容哈希（校验 transcript 是否被重写）
   updatedAt: number;
 }
 ```
 
-- 存储位置：`$DSH_HOME/cache/lrc-plugin/cursor.json`
-- 每次 `summarize()` 前读游标，只取 `lines[lastLine..]`
-- **哈希校验**：若 `lines[lastLine-1]` 的哈希与记录不符（transcript 被截断/重写），
-  游标失效，退回全量提炼并记 `warn`
-- 压缩成功后推进游标
+- 存储：`$DSH_HOME/cache/lrc-plugin/cursor.json`
+- 哈希不匹配（transcript 被截断/重写）→ 游标失效，退回全量并记 `warn`
+- 卸载成功后推进游标
 
-**验收**：连续 3 次压缩，第 2、3 次送进 `distill` 的字符数应显著小于第 1 次
-（预期 < 50%），且 `distill` 返回的 `count` 递减。
+**验收**：连续 3 次卸载，第 2、3 次送进 `distill` 的字符数 < 第 1 次的 50%。
 
 ### 标准 2：migrate 必须语义查重，绝不盲目 insert
 
-**问题**：`migrate` 目前走 `prepare_remember` 的相似度合并，但**没有显式阈值**，
-也没有"被取代"语义 —— 同一决策的旧版本会和新版本并存。
-
-**设计**：给 `migrate` 增加 `dedup` 参数（默认开启）：
+`migrate` 增加 `dedup` 参数（默认开启）：
 
 ```json
 {
   "items": [...],
-  "project": "demo",
-  "dedup": {
-    "enabled": true,
-    "similarityThreshold": 0.85,
-    "onConflict": "supersede"   // supersede | merge | skip
-  }
+  "project": "dsh",
+  "dedup": { "enabled": true, "similarityThreshold": 0.85, "onConflict": "supersede" }
 }
 ```
-
-三种冲突处理：
 
 | 策略 | 行为 | 何时用 |
 |---|---|---|
@@ -181,46 +173,50 @@ interface CursorState {
 | `supersede` | 新记忆写入，旧记忆打 `mark_superseded` | 决策被推翻（"改用 npm" → "改回 pnpm"） |
 | `skip` | 丢弃新记忆 | 完全重复 |
 
-**依赖**：LRC 侧需要
-1. `migrate` 支持 `dedup` 参数并返回 `{written, merged, superseded, skipped}`
-2. 复用既有 `/v1/memories/lifecycle` 的 `mark_superseded`
-
 **验收**：同一批 items 连续 migrate 3 次，库内总数不增长；
-`merged + superseded + skipped` 应等于第 2、3 次的 `items.length`。
+`merged + superseded + skipped` 等于第 2、3 次的 `items.length`。
 
-### 标准 3：三次压缩不线性膨胀
+### 标准 3：三次卸载不线性膨胀
 
-**验收脚本** `scripts/e2e-compact.ts`：
+`scripts/e2e-compact.ts`：
 
 ```
 1. 起 mock LRC（记录所有写入）
-2. 构造 3 段递进的对话（第 2、3 段包含第 1 段结论的复述）
-3. 依次触发 3 次 summarize()
+2. 构造 3 段递进对话（第 2、3 段复述第 1 段结论）
+3. 依次触发 3 次卸载
 4. 断言：
    - 第 1 次：written = N1
-   - 第 2 次：written + merged + superseded + skipped = N2，且库内总数 = N1
-   - 第 3 次：同上，库内总数仍 = N1
+   - 第 2、3 次：库内总数仍 = N1
    - 去重率 = (N2 + N3 - 新增) / (N2 + N3) ≥ 80%
 ```
 
-**通过标准**：3 次压缩后库内总数 **≤ 第 1 次的 1.2 倍**（允许少量真实新增）。
+**通过标准**：3 次卸载后库内总数 **≤ 第 1 次的 1.2 倍**。
 
 ---
 
-## 五、Phase 协议（探索项，M3）
+## 五、组件结构
 
-**想法**：不在对话中途硬压，而是在任务阶段结束时主动"接力"。
-
-**待调研**（M3 第一件事）：
-
-1. DSH 是否有 phase / stage 概念？事件名是什么？
-2. 能否在 phase 边界主动触发 `compactNow()`？
-3. 能否在压缩后注入"下一阶段的前置条件"？
-
-**如果 DSH 没有 phase 协议**：降级为"按 token 阈值 + 任务关键词"启发式触发，
-并在 README 里明确说明这是启发式，不是官方协议。
-
-> 这一项**不阻塞** M1/M2。先做能确定的部分。
+```
+dsh-plugin-lrc/
+├── src/
+│   ├── index.ts              # 插件入口：注册工具 + 挂卸载器 + 挂压缩后端
+│   ├── runtime.ts            # LRC 运行时管理（探测/下载/启动/健康检查）
+│   ├── lrc-client.ts         # HTTP 客户端（distill / migrate / index / lifecycle）
+│   ├── offloader.ts          # 持续卸载器（事件订阅 + 阈值 + 快照注入）
+│   ├── cursor.ts             # 增量游标
+│   ├── dedup.ts              # 语义查重与版本合并
+│   └── compaction-backend.ts # LrcCompactionEngine（兜底）
+├── scripts/
+│   ├── smoke.ts              # 客户端冒烟（mock）
+│   ├── e2e-offload.ts        # 三次卸载不膨胀
+│   └── e2e-runtime.ts        # 运行时管理（探测/启动/降级）
+├── docs/
+│   ├── PLAN.md               # 本文件
+│   └── ACCEPTANCE.md         # 硬性验收标准与实测记录
+├── package.json
+├── cordis.patch.yml
+└── README.md
+```
 
 ---
 
@@ -228,13 +224,14 @@ interface CursorState {
 
 | 阶段 | 内容 | 交付物 | 验收 |
 |---|---|---|---|
-| **M0** | 仓库与计划 | 本文件 + README + package.json | 仓库可 clone，`npm run smoke` 可跑 |
-| **M1** | 客户端 + 压缩后端 | `lrc-client.ts` / `compaction-backend.ts` | 冒烟 11 项通过；DSH 里 `/compact` 后记忆数增加 |
-| **M2** | 去重三件套 | `cursor.ts` / `dedup.ts` / `e2e-compact.ts` | **§4 三条硬性标准全过** |
-| **M3** | Phase 接力 | 调研报告 + 实现（若可行） | 阶段切换时自动归档并注入前置条件 |
-| **M4** | 上架 | 发布包 + 文档 | 进入 DSH 官方插件库 |
+| **M0** | 仓库与计划 | 本文件 + README + package.json | 仓库可 clone |
+| **M1** | 运行时 + 客户端 | `runtime.ts` / `lrc-client.ts` | 能探测/启动/降级；冒烟 11 项通过 |
+| **M2** | 持续卸载 | `offloader.ts` / `cursor.ts` | 对话中上下文增速显著下降；快照正确注入 |
+| **M3** | 去重三件套 | `dedup.ts` / `e2e-offload.ts` | **§4 三条硬性标准全过** |
+| **M4** | 压缩兜底 | `compaction-backend.ts` | 压缩时摘要含 `[LRC 状态]` |
+| **M5** | 上架 | 发布包 + 文档 | 进入 DSH 官方插件库 |
 
-**M2 是硬门槛**：三条标准不过，不进入 M3/M4。
+**M3 是硬门槛**：三条标准不过，不进入 M4/M5。
 
 ---
 
@@ -242,45 +239,57 @@ interface CursorState {
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| DSH 处于 Developer Preview，API 会变 | 插件随时可能失效 | 锁版本；`peerDependencies` 用 `*` 但 README 标注已验证版本 |
-| `summarize()` 的 `input.messages` 结构变化 | 抽文本失败 | 防御式解析（字符串 / 数组 / 未知块都跳过），失败则退回原始摘要 |
-| 增量游标与 transcript 重写冲突 | 漏提炼或重复提炼 | 哈希校验 + 失效退回全量 |
-| 语义查重阈值难调 | 该合并的没合并 / 该保留的被合并 | 阈值可配；默认 0.85；`onConflict` 可切 |
-| LRC 侧 `migrate` 尚不支持 `dedup` 参数 | 标准 2 无法验收 | **需要先改 LRC 主仓**（见 §8） |
-| Phase 协议不存在 | M3 无法按原计划做 | 降级为启发式，明确标注 |
+| DSH 处于 Developer Preview，API 会变 | 插件随时失效 | 锁版本；README 标注已验证版本 |
+| 内置二进制体积大 | 安装体验差 | 倾向"首次下载"（§2.3） |
+| 下载源不可用 | 首次启动失败 | 降级为"提示用户装 LRC" |
+| 持续卸载打断对话节奏 | 体验差 | 卸载在 `spawn_blocking` 等价路径异步执行；失败静默 |
+| 快照注入占用上下文 | 与目标相反 | 快照限 1~3 行，且只在有新增结论时注入 |
+| 语义查重阈值难调 | 该合并的没合并 | 阈值可配，默认 0.85 |
+| LRC 侧 `migrate` 尚不支持 `dedup` | 标准 2 无法验收 | **需先改 LRC 主仓**（§8） |
 
 ---
 
 ## 八、对 LRC 主仓的依赖（需要先做）
 
-标准 2 依赖 LRC 侧改动，**这是本仓库的前置条件**：
-
 | 改动 | 位置 | 说明 |
 |---|---|---|
 | `migrate` 支持 `dedup` 参数 | `src/v1_api.rs` | `{enabled, similarityThreshold, onConflict}` |
 | 返回 `superseded` / `skipped` 计数 | 同上 | 当前只有 `written` / `merged` / `failed` |
-| 冲突时调 `mark_superseded` | 同上 | 复用既有 `/v1/memories/lifecycle` 逻辑 |
+| 冲突时调 `mark_superseded` | 同上 | 复用既有 `/v1/memories/lifecycle` |
+| 提供可独立分发的 sidecar 二进制 | 构建产物 | 插件内置运行时需要 |
 
-**建议顺序**：先在 LRC 主仓做这三处（约半天），再开始 M2。
+**建议顺序**：先在主仓做前三处（约半天），再开始 M3。
 
 ---
 
-## 九、验收清单（总）
+## 九、需要你拍板的两个决策
+
+### 决策 1：二进制怎么分发
+
+| 方案 | 包体积 | 首次体验 | 离线可用 |
+|---|---|---|---|
+| A. 随包分发全平台 | ~300MB+ | 开箱即用 | ✅ |
+| **B. 首次运行按平台下载（推荐）** | ~1MB | 需联网一次 | ❌（可降级） |
+| C. 只支持已装 LRC | ~1MB | 需先装 | ✅ |
+
+### 决策 2：卸载频率
+
+| 方案 | 上下文增速 | 开销 |
+|---|---|---|
+| 每轮卸载 | 最低 | 每轮一次 HTTP + 提炼 |
+| **每 8 轮或 6000 字符（推荐）** | 低 | 可忽略 |
+| 只在空闲时 | 中 | 最低 |
+
+---
+
+## 十、验收清单（总）
 
 | # | 项 | 通过标准 |
 |---|---|---|
 | 1 | 增量游标 | 第 2、3 次送进 distill 的字符数 < 第 1 次的 50% |
 | 2 | 语义查重 | 重复 migrate 3 次，库内总数不增长 |
-| 3 | 不线性膨胀 | 3 次压缩后总数 ≤ 首次的 1.2 倍，去重率 ≥ 80% |
-| 4 | 不阻断压缩 | LRC 不可达时压缩仍成功，摘要退回模型原文 |
-| 5 | 状态快照质量 | 压缩后的上下文含 `[LRC 状态]` 行，且列出关键决策 |
-| 6 | 可回滚 | 删掉 `cordis.patch.yml` 的 insert 段即恢复官方后端 |
-
----
-
-## 十、下一步
-
-1. 在 LRC 主仓实现 §8 的三处改动（`dedup` 参数）
-2. 本仓库 M0：补齐 README / package.json / .gitignore
-3. 本仓库 M1：迁移 `lrc-client.ts` 与 `compaction-backend.ts`（已有可复用实现）
-4. 本仓库 M2：实现游标与去重，跑通三条硬性标准
+| 3 | 不线性膨胀 | 3 次卸载后总数 ≤ 首次的 1.2 倍，去重率 ≥ 80% |
+| 4 | 内置运行时 | 无本地 LRC 时能自动启动隔离实例；失败能降级 |
+| 5 | 不阻断对话 | LRC 不可用时对话正常，卸载静默跳过 |
+| 6 | 快照质量 | 注入的 `[LRC 状态]` 行能列出关键决策，且 ≤ 3 行 |
+| 7 | 可回滚 | 删掉 `cordis.patch.yml` 的 insert 段即恢复官方行为 |
