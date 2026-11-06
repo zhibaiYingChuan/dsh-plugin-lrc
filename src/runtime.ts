@@ -34,15 +34,32 @@ export interface RuntimeResult {
 /**
  * 二进制清单：`<platform>-<arch>` → `{ file, sha256 }`。
  *
- * **当前为空**：LRC 的 Release 还没产出插件专用的 sidecar 资产。
- * 填上之前，`ensure()` 会走 degraded 并提示用户手动安装 LRC ——
- * 这是刻意的：宁可明确失败，也不下载一个无法校验的文件。
+ * 文件名带版本号（`lrc-v0.10.0-...`），配合 `BINARY_RELEASE` 拼出**固定 URL**：
+ * `releases/download/v0.10.0/<file>`。这样不会因为 `latest` 漂移而拿到未校验的版本。
+ *
+ * **每次 LRC 发版都要更新这里**（文件名 + SHA256 + BINARY_RELEASE）。
+ * 后续可加一个 Action 自动回写，见 docs/PLAN.md §2.3。
  */
-export const BINARY_MANIFEST: Record<string, { file: string; sha256: string }> = {};
+export const BINARY_RELEASE = 'v0.10.0';
+
+export const BINARY_MANIFEST: Record<string, { file: string; sha256: string }> = {
+  'win32-x64': {
+    file: 'lrc-v0.10.0-windows-x86_64.exe',
+    sha256: '005fcad2e4e61e77b8efd15d43d37a7c39d73d4e4eff1fdbf8107b8bd30951d4',
+  },
+  'darwin-arm64': {
+    file: 'lrc-v0.10.0-macos-arm64',
+    sha256: 'd1fcfbb52f02a24d9cd277981b43884fd16e71ed8d5c7f1c8f2b918e4a8bce62',
+  },
+  'linux-x64': {
+    file: 'lrc-v0.10.0-linux-x86_64',
+    sha256: '2e6fd027c2f0c76a98f4970278e321fa39543860d3e446fc303df5950a3f15e0',
+  },
+};
 
 const DEFAULT_MIRRORS = [
-  'https://github.com/zhibaiYingChuan/LRC/releases/latest/download',
-  'https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/latest/download',
+  `https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
+  `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
 ];
 
 export interface RuntimeOptions {
@@ -54,6 +71,12 @@ export interface RuntimeOptions {
   log?: (message: string) => void;
   /** 健康检查超时（毫秒） */
   healthTimeoutMs?: number;
+  /** 覆盖二进制清单（测试用：可注入错误哈希验证降级） */
+  manifest?: Record<string, { file: string; sha256: string }>;
+  /** 覆盖 Release 版本（测试用） */
+  release?: string;
+  /** 是否探测本地 3099 端口（测试用：置 false 可强制走下载路径） */
+  probeLocal?: boolean;
 }
 
 function defaultCacheDir(): string {
@@ -103,6 +126,9 @@ export class LrcRuntime {
   private readonly mirror?: string;
   private readonly log: (message: string) => void;
   private readonly healthTimeoutMs: number;
+  private readonly manifest: Record<string, { file: string; sha256: string }>;
+  private readonly mirrors: string[];
+  private readonly probeLocal: boolean;
   private child: ChildProcess | null = null;
   private result: RuntimeResult | null = null;
 
@@ -111,6 +137,13 @@ export class LrcRuntime {
     this.mirror = options.mirror ?? process.env.LRC_MIRROR;
     this.log = options.log ?? (() => {});
     this.healthTimeoutMs = options.healthTimeoutMs ?? 15_000;
+    this.manifest = options.manifest ?? BINARY_MANIFEST;
+    this.probeLocal = options.probeLocal ?? true;
+    const release = options.release ?? BINARY_RELEASE;
+    this.mirrors = [
+      `https://github.com/zhibaiYingChuan/LRC/releases/download/${release}`,
+      `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${release}`,
+    ];
   }
 
   /** 幂等：多次调用只启动一次。 */
@@ -125,7 +158,7 @@ export class LrcRuntime {
       return this.result;
     }
     const local = 'http://127.0.0.1:3099';
-    if (await isHealthy(local)) {
+    if (this.probeLocal && (await isHealthy(local))) {
       this.result = { mode: 'external', baseUrl: local };
       this.log(`[lrc] 复用本地实例：${local}`);
       return this.result;
@@ -182,7 +215,7 @@ export class LrcRuntime {
   /** 确保二进制存在且校验通过。 */
   private async ensureBinary(): Promise<string> {
     const key = platformKey();
-    const entry = BINARY_MANIFEST[key];
+    const entry = this.manifest[key];
     if (entry === undefined) {
       throw new Error(
         `没有 ${key} 的二进制清单。请手动安装 LRC 桌面端，或设置 LRC_BASE 指向已有实例。`,
@@ -197,8 +230,9 @@ export class LrcRuntime {
       return target;
     }
 
-    const mirrors = this.mirror ? [this.mirror, ...DEFAULT_MIRRORS] : DEFAULT_MIRRORS;
+    const mirrors = this.mirror ? [this.mirror, ...this.mirrors] : this.mirrors;
     let lastError: unknown = null;
+    let hashMismatch = false;
     for (const mirror of mirrors) {
       const url = `${mirror.replace(/\/+$/, '')}/${entry.file}`;
       try {
@@ -209,6 +243,7 @@ export class LrcRuntime {
         writeFileSync(target, buffer);
         if (!this.verify(target, entry.sha256)) {
           rmSync(target, { force: true });
+          hashMismatch = true;
           throw new Error('SHA256 校验失败');
         }
         if (platform() !== 'win32') chmodSync(target, 0o755);
@@ -217,6 +252,13 @@ export class LrcRuntime {
         lastError = error;
         this.log(`[lrc] 镜像失败（${mirror}）：${error instanceof Error ? error.message : error}`);
       }
+    }
+    // 哈希不符是**安全信号**，优先级高于网络错误：必须让用户看到真正的原因
+    if (hashMismatch) {
+      throw new Error(
+        `SHA256 校验失败（期望 ${entry.sha256.slice(0, 12)}…）。` +
+          '文件可能被篡改或清单过期，已删除下载内容。',
+      );
     }
     throw new Error(
       `所有镜像均失败：${lastError instanceof Error ? lastError.message : String(lastError)}`,
