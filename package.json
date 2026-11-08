@@ -1,11 +1,11 @@
 {
   "name": "dsh-plugin-lrc",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "把 LRC 的结构化长期记忆接进 DeepSeek Harness：边聊边沉淀、按需召回、可纠错，让上下文不再需要频繁压缩",
   "type": "module",
   "main": "dist/index.js",
   "files": [
-    "dist",
+    "dist/index.js",
     "src",
     "cordis.patch.yml",
     "README.md",
