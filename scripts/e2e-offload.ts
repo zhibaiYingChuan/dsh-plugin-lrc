@@ -16,8 +16,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LrcClient } from '../src/lrc-client.ts';
-import { CursorStore } from '../src/cursor.ts';
-import { Offloader } from '../src/offloader.ts';
+import { CursorStore, snapshotChanged } from '../src/cursor.ts';
+import { buildSnapshot, itemsFromTag, Offloader } from '../src/offloader.ts';
 
 // ────────────────────────────────────────────────────────────
 // mock LRC：按契约实现，不做真实语义计算
@@ -116,6 +116,35 @@ const server = createServer(async (req, res) => {
   }
   if (url.pathname === '/v1/memories/stats') {
     send(res, 200, { total_memories: memories.length });
+    return;
+  }
+  if (url.pathname === '/v1/memories/enrich') {
+    const body = JSON.parse(raw) as { query: string; top_k?: number; project?: string };
+    calls.push({ path: 'enrich', chars: body.query.length });
+    const topK = body.top_k ?? 5;
+    const items = memories.slice(0, topK).map((m, i) => ({
+      id: `mem-${i}`,
+      content: m.content,
+      memory_type: m.memory_type,
+      score_norm: i === 0 ? 1 : Math.max(0, 0.9 - i * 0.05),
+      importance: 7,
+    }));
+    send(res, 200, { memories: items, total: memories.length });
+    return;
+  }
+  if (url.pathname === '/v1/memories/forget') {
+    const body = JSON.parse(raw) as { memory_id: string };
+    calls.push({ path: 'forget', chars: body.memory_id.length });
+    if (body.memory_id === 'missing-id') {
+      send(res, 200, {
+        success: true,
+        memory_id: body.memory_id,
+        deleted: false,
+        already_deleted: true,
+      });
+    } else {
+      send(res, 200, { success: true, memory_id: body.memory_id, deleted: true });
+    }
     return;
   }
   send(res, 404, { error: 'not_found' });
@@ -238,13 +267,14 @@ try {
 
   console.log('\n=== 验收标准 3：不线性膨胀 ===');
   const growth = totalAfter3 / totalAfter1;
-  const totalItems = r1.distilled + r2.distilled + r3.distilled;
-  const dedupRate = totalItems === 0 ? 0 : (totalItems - totalAfter3) / totalItems;
-  console.log(`  3 次总产出 = ${totalItems} 条，库内 = ${totalAfter3} 条`);
+  // 架构调整后，复述在插件端就被 Jaccard 拦下，不再送进 distill。
+  // 所以"去重率"改看两处：库内不膨胀 + 本地查重确实拦到了东西。
+  const localDeduped = r2.deduped + r3.deduped;
+  console.log(`  库内 = ${totalAfter3} 条（第 1 次后 ${totalAfter1} 条）`);
   console.log(`  膨胀倍数 = ${growth.toFixed(2)}x（要求 ≤ 1.2x）`);
-  console.log(`  去重率 = ${(dedupRate * 100).toFixed(1)}%（要求 ≥ 80%）`);
+  console.log(`  本地查重拦下 = ${localDeduped} 块（要求 > 0）`);
   check('膨胀倍数 ≤ 1.2x', growth <= 1.2, { growth });
-  check('去重率 ≥ 80%', dedupRate >= 0.8, { dedupRate });
+  check('本地查重生效', localDeduped > 0, { localDeduped });
 
   console.log('\n=== 附加：游标失效检测 ===');
   const rewritten = ['完全不同的第一行', '完全不同的第二行'];
@@ -254,6 +284,66 @@ try {
   console.log('\n=== 附加：无新增内容时返回 null ===');
   const r5 = await offloader.offload('session-a', rewritten);
   check('无新增时返回 null', r5 === null, r5);
+
+  console.log('\n=== 附加：推理兜底 offloadItems（不走行游标） ===');
+  const reasoningItems = itemsFromTag(
+    '结论：推理兜底必须只抽带结论标记的句子\n决策：改用 offloadItems 直接入库',
+  );
+  const r6 = await offloader.offloadItems(reasoningItems);
+  check('offloadItems 直接入库', r6.distilled === 2 && r6.written + r6.merged === 2, r6);
+  const r7 = await offloader.offloadItems(reasoningItems);
+  check('offloadItems 重复内容被本地查重拦下', r7.distilled === 0 && r7.deduped === 2, r7);
+
+  console.log('\n=== 附加：沉淀累计统计（lrc_status 用） ===');
+  const stats = offloader.stats();
+  check('统计有沉淀次数', stats.flushCount > 0, stats);
+  check('统计累计写入 + 合并 > 0', stats.totalWritten + stats.totalMerged > 0, stats);
+  check('统计累计查重 > 0', stats.totalDeduped > 0, stats);
+  check('统计记录了最近一次时间', stats.lastFlushAt > 0, stats);
+  check('统计查重窗口非空', stats.recentWindow > 0, stats);
+
+  console.log('\n=== 附加：召回客户端（lrc_recall 的底层） ===');
+  const recallClient = new LrcClient({ baseUrl });
+  const recalled = await recallClient.recall('测试查询', { topK: 3 });
+  check('recall 返回结果', recalled.memories.length > 0, recalled.memories.length);
+  check('recall 遵守 top_k', recalled.memories.length <= 3, recalled.memories.length);
+  check('recall 首条相关度为 1', recalled.memories[0]?.score_norm === 1, recalled.memories[0]);
+  check('recall 带候选总数', recalled.total >= recalled.memories.length, recalled.total);
+  const emptyRecall = await recallClient.recall('不存在的查询', { topK: 0 });
+  check('recall top_k 为 0 时返回空', emptyRecall.memories.length === 0, emptyRecall.memories.length);
+
+  console.log('\n=== 附加：纠错客户端（lrc_forget 的底层） ===');
+  const forgot = await recallClient.forget('mem-1');
+  check('forget 删除成功', forgot.deleted === true, forgot);
+  const forgotAgain = await recallClient.forget('missing-id');
+  check(
+    'forget 幂等（已不存在）',
+    forgotAgain.deleted === false && forgotAgain.alreadyDeleted === true,
+    forgotAgain,
+  );
+
+  console.log('\n=== 附加：快照不再截到 40 字符 ===');
+  const longBody = '这是一条很长的结论'.repeat(10);
+  const snap = buildSnapshot(
+    [{ content: `[结论] ${longBody}`, memory_type: 'fact', tags: [], importance: 6, source_turns: [0, 0] }],
+    3,
+  );
+  check('快照保留完整结论', snap.includes(longBody), snap.length);
+
+  console.log('\n=== 附加：快照实质变化判定（缓存命中率） ===');
+  check(
+    '相同快照不触发更新',
+    snapshotChanged('[LRC 状态] A；B。', '[LRC 状态] A；B。') === false,
+  );
+  check(
+    '仅空白差异不触发更新',
+    snapshotChanged('[LRC 状态] A；B。', '[LRC 状态]  A；B。\n') === false,
+  );
+  check(
+    '内容变化触发更新',
+    snapshotChanged('[LRC 状态] A；B。', '[LRC 状态] A；C。') === true,
+  );
+  check('空 → 非空触发更新', snapshotChanged('', '[LRC 状态] A。') === true);
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   rmSync(workDir, { recursive: true, force: true });

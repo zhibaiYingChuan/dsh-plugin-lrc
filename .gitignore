@@ -1,9 +1,25 @@
 node_modules/
-dist/
 lib/
 *.log
+*.bak
 .DS_Store
 Thumbs.db
 .env
 .env.local
 *.tgz
+
+# 本地勘查 / 调试脚本（不属于插件本体，不提交）
+tmp-*.mjs
+scripts/probe-*.ts
+scripts/inspect-session.ts
+scripts/extract-host-module.ts
+scripts/reconstruct-surface.ts
+scripts/explain-profile.ts
+scripts/session-file.ts
+
+# 从宿主 app.asar 抽出来的现场勘查副本，由 scripts/extract-host-module.ts 生成，
+# 只用于本地复现宿主 fold 行为，不应提交（内容属于宿主，也随宿主版本变化）。
+tmp-host/
+
+# 注意：dist/ 不忽略 —— 插件从 GitHub 直接安装（dsh plugin add github:...），
+# 宿主不会在安装时构建，因此必须提交构建产物。

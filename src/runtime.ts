@@ -63,6 +63,13 @@ const DEFAULT_MIRRORS = [
 ];
 
 export interface RuntimeOptions {
+  /**
+   * 显式指定已有 LRC 实例（优先于 `LRC_BASE` 环境变量与本地探测）。
+   *
+   * 来自插件配置 `baseUrl`。此前只认环境变量，导致 `cordis.patch.yml`
+   * 里写 `baseUrl: http://127.0.0.1:3111` 不生效，永远打到 3099。
+   */
+  baseUrl?: string;
   /** 缓存根目录，默认 `$DSH_HOME/cache/lrc-plugin` */
   cacheDir?: string;
   /** 额外镜像前缀（优先于内置镜像） */
@@ -129,10 +136,13 @@ export class LrcRuntime {
   private readonly manifest: Record<string, { file: string; sha256: string }>;
   private readonly mirrors: string[];
   private readonly probeLocal: boolean;
+  /** 显式实例地址：配置 `baseUrl` 优先，其次 `LRC_BASE` 环境变量。 */
+  private readonly explicitBase?: string;
   private child: ChildProcess | null = null;
   private result: RuntimeResult | null = null;
 
   constructor(options: RuntimeOptions = {}) {
+    this.explicitBase = options.baseUrl?.trim() || process.env.LRC_BASE;
     this.cacheDir = options.cacheDir ?? defaultCacheDir();
     this.mirror = options.mirror ?? process.env.LRC_MIRROR;
     this.log = options.log ?? (() => {});
@@ -150,11 +160,22 @@ export class LrcRuntime {
   async ensure(): Promise<RuntimeResult> {
     if (this.result !== null) return this.result;
 
-    // ① 已有实例
-    const explicit = process.env.LRC_BASE;
-    if (explicit && (await isHealthy(explicit))) {
-      this.result = { mode: 'external', baseUrl: explicit.replace(/\/+$/, '') };
-      this.log(`[lrc] 复用已有实例：${this.result.baseUrl}`);
+    // ① 已有实例（配置 baseUrl > LRC_BASE 环境变量）
+    const explicit = this.explicitBase;
+    if (explicit) {
+      if (await isHealthy(explicit)) {
+        this.result = { mode: 'external', baseUrl: explicit.replace(/\/+$/, '') };
+        this.log(`[lrc] 复用已有实例：${this.result.baseUrl}`);
+        return this.result;
+      }
+      // 显式指定了却连不上：**直接降级，不回落 3099**。
+      // 回落会让"配了 3111 却打到 3099"，违反端口纪律，且用户无从察觉。
+      this.result = {
+        mode: 'degraded',
+        baseUrl: explicit.replace(/\/+$/, ''),
+        reason: `配置的实例不可用：${explicit}`,
+      };
+      this.log(`[lrc] 降级：${this.result.reason}`);
       return this.result;
     }
     const local = 'http://127.0.0.1:3099';

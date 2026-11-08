@@ -132,10 +132,22 @@ DSH 的 `BasicCompactionEngine` 用 `ctx.on('agent/pre-step', ...)` 做压力检
 | 场景 | 行为 |
 |---|---|
 | 正常对话 | 持续卸载，上下文增速降到 1/5~1/10 |
-| 仍触发压缩 | `summarize()` 被重写：先卸载，再返回"LRC 状态快照 + 模型摘要" |
-| LRC 不可用 | 静默跳过卸载，压缩退回官方行为 |
+| 仍触发压缩 | **走 DSH 原生摘要**，本插件不接管 |
+| LRC 不可用 | 静默跳过卸载，对话不受影响 |
 
-**压缩后端仍然要重写 `summarize()`** —— 它是兜底，不是主路径。
+**为什么不做压缩兜底（2026-11-06 结论）**
+
+原计划重写 `summarize()` 返回 LRC 状态快照。实测 DSH 0.2.2-rc.1 的架构后放弃：
+
+1. `dsh-web-app` 的 patch 已把宿主层 `compaction-basic` 关掉（`disabled: true`）；
+2. 真正的实例在 `standard` / `minimal` / `ptc` 三个 preset 里，各自包在
+   `isolate: { compaction: true }` 的组中 —— agent 用的是**组内**服务，
+   宿主层插件注册的 `compaction` 它看不见；
+3. 三个 preset 共用同一套 id（`compaction` / `compaction-basic`），
+   而 DSH 的 patch 按 id 索引，同名 id 会互相覆盖，按 id 关不掉指定的那一个；
+4. 唯一可靠做法是整组重写 `config` 列表，DSH 升级 preset 结构即静默失效。
+
+结论：**不做**。`src/compaction-backend.ts` 已删除，相关 peer 依赖一并移除。
 
 ---
 
@@ -183,7 +195,7 @@ interface CursorState {
 
 ### 标准 3：三次卸载不线性膨胀
 
-`scripts/e2e-compact.ts`：
+`scripts/e2e-offload.ts`：
 
 ```
 1. 起 mock LRC（记录所有写入）
@@ -192,10 +204,52 @@ interface CursorState {
 4. 断言：
    - 第 1 次：written = N1
    - 第 2、3 次：库内总数仍 = N1
-   - 去重率 = (N2 + N3 - 新增) / (N2 + N3) ≥ 80%
+   - 第 2、3 次：本地 Jaccard 查重确实拦下了复述块（deduped > 0）
 ```
 
 **通过标准**：3 次卸载后库内总数 **≤ 第 1 次的 1.2 倍**。
+
+> 2026-11-07 调整：复述现在在**插件端**就被 Jaccard 拦下，不再送进 `distill`。
+> 因此"去重率"不再按 distill 产出计算，改看「库内不膨胀 + 本地查重生效」两处。
+
+---
+
+## 四之二、三层过滤（2026-11-07 架构定调）
+
+**LRC 只存不筛。** 筛选、提炼、决定"什么该存"全部在插件端完成，
+LRC 端不加任何 LLM，保持毫秒级写入。
+
+| 层 | 位置 | 做什么 |
+|---|---|---|
+| 1. 硬规则 | `src/memory-filter.ts` `hardFilter()` | 丢寒暄、代码围栏、正常日志、过短且无关键词的行 |
+| 2. 宿主 LLM 提炼 | `src/index.ts` 系统提示段落 + `extractMemoryTag()` | 要求模型在回答末尾输出 `<lrc_memory>决策/约束/结论</lrc_memory>`，正则抠出 |
+| 3. 本地查重 | `src/memory-filter.ts` `isDuplicate()` | Jaccard ≥ 0.85 视为复述，连 HTTP 都不发 |
+
+**触发条件**（三者任一）：
+
+- 累计 20 步（`offloadSteps`）—— 长任务里正文很少，靠步数兜底
+- 累计 8 轮正文（`offloadTurns`）
+- 累计 6000 字符（`offloadChars`）
+- **外加 `turn/end` 无条件兜底**：最终报告只在 turn 末尾出现一次，
+  没有 pre-step 可等，必须在这里收走
+
+**为什么必须加步数与 turn/end**：实测一次 88 步的长任务，
+88 条 assistant 消息里只有 1 条有正文（5269 字符），
+按"正文消息数"计数永远到不了阈值，最终报告也等不到下一次 pre-step。
+
+### 2026-11-07 定向测试修复
+
+| 级别 | 问题 | 修复 |
+|---|---|---|
+| P0 | 游标在 `distill` 之前推进，失败即永久丢内容 | 改为 `distill` + `migrate` 都成功后才 `commitCursor()` |
+| P1 | `hardFilter` 逐物理行调用，`stripCodeFences` 状态失效，围栏内代码透传 | 改为按**消息**整段过滤（`lines.slice(fromLine).map(hardFilter)`） |
+| P1 | `hasPending()` 不认步数，步数兜底在"只有工具调用"的任务上失效 | 加入 `pendingSteps > 0` |
+| P1 | `<lrc_memory>` 写成可选项时模型从不输出 | 改为强制契约：每轮必须输出，空轮写 `无新增`；并加命中率日志 |
+| P1 | 标签内容被 LRC 的 `distill` 二次过滤（`DECISION_WORDS` 无「决策」） | 标签内容由 `itemsFromTag()` 直接构造条目走 `migrate`，**绕过 distill** |
+
+**关于第二层的定性**：它不是"可选增强"，而是**依赖模型配合的软约束**。
+因此硬规则必须始终是兜底路径，不能假设标签一定存在。
+命中率日志（每 20 条 assistant 消息打一次）用于判断这一层是否真的生效。
 
 ---
 
@@ -204,13 +258,14 @@ interface CursorState {
 ```
 dsh-plugin-lrc/
 ├── src/
-│   ├── index.ts              # 插件入口：注册工具 + 挂卸载器 + 挂压缩后端
+│   ├── index.ts              # 插件入口：注册工具 + 挂卸载器
 │   ├── runtime.ts            # LRC 运行时管理（探测/下载/启动/健康检查）
 │   ├── lrc-client.ts         # HTTP 客户端（distill / migrate / index / lifecycle）
 │   ├── offloader.ts          # 持续卸载器（事件订阅 + 阈值 + 快照注入）
 │   ├── cursor.ts             # 增量游标
-│   ├── dedup.ts              # 语义查重与版本合并
-│   └── compaction-backend.ts # LrcCompactionEngine（兜底）
+│   ├── session-text.ts       # 会话事件 → 纯文本行（过滤推理/技能目录/工具输出）
+│   ├── memory-filter.ts      # 三层过滤：硬规则 / <lrc_memory> 提取 / Jaccard 查重
+│   └── dedup.ts              # 语义查重与版本合并
 ├── scripts/
 │   ├── smoke.ts              # 客户端冒烟（mock）
 │   ├── e2e-offload.ts        # 三次卸载不膨胀
@@ -233,10 +288,10 @@ dsh-plugin-lrc/
 | **M1** | 运行时 + 客户端 | `runtime.ts` / `lrc-client.ts` | 能探测/启动/降级；冒烟 11 项通过 |
 | **M2** | 持续卸载 | `offloader.ts` / `cursor.ts` | 对话中上下文增速显著下降；快照正确注入 |
 | **M3** | 去重三件套 | `dedup.ts` / `e2e-offload.ts` | **§4 三条硬性标准全过** |
-| **M4** | 压缩兜底 | `compaction-backend.ts` | 压缩时摘要含 `[LRC 状态]` |
+| **M4** | 压缩兜底 | ~~`compaction-backend.ts`~~ | **已取消**，见 §3.3 |
 | **M5** | 上架 | 发布包 + 文档 | 进入 DSH 官方插件库 |
 
-**M3 是硬门槛**：三条标准不过，不进入 M4/M5。
+**M3 是硬门槛**：三条标准不过，不进入 M5。
 
 ---
 

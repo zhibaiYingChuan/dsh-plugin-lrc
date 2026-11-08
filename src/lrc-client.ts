@@ -39,6 +39,22 @@ export interface IndexResult {
   }>;
 }
 
+/** 一条召回结果（`/v1/memories/enrich` 的子集）。 */
+export interface RecallItem {
+  id: string;
+  content: string;
+  memory_type: string;
+  /** 展示用相关度（0–1，相对 top1 归一化） */
+  score_norm: number;
+  importance: number;
+}
+
+export interface RecallResult {
+  memories: RecallItem[];
+  /** 候选总数（折叠前） */
+  total: number;
+}
+
 export interface LrcClientOptions {
   baseUrl?: string;
   token?: string;
@@ -126,6 +142,51 @@ export class LrcClient {
       method: 'GET',
     });
     return stats.total_memories ?? 0;
+  }
+
+  /**
+   * 召回相关记忆（三路融合 + 近重复折叠）。
+   *
+   * 这是插件唯一的**读**路径：DSH 没有 MCP 客户端，AI 看不到 LRC 的
+   * `recall` 工具，只能通过插件注册的原生工具读回记忆。
+   */
+  async recall(
+    query: string,
+    options: { topK?: number; project?: string } = {},
+  ): Promise<RecallResult> {
+    const body: Record<string, unknown> = {
+      query,
+      top_k: options.topK ?? 5,
+    };
+    if (options.project !== undefined && options.project.length > 0) {
+      body.project = options.project;
+    }
+    const data = await this.request<{ memories?: RecallItem[]; total?: number }>(
+      '/v1/memories/enrich',
+      { method: 'POST', body: JSON.stringify(body) },
+    );
+    return { memories: data.memories ?? [], total: data.total ?? 0 };
+  }
+
+  /**
+   * 删除一条记忆（幂等）。
+   *
+   * 用于**纠错**：AI 发现某条记忆是错的（例如把「没找到」误写成「不存在」），
+   * 必须能撤回，否则错误结论会被持续召回、污染后续所有对话。
+   */
+  async forget(memoryId: string): Promise<{ deleted: boolean; alreadyDeleted: boolean }> {
+    const data = await this.request<{
+      success?: boolean;
+      deleted?: boolean;
+      already_deleted?: boolean;
+    }>('/v1/memories/forget', {
+      method: 'POST',
+      body: JSON.stringify({ memory_id: memoryId }),
+    });
+    return {
+      deleted: data.deleted === true,
+      alreadyDeleted: data.already_deleted === true,
+    };
   }
 
   /** 一步完成"提炼 + 迁移"。 */

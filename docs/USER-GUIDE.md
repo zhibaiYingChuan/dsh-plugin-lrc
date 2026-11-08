@@ -19,10 +19,10 @@
 
 ```bash
 # 1) 装插件
-dsh plugin --profile web add github:zhibaiYingChuan/dsh-plugin-lrc
+dsh plugin --profile desktop add github:zhibaiYingChuan/dsh-plugin-lrc
 
 # 2) 确认真的进了插件树（这步不能省）
-dsh --profile web --dump-config | grep dsh-plugin-lrc
+dsh --profile desktop --dump-config | grep dsh-plugin-lrc
 
 # 3) 重启 DSH
 ```
@@ -41,7 +41,7 @@ dsh --profile web --dump-config | grep dsh-plugin-lrc
 [lrc] 下载 https://github.com/zhibaiYingChuan/LRC/releases/latest/download/lrc-sidecar-windows-x64.exe
 [lrc] SHA256 校验通过
 [lrc] 已启动隔离实例：http://127.0.0.1:52341（数据目录 ~/.dsh/cache/lrc-plugin/data）
-[lrc] 卸载器就绪（managed）
+[lrc] 记忆沉淀已就绪（managed）
 ```
 
 **这段提示的含义**：
@@ -52,12 +52,12 @@ dsh --profile web --dump-config | grep dsh-plugin-lrc
 | 下载 … | 从 GitHub Release 拉取（失败会自动换镜像） |
 | SHA256 校验通过 | 文件完整，可以信任 |
 | 已启动隔离实例 | 用的是**独立数据目录**，不会碰你的生产记忆库 |
-| 卸载器就绪 | 开始工作 |
+| 记忆沉淀已就绪 | 开始工作 |
 
 **第二次启动**会跳过下载，直接复用缓存：
 
 ```
-[lrc] 卸载器就绪（managed）：http://127.0.0.1:52341
+[lrc] 记忆沉淀已就绪（managed）：http://127.0.0.1:52341
 ```
 
 ---
@@ -68,12 +68,12 @@ dsh --profile web --dump-config | grep dsh-plugin-lrc
 |---|---|---|
 | `external` | 你已有 LRC（`LRC_BASE` 或 3099 端口） | 直接复用，不下载、不启动 |
 | `managed` | 没有现成 LRC | 下载并启动隔离实例 |
-| `degraded` | 下载失败 / 启动失败 | **静默跳过卸载**，对话照常，不报错 |
+| `degraded` | 下载失败 / 启动失败 | **静默跳过沉淀**，对话照常，不报错 |
 
 `degraded` 时你会看到一行 warn：
 
 ```
-[lrc] 未启用卸载：LRC 二进制不可用：没有 windows-x64 的二进制清单。请手动安装 LRC 桌面端，或设置 LRC_BASE 指向已有实例。
+[lrc] 未启用记忆沉淀：LRC 二进制不可用：没有 windows-x64 的二进制清单。请手动安装 LRC 桌面端，或设置 LRC_BASE 指向已有实例。
 ```
 
 **这不是故障**，只是插件退化成"不工作"。装个 LRC 桌面端或设 `LRC_BASE` 就能恢复。
@@ -91,8 +91,8 @@ dsh --profile web --dump-config | grep dsh-plugin-lrc
       baseUrl: ''          # 留空 = 自动探测/启动
       token: ''            # 服务端设了 LRC_API_TOKEN 时填
       project: dsh         # 记忆归属项目
-      offloadTurns: 8      # 每 8 轮卸载一次
-      offloadChars: 6000   # 或累计 6000 字符卸载一次
+      offloadTurns: 8      # 每 8 轮沉淀一次
+      offloadChars: 6000   # 或累计 6000 字符沉淀一次
       maxItems: 40         # 单次最多提炼条数
 ```
 
@@ -114,7 +114,7 @@ dsh --profile web --dump-config | grep dsh-plugin-lrc
 正常工作时每 8 轮会有一行：
 
 ```
-[lrc] 已卸载 3 条（新增 1 / 合并 2）
+[lrc] 已沉淀 3 条（新增 1 / 合并 2）
 ```
 
 ### 6.2 看记忆数
@@ -127,7 +127,7 @@ curl -s http://127.0.0.1:52341/v1/memories/stats
 
 ### 6.3 看上下文
 
-卸载后，下一轮对话里会出现一行：
+沉淀后，下一轮对话里会出现一行：
 
 ```
 [LRC 状态] 已确定用 pnpm（放弃 npm 因兼容问题）；端口纪律 3099/3111。细节在 LRC，需要时 recall。
@@ -141,12 +141,12 @@ curl -s http://127.0.0.1:52341/v1/memories/stats
 
 | 现象 | 原因 | 怎么修 |
 |---|---|---|
-| 装完没反应 | 没进插件树 | `dsh --profile web --dump-config \| grep dsh-plugin-lrc` |
+| 装完没反应 | 没进插件树 | `dsh --profile desktop --dump-config \| grep dsh-plugin-lrc` |
 | 日志里没有 `[lrc]` | 插件没加载 | 重启 DSH；确认 `package.json` 有 `dsh.bundle.patch` |
 | 一直 `degraded` | 下载失败 | 设 `LRC_MIRROR` 换镜像，或手动装 LRC 后设 `LRC_BASE` |
 | 记忆数不涨 | 对话里没有决策/约束类句子 | 正常。提炼只收结论，不收闲聊 |
 | 记忆数涨太快 | 阈值太低 | 调大 `offloadTurns` / `offloadChars` |
-| 上下文里没有 `[LRC 状态]` | 卸载了但没注入 | 检查 DSH 版本是否支持 `agent/pre-step` 附加上下文 |
+| 上下文里没有 `[LRC 状态]` | 沉淀了但没注入 | 检查 DSH 版本是否支持 `agent/pre-step` 附加上下文 |
 
 ---
 

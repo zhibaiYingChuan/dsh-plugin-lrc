@@ -40,6 +40,33 @@ export function hashLine(line: string): string {
 }
 
 /**
+ * 快照的**实质内容指纹**：折叠空白后取哈希。
+ *
+ * 为什么折叠空白：快照是 1~3 行短文本，换行/缩进差异不构成"状态变了"，
+ * 但会让宿主认为 runtime-context 变了并 append 一条新消息。
+ */
+export function snapshotFingerprint(text: string): string {
+  return hashLine(text.replace(/\s+/g, ' ').trim());
+}
+
+/**
+ * 快照是否发生了**实质变化**（仅空白差异不算）。
+ *
+ * ## 为什么需要
+ *
+ * 宿主把 `systemPrompt.context` 渲染成一条 runtime-context 用户消息，
+ * 文本一变就 append 一条新消息（旧消息留在 surface 里）。快照每轮都变
+ * 就会不断插入新消息：既打乱前缀缓存，又让上下文持续膨胀。
+ *
+ * 因此只有实质变化才更新快照；内容相同（含仅空白差异）时保持原样，
+ * 让宿主侧 `RuntimeContextProjection` 判定"无需更新"。
+ */
+export function snapshotChanged(previous: string, next: string): boolean {
+  if (previous === next) return false;
+  return snapshotFingerprint(previous) !== snapshotFingerprint(next);
+}
+
+/**
  * 按游标切出新增文本（**纯函数**，便于测试）。
  *
  * @param lines 当前 transcript 的全部行
@@ -120,6 +147,49 @@ export class CursorStore {
       writeFileSync(this.filePath, JSON.stringify(all, null, 2), 'utf8');
     } catch {
       // 落盘失败不影响本次卸载，下次会退回全量
+    }
+  }
+}
+
+/**
+ * 最近已发送块的持久化。
+ *
+ * 为什么需要：`Offloader.recent` 是内存态，插件重启后丢失，
+ * 跨会话的换措辞复述会重新入库。落盘后查重窗口跨重启保留。
+ */
+export class RecentStore {
+  private readonly filePath: string;
+  private cache: string[] | null = null;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+  }
+
+  load(): string[] {
+    if (this.cache !== null) return this.cache;
+    try {
+      if (existsSync(this.filePath)) {
+        const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as unknown;
+        this.cache = Array.isArray(parsed)
+          ? parsed.filter((item): item is string => typeof item === 'string')
+          : [];
+      } else {
+        this.cache = [];
+      }
+    } catch {
+      // 文件损坏不应阻断卸载：当作空窗口
+      this.cache = [];
+    }
+    return this.cache;
+  }
+
+  save(items: string[]): void {
+    this.cache = items;
+    try {
+      mkdirSync(dirname(this.filePath), { recursive: true });
+      writeFileSync(this.filePath, JSON.stringify(items), 'utf8');
+    } catch {
+      // 落盘失败不影响本次卸载
     }
   }
 }
