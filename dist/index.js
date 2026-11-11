@@ -12,23 +12,27 @@ import { createServer } from "node:net";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform, arch } from "node:os";
 import { join } from "node:path";
-var BINARY_RELEASE = "v0.10.0";
+var BINARY_RELEASE = "v0.10.4";
 var BINARY_MANIFEST = {
   "win32-x64": {
-    file: "lrc-v0.10.0-windows-x86_64.exe",
-    sha256: "005fcad2e4e61e77b8efd15d43d37a7c39d73d4e4eff1fdbf8107b8bd30951d4"
+    file: "lrc-v0.10.4-windows-x86_64.exe",
+    sha256: "4be3e0841bc312892e93e29ae416a8b7f2b793bdf2726f14ad3475d738e3c589"
   },
   "darwin-arm64": {
-    file: "lrc-v0.10.0-macos-arm64",
-    sha256: "d1fcfbb52f02a24d9cd277981b43884fd16e71ed8d5c7f1c8f2b918e4a8bce62"
+    file: "lrc-v0.10.4-macos-arm64",
+    sha256: "0878cd748c800bc9d846abf1fe5a0671da80b504527c237318bb38ee1b29c49b"
   },
   "linux-x64": {
-    file: "lrc-v0.10.0-linux-x86_64",
-    sha256: "2e6fd027c2f0c76a98f4970278e321fa39543860d3e446fc303df5950a3f15e0"
+    file: "lrc-v0.10.4-linux-x86_64",
+    sha256: "dbccf5cc0bc26667a0d880697b3e40b58fc119d7c3db6aa94140e207485a8a7c"
   }
 };
 var DEFAULT_MIRRORS = [
+  // ① 国内直连（文件在 downloads 根下，不含版本子目录）
+  "https://sfang.cc/xd/downloads",
+  // ② GitHub 原始地址（海外 / 国内可达时）
   `https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
+  // ③ GitHub 加速代理（前两者都失败时的兜底）
   `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`
 ];
 function defaultCacheDir() {

@@ -34,31 +34,54 @@ export interface RuntimeResult {
 /**
  * 二进制清单：`<platform>-<arch>` → `{ file, sha256 }`。
  *
- * 文件名带版本号（`lrc-v0.10.0-...`），配合 `BINARY_RELEASE` 拼出**固定 URL**：
- * `releases/download/v0.10.0/<file>`。这样不会因为 `latest` 漂移而拿到未校验的版本。
+ * 文件名带版本号（`lrc-v0.10.4-...`），配合 `BINARY_RELEASE` 拼出**固定 URL**：
+ * `releases/download/v0.10.4/<file>`。这样不会因为 `latest` 漂移而拿到未校验的版本。
  *
- * **每次 LRC 发版都要更新这里**（文件名 + SHA256 + BINARY_RELEASE）。
- * 后续可加一个 Action 自动回写，见 docs/PLAN.md §2.3。
+ * ⚠ **Release 资产的生命周期约束**：LRC 仓库的发布口径是"只保留最新一个 Release"，
+ * 旧版本的 Release 会被删除。因此这里的 `BINARY_RELEASE` 一旦落后于线上最新版，
+ * 三个下载 URL 就会**全部 404**，首次安装插件的用户直接拿不到二进制。
+ *
+ * 维护动作（每次 LRC 发版必须做，否则插件静默失效）：
+ *   1. `BINARY_RELEASE` 改为新版本 tag；
+ *   2. `BINARY_MANIFEST` 的 `file` 与 `sha256` 同步更新；
+ *   3. 国内镜像 URL 的版本号同步更新。
+ * 依据：v0.10.0 的 Release 已删除，旧清单实测三个 URL 全 404。
  */
-export const BINARY_RELEASE = 'v0.10.0';
+export const BINARY_RELEASE = 'v0.10.4';
 
 export const BINARY_MANIFEST: Record<string, { file: string; sha256: string }> = {
   'win32-x64': {
-    file: 'lrc-v0.10.0-windows-x86_64.exe',
-    sha256: '005fcad2e4e61e77b8efd15d43d37a7c39d73d4e4eff1fdbf8107b8bd30951d4',
+    file: 'lrc-v0.10.4-windows-x86_64.exe',
+    sha256: '4be3e0841bc312892e93e29ae416a8b7f2b793bdf2726f14ad3475d738e3c589',
   },
   'darwin-arm64': {
-    file: 'lrc-v0.10.0-macos-arm64',
-    sha256: 'd1fcfbb52f02a24d9cd277981b43884fd16e71ed8d5c7f1c8f2b918e4a8bce62',
+    file: 'lrc-v0.10.4-macos-arm64',
+    sha256: '0878cd748c800bc9d846abf1fe5a0671da80b504527c237318bb38ee1b29c49b',
   },
   'linux-x64': {
-    file: 'lrc-v0.10.0-linux-x86_64',
-    sha256: '2e6fd027c2f0c76a98f4970278e321fa39543860d3e446fc303df5950a3f15e0',
+    file: 'lrc-v0.10.4-linux-x86_64',
+    sha256: 'dbccf5cc0bc26667a0d880697b3e40b58fc119d7c3db6aa94140e207485a8a7c',
   },
 };
 
+/**
+ * 下载镜像，按顺序尝试，**国内优先**。
+ *
+ * 注意拼接规则：最终 URL = `${mirror}/${entry.file}`，**mirror 本身不含版本段**。
+ * 因此三条镜像的路径形态不同，各自要拼对：
+ *   · 国内：文件平铺在 `/xd/downloads/` 根下（随版本改名，无子目录）；
+ *   · GitHub：走 `/releases/download/<tag>/`，tag 必须写进 mirror。
+ *
+ * 为什么国内地址排第一：GitHub Releases 在国内经常超时或被重置，
+ * 而 sfang.cc 是自家的国内直连源（与 Releases 同名文件字节一致，
+ * 已逐个下载回来比过 SHA256）。
+ */
 const DEFAULT_MIRRORS = [
+  // ① 国内直连（文件在 downloads 根下，不含版本子目录）
+  'https://sfang.cc/xd/downloads',
+  // ② GitHub 原始地址（海外 / 国内可达时）
   `https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
+  // ③ GitHub 加速代理（前两者都失败时的兜底）
   `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
 ];
 

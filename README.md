@@ -3,7 +3,7 @@
 把 [LRC](https://github.com/zhibaiYingChuan/LRC) 的长期记忆接进 DeepSeek Harness（DSH）：
 **边聊边沉淀、按需召回、可纠错**，让上下文不再需要频繁压缩。
 
-> 版本 **0.2.0** · [MIT License](LICENSE) · 适配 DSH `>=0.2.0-rc.1 <0.3.0-0`
+> 版本 **0.2.2** · [MIT License](LICENSE) · 适配 DSH `>=0.2.0-rc.1 <0.3.0-0`
 
 ---
 
@@ -57,7 +57,13 @@ AI 看到的不再是几十轮原文，而是：
 - DSH `>= 0.2.0-rc.1`
 - Node.js `>= 20`
 
-### 方式一：从 GitHub 安装（推荐）
+### 方式一：从 npm 安装（推荐）
+
+```bash
+dsh plugin --profile desktop add dsh-plugin-lrc
+```
+
+### 方式二：从 GitHub 安装
 
 ```bash
 # 把 desktop 换成你的 profile 名（web / desktop / ...）
@@ -70,20 +76,28 @@ dsh plugin --profile desktop add github:zhibaiYingChuan/dsh-plugin-lrc
 dsh --profile desktop --dump-config | grep dsh-plugin-lrc
 ```
 
-### 方式二：从 npm 安装（发布后可用）
+### 安装 LRC 本体
 
-```bash
-dsh plugin --profile desktop add dsh-plugin-lrc
-```
+插件负责**调用** LRC，但需要有 LRC 可调。两种方式二选一：
 
-### 关于 LRC 本体：你不需要先装它
+**A. 已装 LRC 就直接用**（推荐）
 
-插件启动时会自动处理：
+插件启动时先探测本地实例（`baseUrl` 配置 → `LRC_BASE` 环境变量 → `127.0.0.1:3099`），
+探到就复用，不另起进程，也不碰它的数据。
 
-1. 探测本地已有 LRC（环境变量 / 3099 端口）→ 有就直接用
-2. 没有 → 检查内置二进制，缺失则按平台下载
-3. 启动**隔离实例**（独立数据目录，不碰你的生产记忆库）
-4. 失败 → 降级为纯客户端模式，静默跳过沉淀
+- 国内下载（推荐）：<https://sfang.cc/longyi>
+- GitHub Releases：<https://github.com/zhibaiYingChuan/LRC/releases>
+
+**B. 没装就让插件自己拉**
+
+插件会按平台下载对应版本的 LRC 二进制（国内镜像优先，失败回退 GitHub），
+校验 SHA256 后在 `$DSH_HOME/cache/lrc-plugin/data` 启动一个**隔离实例**。
+
+> 隔离实例与你的桌面端 LRC 各用独立数据目录，互不影响。
+
+**C. 都没有**
+
+降级为纯客户端模式：插件加载不报错，但沉淀会静默跳过。`lrc_status` 会显示 `degraded` 及原因。
 
 **数据到底写在哪，取决于模式**：
 
@@ -91,6 +105,7 @@ dsh plugin --profile desktop add dsh-plugin-lrc
 |---|---|---|
 | `external`（复用已有实例） | 那个实例自己的目录，例如 `~/.loong-recall/global/data` | 插件**不拥有**这份数据，删 `~/.dsh/cache/lrc-plugin/data` 清不掉它 |
 | `managed`（插件自启） | `$DSH_HOME/cache/lrc-plugin/data` | 只有这个目录是插件自己的 |
+| `degraded`（降级） | 不写 | 只做上下文裁剪，不沉淀 |
 
 清理测试数据前先看日志里的 `复用已有实例` / `已启动隔离实例`，别删错。
 
