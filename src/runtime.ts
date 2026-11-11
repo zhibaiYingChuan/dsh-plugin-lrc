@@ -139,6 +139,12 @@ export interface RuntimeOptions {
    * 置 0 表示每次都查（测试用）。
    */
   recheckAfterMs?: number;
+  /**
+   * 降级后的重探退避（毫秒），默认起步 5s、封顶 60s。
+   *
+   * 置 0 表示降级结果**不作退避**，每次 `ensure()` 都立即重探（测试用）。
+   */
+  retryBackoff?: { baseMs: number; maxMs: number };
 }
 
 function defaultCacheDir(): string {
@@ -212,6 +218,12 @@ export class LrcRuntime {
   private readonly explicitBase?: string;
   private child: ChildProcess | null = null;
   private result: RuntimeResult | null = null;
+  /** 下次允许重探的时刻（degraded 时的退避，毫秒时间戳）。 */
+  private nextRetryAt = 0;
+  /** 连续 degraded 次数（用于指数退避）。 */
+  private degradeCount = 0;
+  /** 降级退避策略。 */
+  private readonly retryBackoff: { baseMs: number; maxMs: number };
 
   constructor(options: RuntimeOptions = {}) {
     this.explicitBase = options.baseUrl?.trim() || process.env.LRC_BASE;
@@ -221,6 +233,7 @@ export class LrcRuntime {
     this.manifest = options.manifest ?? {};
     this.probeLocal = options.probeLocal ?? true;
     this.recheckAfterMs = options.recheckAfterMs ?? 60 * 60 * 1000;
+    this.retryBackoff = options.retryBackoff ?? { baseMs: 5_000, maxMs: 60_000 };
     const explicit = [options.mirror ?? process.env.LRC_MIRROR ?? '', ...(options.mirrors ?? [])]
       .map((m) => m.trim().replace(/\/+$/, ''))
       .filter(Boolean);
@@ -250,9 +263,35 @@ export class LrcRuntime {
     return this.builtinSources.some((s) => s.url === url && s.authoritative);
   }
 
-  /** 幂等：多次调用只启动一次。 */
-  async ensure(): Promise<RuntimeResult> {
-    if (this.result !== null) return this.result;
+  /**
+   * 幂等：**成功**结果只算一次，失败结果可被作废重探。
+   *
+   * # 为什么失败不能永久缓存
+   *
+   * 此前 `if (this.result !== null) return this.result;` 连 degraded 也缓存。
+   * 真实事故：LRC 桌面端比 DSH 晚 20 分钟启动，插件启动那一刻探测失败、
+   * 判为 degraded，此后整个会话再也不重试 —— 即使 LRC 早已健康，
+   * `lrc_recall` 仍永久返回「未就绪」。
+   *
+   * 现在：成功结果仍然复用（不重复探测/下载），失败结果在
+   * `invalidate()` 之后会重新走一遍完整探测。
+   *
+   * # force（避免双层退避）
+   *
+   * 上层 `Recoverable` 已经有一套退避：它只在自己判定「该重试了」时才调用这里。
+   * 若这里再卡一次自己的退避窗口，两层叠加会让实际恢复时间远超任一层设定
+   * （实测：上层 2s、下层 5s ⇒ 用户要等 5s 以上）。故 `force=true` 时跳过本地退避。
+   */
+  async ensure(options: { force?: boolean } = {}): Promise<RuntimeResult> {
+    if (this.result !== null && this.result.mode !== 'degraded') return this.result;
+    if (
+      this.result !== null &&
+      this.result.mode === 'degraded' &&
+      options.force !== true &&
+      !this.mayRetry()
+    ) {
+      return this.result;
+    }
 
     // ① 已有实例（配置 baseUrl > LRC_BASE 环境变量）
     const explicit = this.explicitBase;
@@ -260,23 +299,17 @@ export class LrcRuntime {
       if (await isHealthy(explicit)) {
         this.result = { mode: 'external', baseUrl: explicit.replace(/\/+$/, '') };
         this.log(`[lrc] 复用已有实例：${this.result.baseUrl}`);
-        return this.result;
+        return this.succeed();
       }
       // 显式指定了却连不上：**直接降级，不回落 3099**。
       // 回落会让"配了 3111 却打到 3099"，违反端口纪律，且用户无从察觉。
-      this.result = {
-        mode: 'degraded',
-        baseUrl: explicit.replace(/\/+$/, ''),
-        reason: `配置的实例不可用：${explicit}`,
-      };
-      this.log(`[lrc] 降级：${this.result.reason}`);
-      return this.result;
+      return this.degrade(explicit, `配置的实例不可用：${explicit}`);
     }
     const local = 'http://127.0.0.1:3099';
     if (this.probeLocal && (await isHealthy(local))) {
       this.result = { mode: 'external', baseUrl: local };
       this.log(`[lrc] 复用本地实例：${local}`);
-      return this.result;
+      return this.succeed();
     }
 
     // ② 准备二进制
@@ -284,13 +317,10 @@ export class LrcRuntime {
     try {
       binary = await this.ensureBinary();
     } catch (error) {
-      this.result = {
-        mode: 'degraded',
-        baseUrl: explicit ?? local,
-        reason: `LRC 二进制不可用：${error instanceof Error ? error.message : String(error)}`,
-      };
-      this.log(`[lrc] 降级：${this.result.reason}`);
-      return this.result;
+      return this.degrade(
+        explicit ?? local,
+        `LRC 二进制不可用：${error instanceof Error ? error.message : String(error)}`,
+      );
     }
 
     // ③ 启动隔离实例
@@ -310,21 +340,73 @@ export class LrcRuntime {
         if (await isHealthy(baseUrl, 1000)) {
           this.result = { mode: 'managed', baseUrl };
           this.log(`[lrc] 已启动隔离实例：${baseUrl}（数据目录 ${dataDir}）`);
-          return this.result;
+          return this.succeed();
         }
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
       throw new Error(`健康检查超时（${this.healthTimeoutMs}ms）`);
     } catch (error) {
       this.stop();
-      this.result = {
-        mode: 'degraded',
-        baseUrl: explicit ?? local,
-        reason: `LRC 启动失败：${error instanceof Error ? error.message : String(error)}`,
-      };
-      this.log(`[lrc] 降级：${this.result.reason}`);
-      return this.result;
+      return this.degrade(
+        explicit ?? local,
+        `LRC 启动失败：${error instanceof Error ? error.message : String(error)}`,
+      );
     }
+  }
+
+  /** 成功：清空退避状态（下次仍可正常复用结果）。 */
+  private succeed(): RuntimeResult {
+    this.degradeCount = 0;
+    this.nextRetryAt = 0;
+    return this.result as RuntimeResult;
+  }
+
+  /**
+   * 降级：记录退避窗口。
+   *
+   * 退避的意义：宿主每次 recall 都可能触发一次 `ensure()`，
+   * 若 LRC 长期不在，不加退避就会每次请求都白等 3 秒健康检查超时。
+   */
+  private degrade(baseUrl: string, reason: string): RuntimeResult {
+    this.degradeCount += 1;
+    // 5s → 10s → 20s …，封顶 maxMs
+    const exp = this.retryBackoff.baseMs * 2 ** Math.min(this.degradeCount - 1, 4);
+    const backoff = Math.min(exp, this.retryBackoff.maxMs);
+    this.nextRetryAt = backoff > 0 ? Date.now() + backoff : 0;
+    this.result = { mode: 'degraded', baseUrl, reason };
+    this.log(
+      backoff > 0
+        ? `[lrc] 降级：${reason}（${Math.round(backoff / 1000)}s 后重新探测）`
+        : `[lrc] 降级：${reason}`,
+    );
+    return this.result;
+  }
+
+  /** 当前是否可以重新探测（退避窗口是否已过）。 */
+  private mayRetry(): boolean {
+    return Date.now() >= this.nextRetryAt;
+  }
+
+  /**
+   * 显式作废当前状态，下次 `ensure()` 立刻重新探测。
+   *
+   * 用于热路径发现连接断了：既然是刚断的，没必要再等退避窗口。
+   */
+  invalidate(reason?: string): void {
+    // 托管实例若已退出，留着等也没意义；先清掉句柄，重探时会重新拉起
+    if (this.result?.mode === 'managed') this.stop();
+    this.result = null;
+    this.nextRetryAt = 0;
+    if (reason !== undefined) this.log(`[lrc] 状态已作废，下次重新探测：${reason}`);
+  }
+
+  /** 当前状态（诊断用）。 */
+  status(): { mode: RuntimeMode | 'idle'; retryInMs: number; degradeCount: number } {
+    return {
+      mode: this.result?.mode ?? 'idle',
+      retryInMs: Math.max(0, this.nextRetryAt - Date.now()),
+      degradeCount: this.degradeCount,
+    };
   }
 
   /**

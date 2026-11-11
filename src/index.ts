@@ -28,6 +28,7 @@ import { homedir } from 'node:os';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { LrcRuntime } from './runtime.ts';
 import { LrcClient } from './lrc-client.ts';
+import { Recoverable, isConnectionError } from './recoverable.ts';
 import { CursorStore, RecentStore, snapshotChanged } from './cursor.ts';
 import { Offloader, itemsFromTag } from './offloader.ts';
 import {
@@ -104,6 +105,14 @@ export interface Config {
   trimMaxNodes: number;
   /** 确定性摘要的字符上限 */
   trimMaxSummaryChars: number;
+  /** 首次重连等待（毫秒）；0 = 不重试 */
+  reconnectBaseMs: number;
+  /** 重连退避上限（毫秒） */
+  reconnectMaxMs: number;
+  /** 能力矩阵复查间隔（步）：判定为不可用后每 N 步重探一次，0 = 不复查 */
+  capabilityRecheckSteps: number;
+  /** 预算复查间隔（步）：窗口未知时每 N 步重探一次，0 = 不复查 */
+  budgetRecheckSteps: number;
 }
 
 export const Config: Schema = Schema.object({
@@ -144,6 +153,20 @@ export const Config: Schema = Schema.object({
   // ★2026-11-07：2000 → 4000。实测 2000 字符的摘要会把关键结论截掉，
   // 用户反馈「关键信息基本都丢了」；4000 仍远小于被裁剪区间（约 9k tokens）。
   trimMaxSummaryChars: Schema.number().default(4000),
+
+  // ── 连接恢复 ──
+  // LRC 可能比 DSH 晚启动（实测桌面端晚 20 分钟）。此前插件只在加载时连一次，
+  // 失败即永久降级 —— 召回整场会话都用不了。这两项控制重连退避节奏。
+  /** 首次重连等待（毫秒）；0 = 不重试（仅排障用） */
+  reconnectBaseMs: Schema.number().default(2000),
+  /** 重连退避上限（毫秒）：封顶保证最终能自愈 */
+  reconnectMaxMs: Schema.number().default(60000),
+
+  // ── 一次性判定的复查 ──
+  // 宿主服务可能后起（compaction 在 preset 初始化 / tokenMeter 随模型切换就绪）。
+  // 一次性探测会把「启动瞬间没准备好」固化成「整场会话不可用」。
+  capabilityRecheckSteps: Schema.number().default(20),
+  budgetRecheckSteps: Schema.number().default(20),
 });
 
 /** 系统提示段落名（全局唯一，避免与宿主段落冲突）。 */
@@ -221,7 +244,28 @@ export function apply(ctx: Context, config: Config): void {
   });
 
   let offloader: Offloader | null = null;
-  let client: LrcClient | null = null;
+  /**
+   * LRC 连接：**可恢复**，不是启动时决定一次就永久定死。
+   *
+   * 真实事故：LRC 桌面端比 DSH 晚 20 分钟启动，插件在那一刻探测失败后
+   * `client` 永久为 null，整个会话 5 次 `lrc_recall` 全部返回「未就绪」，
+   * 即使 LRC 早已健康也没有任何重试。
+   *
+   * 现在改成懒加载 + 指数退避 + 热路径失效重连（见 `recoverable.ts`）。
+   */
+  const connection = new Recoverable<LrcClient>(
+    async () => {
+      // force：重试节奏由外层 Recoverable 统一控制，避免两层退避叠加
+      const result = await runtime.ensure({ force: true });
+      if (result.mode === 'degraded') {
+        throw new Error(result.reason ?? 'LRC 不可用');
+      }
+      const created = new LrcClient({ baseUrl: result.baseUrl, token: config.token || undefined });
+      attachOffloader(created);
+      return created;
+    },
+    { backoff: { baseMs: config.reconnectBaseMs, maxMs: config.reconnectMaxMs } },
+  );
   let warnedShape = false;
   let warnedEmpty = false;
   /** 推理兜底抽不到结论句时只提示一次。 */
@@ -322,27 +366,57 @@ export function apply(ctx: Context, config: Config): void {
     }`,
   );
 
-  // 异步初始化：不阻塞插件加载
+  /**
+   * 连接就绪后挂上 Offloader。
+   *
+   * Offloader **一开始就创建**（计数器立即开始工作），只是先以「未连接」状态存在。
+   * 这样 LRC 晚启动时，之前那些轮次的 pending 计数不会丢 —— 一旦连上就立刻能沉淀。
+   */
+  function attachOffloader(client: LrcClient): void {
+    if (offloader === null) {
+      offloader = new Offloader(
+        client,
+        new CursorStore(join(cacheDir, 'cursor.json')),
+        {
+          turnsThreshold: config.offloadTurns,
+          charsThreshold: config.offloadChars,
+          stepsThreshold: config.offloadSteps,
+          project: config.project,
+          maxItems: config.maxItems,
+        },
+        new RecentStore(join(cacheDir, 'recent.json')),
+      );
+    } else {
+      offloader.bind(client);
+    }
+  }
+
+  // 计数器立即开始工作（此时还没有连接，沉淀会被暂存而不是丢弃）
+  offloader = new Offloader(
+    null,
+    new CursorStore(join(cacheDir, 'cursor.json')),
+    {
+      turnsThreshold: config.offloadTurns,
+      charsThreshold: config.offloadChars,
+      stepsThreshold: config.offloadSteps,
+      project: config.project,
+      maxItems: config.maxItems,
+    },
+    new RecentStore(join(cacheDir, 'recent.json')),
+  );
+
+  // 预热：不阻塞插件加载，失败只记一次日志；之后由工具调用按需重试
   void (async () => {
-    const result = await runtime.ensure();
-    if (result.mode === 'degraded') {
-      ctx.logger.warn(`[lrc] 未启用记忆沉淀：${result.reason ?? '未知原因'}`);
+    const client = await connection.get();
+    if (client === null) {
+      const status = connection.status();
+      ctx.logger.warn(
+        `[lrc] 暂未连上 LRC（${status.lastError ?? '未知原因'}）。` +
+          `将在工具调用时按退避重试（下次最早 ${Math.round(status.retryInMs / 1000)}s 后）。`,
+      );
       return;
     }
-    client = new LrcClient({ baseUrl: result.baseUrl, token: config.token || undefined });
-    offloader = new Offloader(
-      client,
-      new CursorStore(join(cacheDir, 'cursor.json')),
-      {
-        turnsThreshold: config.offloadTurns,
-        charsThreshold: config.offloadChars,
-        stepsThreshold: config.offloadSteps,
-        project: config.project,
-        maxItems: config.maxItems,
-      },
-      new RecentStore(join(cacheDir, 'recent.json')),
-    );
-    ctx.logger.info(`[lrc] 记忆沉淀已就绪（${result.mode}）：${result.baseUrl}`);
+    ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
     // 快照与写入解耦：上次进程没来得及沉淀时，从 LRC 索引重建
     void bootstrapSnapshot();
   })();
@@ -355,7 +429,9 @@ export function apply(ctx: Context, config: Config): void {
    * 让 `[LRC 状态]` 在重启后也能立刻出现。
    */
   async function bootstrapSnapshot(): Promise<void> {
-    if (latestSnapshot.length > 0 || client === null) return;
+    if (latestSnapshot.length > 0) return;
+    const client = connection.peek();
+    if (client === null) return;
     try {
       const index = await client.index(config.project, 3);
       if (index.items.length === 0) return;
@@ -372,6 +448,42 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * 工具层取连接：未就绪时**当场重试一次**（受退避约束），并给出可读原因。
+   *
+   * 这是本次修复的关键：以前工具直接 `if (client === null) return 未就绪`，
+   * 等于把「启动那一瞬间的状态」当成永久事实。现在每次调用都有机会自愈。
+   *
+   * @returns 客户端，或说明为何不可用的文案
+   */
+  async function acquireClient(): Promise<{ client: LrcClient } | { reason: string }> {
+    const client = await connection.get();
+    if (client !== null) return { client };
+    const status = connection.status();
+    const wait = Math.ceil(status.retryInMs / 1000);
+    return {
+      reason:
+        `LRC 暂时不可用：${status.lastError ?? '未知原因'}` +
+        (wait > 0 ? `（约 ${wait}s 后自动重试）` : ''),
+    };
+  }
+
+  /**
+   * 热路径统一的失败处理：连接类错误作废连接，其余原样返回原因。
+   *
+   * 抽出来是为了让 4 个工具的行为完全一致 —— 否则又会各自漂移，
+   * 这次的问题正是「同一类缺陷在 6 处各写一遍」。
+   */
+  function noteToolFailure(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isConnectionError(error)) {
+      connection.invalidate(message);
+      offloader?.bind(null);
+      ctx.logger.warn(`[lrc][tool] 连接失效，已标记重连：${message}`);
+    }
+    return message;
+  }
+
+  /**
    * 执行一次沉淀。
    *
    * `flushing` 是必要的：`agent/pre-step` 与 `turn/end` 可能同时触发，
@@ -380,6 +492,13 @@ export function apply(ctx: Context, config: Config): void {
   async function flush(session: unknown, reason: string): Promise<void> {
     if (offloader === null || flushing) return;
     if (!offloader.hasPending()) return;
+    // 未连接时**保留 pending 计数**，等连上再沉淀。
+    // 此前是「offloader 为 null 直接 return」，LRC 一晚启动这批内容就永久丢了。
+    if (!offloader.connected) {
+      // 顺手触发一次后台重连（不阻塞本步）
+      void connection.get();
+      return;
+    }
     flushing = true;
     try {
       const sessionId = (session as { id?: string })?.id ?? 'default';
@@ -446,9 +565,16 @@ export function apply(ctx: Context, config: Config): void {
         );
       }
     } catch (error) {
-      ctx.logger.warn(
-        `[lrc] 沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`,
-      );
+      // 连接类错误（对端重启/断网）⇒ 作废连接，下次调用会重连。
+      // 业务错误（400/422 等）不动连接：那说明服务是活的，掐掉反而误伤。
+      const message = error instanceof Error ? error.message : String(error);
+      if (isConnectionError(error)) {
+        connection.invalidate(message);
+        offloader?.bind(null);
+        ctx.logger.warn(`[lrc] 沉淀失败，连接已标记失效（下次调用重连）：${message}`);
+      } else {
+        ctx.logger.warn(`[lrc] 沉淀失败（不影响对话）：${message}`);
+      }
     } finally {
       flushing = false;
     }
@@ -571,8 +697,11 @@ export function apply(ctx: Context, config: Config): void {
     const agent = (payload as { agent?: unknown })?.agent;
     lastAgent = agent;
 
-    // 能力矩阵：每个会话只探测一次，结果打一张表。
-    // 探测失败时 caps 为 null，动作按「未知即可用」处理，不让探测本身停摆。
+    // 能力矩阵：首次探测 + **能力缺失时定期复查**。
+    //
+    // 为什么不能只探一次：依赖的宿主服务可能是后起的（compaction 在 preset 里
+    // 初始化、tokenMeter 随模型切换才就绪）。一次性探测会把"启动那一刻还没准备好"
+    // 固化成"整场会话不可用"，于是裁剪/剪枝永久停摆，上下文一路涨。
     if (!probed) {
       probed = true;
       try {
@@ -583,13 +712,48 @@ export function apply(ctx: Context, config: Config): void {
           `[lrc][cap] 能力探测异常：${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    } else if (governor.steps > 0 && governor.steps % config.capabilityRecheckSteps === 0) {
+      // 只复查「当前判定为不可用」的项：已可用的没必要反复探（省开销且更稳）
+      const before = governor.capabilities;
+      const needsRecheck =
+        before === null ||
+        !before.compaction.available ||
+        !before.tokenMeter.available ||
+        !before.toolResultPruner.available;
+      if (needsRecheck) {
+        try {
+          const after = probeCapabilities(ctx, agent);
+          governor.capabilities = after;
+          const recovered: string[] = [];
+          if (before !== null && !before.compaction.available && after.compaction.available) {
+            recovered.push('compaction');
+          }
+          if (before !== null && !before.tokenMeter.available && after.tokenMeter.available) {
+            recovered.push('tokenMeter');
+          }
+          if (
+            before !== null &&
+            !before.toolResultPruner.available &&
+            after.toolResultPruner.available
+          ) {
+            recovered.push('toolResultPruner');
+          }
+          if (recovered.length > 0) {
+            ctx.logger.info(`[lrc][cap] 复查后恢复可用：${recovered.join('、')}`);
+          }
+        } catch {
+          // 复查失败保持原判，不影响本步
+        }
+      }
     }
     const caps = governor.capabilities;
 
-    // 统一预算：按模型窗口比例推导阈值，只解析一次
-    if (budget === null) {
+    // 统一预算：按模型窗口比例推导阈值。
+    // fallback（窗口未知）时允许复查 —— 模型可能中途切换（provider/model 变了），
+    // 一次 fallback 就永久按绝对值裁剪并不合理。
+    if (budget === null || (budget.source === 'fallback' && governor.steps % config.budgetRecheckSteps === 0)) {
       try {
-        budget = await resolveBudget({
+        const resolved = await resolveBudget({
           ctx,
           agent,
           config: {
@@ -600,7 +764,10 @@ export function apply(ctx: Context, config: Config): void {
             pruneResultThreshold: config.pruneResultThreshold,
           },
         });
-        ctx.logger.info(formatBudget(budget));
+        if (budget === null || resolved.source !== budget.source || resolved.windowTokens !== budget.windowTokens) {
+          ctx.logger.info(formatBudget(resolved));
+        }
+        budget = resolved;
       } catch (error) {
         ctx.logger.warn(
           `[lrc][budget] 预算解析失败，使用配置绝对值：${
@@ -804,9 +971,11 @@ export function apply(ctx: Context, config: Config): void {
         ],
       },
       async execute(args: { text: string }) {
-        if (client === null) {
-          return { snapshot: 'LRC 未就绪，本次未沉淀', distilled: 0, written: 0, merged: 0 };
+        const acquired = await acquireClient();
+        if ('reason' in acquired) {
+          return { snapshot: acquired.reason, distilled: 0, written: 0, merged: 0 };
         }
+        const { client } = acquired;
         try {
           // 与自动沉淀路径保持一致：标签内容直接成条目，**绕过 distill**。
           // 否则 `- 决策：…` 会被 LRC 的规则式打分丢掉（DECISION_WORDS 无「决策」）。
@@ -839,7 +1008,7 @@ export function apply(ctx: Context, config: Config): void {
           };
         } catch (error) {
           return {
-            snapshot: `LRC 未连接，本次未沉淀（${String(error).slice(0, 120)}）`,
+            snapshot: `本次未沉淀：${noteToolFailure(error).slice(0, 160)}`,
             distilled: 0,
             written: 0,
             merged: 0,
@@ -891,13 +1060,17 @@ export function apply(ctx: Context, config: Config): void {
         render: (_args: unknown, value: { text: string }) => [{ type: 'text', text: value.text }],
       },
       async execute(args: { query: string; top_k?: number; project?: string }) {
-        if (client === null) {
-          return { text: 'LRC 未就绪，无法召回。', count: 0 };
-        }
         const query = typeof args.query === 'string' ? args.query.trim() : '';
         if (query.length === 0) {
           return { text: 'lrc_recall 需要非空的 query。', count: 0 };
         }
+        // 每次调用都尝试取连接（受退避约束），而不是沿用启动瞬间的判定。
+        // 这是本次事故的直接修复点：以前这里只看一次 client 是否为 null。
+        const acquired = await acquireClient();
+        if ('reason' in acquired) {
+          return { text: `${acquired.reason}。可先用内置搜索。`, count: 0 };
+        }
+        const { client } = acquired;
         try {
           const topK = Math.min(Math.max(args.top_k ?? 5, 1), 20);
           const result = await client.recall(query, {
@@ -926,7 +1099,7 @@ export function apply(ctx: Context, config: Config): void {
             count: result.memories.length,
           };
         } catch (error) {
-          return { text: `LRC 召回失败：${String(error).slice(0, 200)}`, count: 0 };
+          return { text: `LRC 召回失败：${noteToolFailure(error).slice(0, 200)}`, count: 0 };
         }
       },
     }),
@@ -960,13 +1133,15 @@ export function apply(ctx: Context, config: Config): void {
         render: (_args: unknown, value: { text: string }) => [{ type: 'text', text: value.text }],
       },
       async execute(args: { memory_id: string }) {
-        if (client === null) {
-          return { text: 'LRC 未就绪，无法删除。', deleted: false };
-        }
         const memoryId = typeof args.memory_id === 'string' ? args.memory_id.trim() : '';
         if (memoryId.length === 0) {
           return { text: 'lrc_forget 需要非空的 memory_id。', deleted: false };
         }
+        const acquired = await acquireClient();
+        if ('reason' in acquired) {
+          return { text: acquired.reason, deleted: false };
+        }
+        const { client } = acquired;
         try {
           const result = await client.forget(memoryId);
           // 工具调用必须可观测：删除是纠错闭环的关键一步，必须留痕。
@@ -983,7 +1158,7 @@ export function apply(ctx: Context, config: Config): void {
           }
           return { text: `记忆 ${memoryId} 未删除（服务端返回 deleted=false）。`, deleted: false };
         } catch (error) {
-          return { text: `LRC 删除失败：${String(error).slice(0, 200)}`, deleted: false };
+          return { text: `LRC 删除失败：${noteToolFailure(error).slice(0, 200)}`, deleted: false };
         }
       },
     }),
@@ -1035,6 +1210,7 @@ export function apply(ctx: Context, config: Config): void {
 
         // LRC 归档索引：拿不到就跳过，不影响交接
         let indexLines: string[] = [];
+        const client = connection.peek();
         if (client !== null) {
           try {
             const index = await client.index(config.project, 10);
@@ -1107,6 +1283,34 @@ export function apply(ctx: Context, config: Config): void {
         lines.push(formatGovernorState(governor));
         lines.push('');
 
+        lines.push('## 连接');
+        {
+          const conn = connection.status();
+          const rt = runtime.status();
+          const stateText =
+            conn.state === 'ready'
+              ? '已连接'
+              : conn.state === 'failed'
+                ? `未连接（${conn.lastError ?? '未知原因'}）`
+                : '尚未尝试';
+          lines.push(
+            `- LRC 连接：${stateText}` +
+              (conn.state === 'ready'
+                ? ''
+                : `｜重试倒计时 ${Math.ceil(conn.retryInMs / 1000)}s（退避 ${Math.round(conn.lastBackoffMs / 1000)}s）`),
+          );
+          lines.push(
+            `- 累计：成功 ${conn.successes} 次 / 失败 ${conn.failures} 次（连续 ${conn.consecutiveFailures}）`,
+          );
+          lines.push(
+            `- 运行时：${rt.mode}｜连续降级 ${rt.degradeCount} 次｜下次重探 ${Math.ceil(rt.retryInMs / 1000)}s`,
+          );
+          if (conn.lastError !== undefined && conn.state !== 'ready') {
+            lines.push(`- 最近错误：${conn.lastError}`);
+          }
+        }
+        lines.push('');
+
         lines.push('## 上下文画像');
         try {
           lines.push(formatProfile(profileSurface((lastAgent as { session?: unknown } | undefined)?.session)));
@@ -1120,6 +1324,11 @@ export function apply(ctx: Context, config: Config): void {
           lines.push('未启用');
         } else {
           const stats = offloader.stats();
+          // 未连接时 pending 只增不减是**预期行为**（等连上再沉淀），要显式说明，
+          // 否则会被误读成"卡住了"。
+          if (!offloader.connected) {
+            lines.push('连接未就绪：本轮新增内容已计入待沉淀队列，连上后会自动补写。');
+          }
           lines.push(
             `累计 ${stats.flushCount} 次：新写入 ${stats.totalWritten} 条 / 合并 ${stats.totalMerged} 条` +
               ` / 本地查重拦下 ${stats.totalDeduped} 块`,

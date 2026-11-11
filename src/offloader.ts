@@ -195,7 +195,16 @@ export function itemsFromTag(tag: string): DistilledItem[] {
 }
 
 export class Offloader {
-  private readonly client: LrcClient;
+  /**
+   * LRC 客户端**可后置注入**。
+   *
+   * 为什么不是构造时写死：插件可能在 LRC 还没起来时加载（实测桌面端晚 20 分钟），
+   * 此前的做法是整个 Offloader 都不创建 —— 连 `observe()` 的计数都不做，
+   * 于是 LRC 恢复后，之前那些轮次的内容已经不在待沉淀队列里了。
+   *
+   * 现在计数器先跑起来，连接一旦就绪只需 `bind()`，不丢历史累计。
+   */
+  private client: LrcClient | null;
   private readonly cursors: CursorStore;
   private readonly config: OffloadConfig;
   private readonly recentStore?: RecentStore;
@@ -214,7 +223,7 @@ export class Offloader {
   private lastFlushMerged = 0;
 
   constructor(
-    client: LrcClient,
+    client: LrcClient | null,
     cursors: CursorStore,
     config: Partial<OffloadConfig> = {},
     recentStore?: RecentStore,
@@ -225,6 +234,29 @@ export class Offloader {
     this.recentStore = recentStore;
     // 查重窗口跨插件重启保留：否则重启后换措辞复述会重新入库
     this.recent = recentStore?.load() ?? [];
+  }
+
+  /** 连接是否已就绪。 */
+  get connected(): boolean {
+    return this.client !== null;
+  }
+
+  /**
+   * 注入 / 替换客户端。
+   *
+   * 传 `null` 表示连接已断：保留所有计数器与游标，
+   * 只停止发起 HTTP —— 恢复后可以接着从断点继续，不会重复也不会丢失。
+   */
+  bind(client: LrcClient | null): void {
+    this.client = client;
+  }
+
+  /** 取客户端（未连接时抛错，调用方负责先判 `connected`）。 */
+  private requireClient(): LrcClient {
+    if (this.client === null) {
+      throw new Error('LRC 尚未连接');
+    }
+    return this.client;
   }
 
   /** 记录一轮新增文本（由 index.ts 在 assistant/message 事件里调用）。 */
@@ -377,14 +409,18 @@ export class Offloader {
     if (freshBlocks.length > 0) {
       const text = freshBlocks.join('\n');
       charsSent += text.length;
-      const distilled = await this.client.distill(text, this.config.project, this.config.maxItems);
+      const distilled = await this.requireClient().distill(
+        text,
+        this.config.project,
+        this.config.maxItems,
+      );
       items = [...items, ...distilled.items];
     }
 
     let written = 0;
     let merged = 0;
     if (items.length > 0) {
-      const migrated = await this.client.migrate(items, this.config.project);
+      const migrated = await this.requireClient().migrate(items, this.config.project);
       written = migrated.written;
       merged = migrated.merged;
     }
@@ -446,7 +482,7 @@ export class Offloader {
       return empty;
     }
 
-    const migrated = await this.client.migrate(fresh, this.config.project);
+    const migrated = await this.requireClient().migrate(fresh, this.config.project);
     this.recent.push(...fresh.map((item) => item.content));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);

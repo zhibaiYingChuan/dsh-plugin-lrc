@@ -50,6 +50,10 @@ const config = {
   trimMinSteps: 10,
   trimMaxNodes: 120,
   trimMaxSummaryChars: 2000,
+  reconnectBaseMs: 2000,
+  reconnectMaxMs: 60000,
+  capabilityRecheckSteps: 20,
+  budgetRecheckSteps: 20,
 };
 
 interface StubCtx {

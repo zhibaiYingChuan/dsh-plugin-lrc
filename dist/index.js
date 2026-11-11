@@ -95,6 +95,12 @@ var LrcRuntime = class {
   explicitBase;
   child = null;
   result = null;
+  /** 下次允许重探的时刻（degraded 时的退避，毫秒时间戳）。 */
+  nextRetryAt = 0;
+  /** 连续 degraded 次数（用于指数退避）。 */
+  degradeCount = 0;
+  /** 降级退避策略。 */
+  retryBackoff;
   constructor(options = {}) {
     this.explicitBase = options.baseUrl?.trim() || process.env.LRC_BASE;
     this.cacheDir = options.cacheDir ?? defaultCacheDir();
@@ -104,6 +110,7 @@ var LrcRuntime = class {
     this.manifest = options.manifest ?? {};
     this.probeLocal = options.probeLocal ?? true;
     this.recheckAfterMs = options.recheckAfterMs ?? 60 * 60 * 1e3;
+    this.retryBackoff = options.retryBackoff ?? { baseMs: 5e3, maxMs: 6e4 };
     const explicit = [options.mirror ?? process.env.LRC_MIRROR ?? "", ...options.mirrors ?? []].map((m) => m.trim().replace(/\/+$/, "")).filter(Boolean);
     this.explicitSources = [...new Set(explicit)];
     this.builtinSources = options.builtinSources ?? BUILTIN_SOURCES;
@@ -127,41 +134,53 @@ var LrcRuntime = class {
     if (this.explicitSources.includes(url)) return true;
     return this.builtinSources.some((s) => s.url === url && s.authoritative);
   }
-  /** 幂等：多次调用只启动一次。 */
-  async ensure() {
-    if (this.result !== null) return this.result;
+  /**
+   * 幂等：**成功**结果只算一次，失败结果可被作废重探。
+   *
+   * # 为什么失败不能永久缓存
+   *
+   * 此前 `if (this.result !== null) return this.result;` 连 degraded 也缓存。
+   * 真实事故：LRC 桌面端比 DSH 晚 20 分钟启动，插件启动那一刻探测失败、
+   * 判为 degraded，此后整个会话再也不重试 —— 即使 LRC 早已健康，
+   * `lrc_recall` 仍永久返回「未就绪」。
+   *
+   * 现在：成功结果仍然复用（不重复探测/下载），失败结果在
+   * `invalidate()` 之后会重新走一遍完整探测。
+   *
+   * # force（避免双层退避）
+   *
+   * 上层 `Recoverable` 已经有一套退避：它只在自己判定「该重试了」时才调用这里。
+   * 若这里再卡一次自己的退避窗口，两层叠加会让实际恢复时间远超任一层设定
+   * （实测：上层 2s、下层 5s ⇒ 用户要等 5s 以上）。故 `force=true` 时跳过本地退避。
+   */
+  async ensure(options = {}) {
+    if (this.result !== null && this.result.mode !== "degraded") return this.result;
+    if (this.result !== null && this.result.mode === "degraded" && options.force !== true && !this.mayRetry()) {
+      return this.result;
+    }
     const explicit = this.explicitBase;
     if (explicit) {
       if (await isHealthy(explicit)) {
         this.result = { mode: "external", baseUrl: explicit.replace(/\/+$/, "") };
         this.log(`[lrc] 复用已有实例：${this.result.baseUrl}`);
-        return this.result;
+        return this.succeed();
       }
-      this.result = {
-        mode: "degraded",
-        baseUrl: explicit.replace(/\/+$/, ""),
-        reason: `配置的实例不可用：${explicit}`
-      };
-      this.log(`[lrc] 降级：${this.result.reason}`);
-      return this.result;
+      return this.degrade(explicit, `配置的实例不可用：${explicit}`);
     }
     const local = "http://127.0.0.1:3099";
     if (this.probeLocal && await isHealthy(local)) {
       this.result = { mode: "external", baseUrl: local };
       this.log(`[lrc] 复用本地实例：${local}`);
-      return this.result;
+      return this.succeed();
     }
     let binary;
     try {
       binary = await this.ensureBinary();
     } catch (error) {
-      this.result = {
-        mode: "degraded",
-        baseUrl: explicit ?? local,
-        reason: `LRC 二进制不可用：${error instanceof Error ? error.message : String(error)}`
-      };
-      this.log(`[lrc] 降级：${this.result.reason}`);
-      return this.result;
+      return this.degrade(
+        explicit ?? local,
+        `LRC 二进制不可用：${error instanceof Error ? error.message : String(error)}`
+      );
     }
     try {
       const port = await findFreePort();
@@ -178,21 +197,64 @@ var LrcRuntime = class {
         if (await isHealthy(baseUrl, 1e3)) {
           this.result = { mode: "managed", baseUrl };
           this.log(`[lrc] 已启动隔离实例：${baseUrl}（数据目录 ${dataDir}）`);
-          return this.result;
+          return this.succeed();
         }
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
       throw new Error(`健康检查超时（${this.healthTimeoutMs}ms）`);
     } catch (error) {
       this.stop();
-      this.result = {
-        mode: "degraded",
-        baseUrl: explicit ?? local,
-        reason: `LRC 启动失败：${error instanceof Error ? error.message : String(error)}`
-      };
-      this.log(`[lrc] 降级：${this.result.reason}`);
-      return this.result;
+      return this.degrade(
+        explicit ?? local,
+        `LRC 启动失败：${error instanceof Error ? error.message : String(error)}`
+      );
     }
+  }
+  /** 成功：清空退避状态（下次仍可正常复用结果）。 */
+  succeed() {
+    this.degradeCount = 0;
+    this.nextRetryAt = 0;
+    return this.result;
+  }
+  /**
+   * 降级：记录退避窗口。
+   *
+   * 退避的意义：宿主每次 recall 都可能触发一次 `ensure()`，
+   * 若 LRC 长期不在，不加退避就会每次请求都白等 3 秒健康检查超时。
+   */
+  degrade(baseUrl, reason) {
+    this.degradeCount += 1;
+    const exp = this.retryBackoff.baseMs * 2 ** Math.min(this.degradeCount - 1, 4);
+    const backoff = Math.min(exp, this.retryBackoff.maxMs);
+    this.nextRetryAt = backoff > 0 ? Date.now() + backoff : 0;
+    this.result = { mode: "degraded", baseUrl, reason };
+    this.log(
+      backoff > 0 ? `[lrc] 降级：${reason}（${Math.round(backoff / 1e3)}s 后重新探测）` : `[lrc] 降级：${reason}`
+    );
+    return this.result;
+  }
+  /** 当前是否可以重新探测（退避窗口是否已过）。 */
+  mayRetry() {
+    return Date.now() >= this.nextRetryAt;
+  }
+  /**
+   * 显式作废当前状态，下次 `ensure()` 立刻重新探测。
+   *
+   * 用于热路径发现连接断了：既然是刚断的，没必要再等退避窗口。
+   */
+  invalidate(reason) {
+    if (this.result?.mode === "managed") this.stop();
+    this.result = null;
+    this.nextRetryAt = 0;
+    if (reason !== void 0) this.log(`[lrc] 状态已作废，下次重新探测：${reason}`);
+  }
+  /** 当前状态（诊断用）。 */
+  status() {
+    return {
+      mode: this.result?.mode ?? "idle",
+      retryInMs: Math.max(0, this.nextRetryAt - Date.now()),
+      degradeCount: this.degradeCount
+    };
   }
   /**
    * 确保二进制存在且校验通过。
@@ -489,6 +551,127 @@ var LrcClient = class {
     };
   }
 };
+
+// src/recoverable.ts
+var DEFAULT_BACKOFF = {
+  // 2s 起步：足够躲开「刚失败就立刻重试」的抖动，又不至于让用户等太久
+  baseMs: 2e3,
+  // 60s 封顶：即使连续失败很久，一分钟后至少还有一次机会自愈
+  maxMs: 6e4
+};
+var Recoverable = class {
+  factory;
+  now;
+  backoff;
+  value = null;
+  state = "idle";
+  inflight = null;
+  /** 下次允许尝试的时刻（毫秒时间戳） */
+  nextAttemptAt = 0;
+  successes = 0;
+  failures = 0;
+  consecutiveFailures = 0;
+  lastError;
+  lastBackoffMs = 0;
+  /**
+   * 显式作废后置位。
+   *
+   * 与「失败退避」区分开：作废是「之前好好的，刚才那一下断了」，
+   * 应该**立刻**允许重连；退避只在连续失败时才拉长等待。
+   */
+  invalidated = false;
+  constructor(factory, options = {}) {
+    this.factory = factory;
+    this.now = options.now ?? (() => Date.now());
+    this.backoff = { ...DEFAULT_BACKOFF, ...options.backoff };
+  }
+  /** 当前是否已有可用值（不触发任何重试）。 */
+  get ready() {
+    return this.value !== null;
+  }
+  /** 已就绪则直接返回，否则 null（不触发重试）。 */
+  peek() {
+    return this.value;
+  }
+  /**
+   * 取资源。未就绪时按需重试。
+   *
+   * @returns 资源；本轮不该尝试（退避中）或重试失败时为 null
+   */
+  async get() {
+    if (this.value !== null) return this.value;
+    if (this.now() < this.nextAttemptAt) return null;
+    if (this.inflight !== null) return this.inflight;
+    this.inflight = this.attempt();
+    try {
+      return await this.inflight;
+    } finally {
+      this.inflight = null;
+    }
+  }
+  /** 执行一次真实的初始化尝试。 */
+  async attempt() {
+    try {
+      const value = await this.factory();
+      this.value = value;
+      this.state = "ready";
+      this.successes += 1;
+      this.consecutiveFailures = 0;
+      this.lastError = void 0;
+      this.nextAttemptAt = 0;
+      this.invalidated = false;
+      return value;
+    } catch (error) {
+      this.failures += 1;
+      this.consecutiveFailures += 1;
+      this.lastError = error instanceof Error ? error.message : String(error);
+      this.state = "failed";
+      this.value = null;
+      const exp = this.backoff.baseMs * 2 ** Math.min(this.consecutiveFailures - 1, 10);
+      this.lastBackoffMs = Math.min(exp, this.backoff.maxMs);
+      this.nextAttemptAt = this.now() + this.lastBackoffMs;
+      return null;
+    }
+  }
+  /**
+   * 作废当前值，下次 `get()` 立刻重试。
+   *
+   * 用于**热路径发现连接断了**的场景：既然是刚断的，就没必要再等退避。
+   * 注意不清零 `consecutiveFailures`——连续失败仍然会拉长下一次的等待。
+   */
+  invalidate(reason) {
+    this.value = null;
+    this.state = "failed";
+    this.invalidated = true;
+    if (reason !== void 0) this.lastError = reason;
+    this.nextAttemptAt = 0;
+  }
+  /** 状态快照。 */
+  status() {
+    const wait = Math.max(0, this.nextAttemptAt - this.now());
+    return {
+      state: this.state,
+      successes: this.successes,
+      failures: this.failures,
+      consecutiveFailures: this.consecutiveFailures,
+      lastError: this.lastError,
+      retryInMs: this.value === null ? wait : 0,
+      lastBackoffMs: this.lastBackoffMs
+    };
+  }
+  /** 是否处于「作废后待重连」状态（诊断用）。 */
+  get wasInvalidated() {
+    return this.invalidated;
+  }
+};
+function isConnectionError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/返回 \d{3}:/.test(message)) return false;
+  if (/timeout|timed out|ETIMEDOUT/i.test(message)) return true;
+  return /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EPIPE|fetch failed|socket hang up|network/i.test(
+    message
+  );
+}
 
 // src/cursor.ts
 import { createHash as createHash2 } from "node:crypto";
@@ -945,6 +1128,15 @@ function itemsFromTag(tag) {
   return items;
 }
 var Offloader = class {
+  /**
+   * LRC 客户端**可后置注入**。
+   *
+   * 为什么不是构造时写死：插件可能在 LRC 还没起来时加载（实测桌面端晚 20 分钟），
+   * 此前的做法是整个 Offloader 都不创建 —— 连 `observe()` 的计数都不做，
+   * 于是 LRC 恢复后，之前那些轮次的内容已经不在待沉淀队列里了。
+   *
+   * 现在计数器先跑起来，连接一旦就绪只需 `bind()`，不丢历史累计。
+   */
   client;
   cursors;
   config;
@@ -968,6 +1160,26 @@ var Offloader = class {
     this.config = { ...DEFAULT_OFFLOAD_CONFIG, ...config };
     this.recentStore = recentStore;
     this.recent = recentStore?.load() ?? [];
+  }
+  /** 连接是否已就绪。 */
+  get connected() {
+    return this.client !== null;
+  }
+  /**
+   * 注入 / 替换客户端。
+   *
+   * 传 `null` 表示连接已断：保留所有计数器与游标，
+   * 只停止发起 HTTP —— 恢复后可以接着从断点继续，不会重复也不会丢失。
+   */
+  bind(client) {
+    this.client = client;
+  }
+  /** 取客户端（未连接时抛错，调用方负责先判 `connected`）。 */
+  requireClient() {
+    if (this.client === null) {
+      throw new Error("LRC 尚未连接");
+    }
+    return this.client;
   }
   /** 记录一轮新增文本（由 index.ts 在 assistant/message 事件里调用）。 */
   observe(text) {
@@ -1091,13 +1303,17 @@ var Offloader = class {
     if (freshBlocks.length > 0) {
       const text = freshBlocks.join("\n");
       charsSent += text.length;
-      const distilled = await this.client.distill(text, this.config.project, this.config.maxItems);
+      const distilled = await this.requireClient().distill(
+        text,
+        this.config.project,
+        this.config.maxItems
+      );
       items = [...items, ...distilled.items];
     }
     let written = 0;
     let merged = 0;
     if (items.length > 0) {
-      const migrated = await this.client.migrate(items, this.config.project);
+      const migrated = await this.requireClient().migrate(items, this.config.project);
       written = migrated.written;
       merged = migrated.merged;
     }
@@ -1151,7 +1367,7 @@ var Offloader = class {
       this.record(empty);
       return empty;
     }
-    const migrated = await this.client.migrate(fresh, this.config.project);
+    const migrated = await this.requireClient().migrate(fresh, this.config.project);
     this.recent.push(...fresh.map((item) => item.content));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
@@ -2222,6 +2438,7 @@ function formatProfile(profile) {
 
 // src/governor.ts
 var MAX_CONSECUTIVE_FAILURES = 3;
+var HALF_OPEN_AFTER_STEPS = 20;
 function createGovernorState() {
   return {
     capabilities: null,
@@ -2230,7 +2447,8 @@ function createGovernorState() {
     disabled: /* @__PURE__ */ new Set(),
     lastOutcome: {},
     lastRunStep: {},
-    runs: {}
+    runs: {},
+    disabledAtStep: {}
   };
 }
 async function runGovernor(deps) {
@@ -2239,7 +2457,14 @@ async function runGovernor(deps) {
   const executed = [];
   for (const action of actions) {
     if (!action.enabled) continue;
-    if (state.disabled.has(action.name)) continue;
+    if (state.disabled.has(action.name)) {
+      const since = state.disabledAtStep[action.name] ?? state.steps;
+      if (state.steps - since < HALF_OPEN_AFTER_STEPS) continue;
+      state.disabled.delete(action.name);
+      delete state.disabledAtStep[action.name];
+      state.failures[action.name] = 0;
+      log(`[lrc][governor] ${action.name} 进入半开，允许试跑一次`);
+    }
     const throttle = action.throttleSteps ?? 1;
     const last = state.lastRunStep[action.name];
     if (last !== void 0 && state.steps - last < throttle) continue;
@@ -2265,8 +2490,9 @@ async function runGovernor(deps) {
     state.failures[action.name] = failures;
     if (failures >= MAX_CONSECUTIVE_FAILURES) {
       state.disabled.add(action.name);
+      state.disabledAtStep[action.name] = state.steps;
       warn(
-        `[lrc][governor] ${action.name} 连续失败 ${failures} 次，已熔断（本次会话不再尝试）：${outcome.reason}`
+        `[lrc][governor] ${action.name} 连续失败 ${failures} 次，已熔断（${HALF_OPEN_AFTER_STEPS} 步后半开重试）：${outcome.reason}`
       );
     } else {
       warn(
@@ -2292,7 +2518,12 @@ function formatGovernorState(state) {
   }
   for (const name2 of names) {
     const outcome = state.lastOutcome[name2];
-    const disabled = state.disabled.has(name2) ? " [已熔断]" : "";
+    let disabled = "";
+    if (state.disabled.has(name2)) {
+      const since = state.disabledAtStep[name2] ?? state.steps;
+      const remain = Math.max(0, HALF_OPEN_AFTER_STEPS - (state.steps - since));
+      disabled = ` [已熔断，${remain} 步后半开]`;
+    }
     const runs = state.runs[name2] ?? 0;
     const failures = state.failures[name2] ?? 0;
     lines.push(
@@ -2341,7 +2572,19 @@ var Config = Schema.object({
   trimMaxNodes: Schema.number().default(120),
   // ★2026-11-07：2000 → 4000。实测 2000 字符的摘要会把关键结论截掉，
   // 用户反馈「关键信息基本都丢了」；4000 仍远小于被裁剪区间（约 9k tokens）。
-  trimMaxSummaryChars: Schema.number().default(4e3)
+  trimMaxSummaryChars: Schema.number().default(4e3),
+  // ── 连接恢复 ──
+  // LRC 可能比 DSH 晚启动（实测桌面端晚 20 分钟）。此前插件只在加载时连一次，
+  // 失败即永久降级 —— 召回整场会话都用不了。这两项控制重连退避节奏。
+  /** 首次重连等待（毫秒）；0 = 不重试（仅排障用） */
+  reconnectBaseMs: Schema.number().default(2e3),
+  /** 重连退避上限（毫秒）：封顶保证最终能自愈 */
+  reconnectMaxMs: Schema.number().default(6e4),
+  // ── 一次性判定的复查 ──
+  // 宿主服务可能后起（compaction 在 preset 初始化 / tokenMeter 随模型切换就绪）。
+  // 一次性探测会把「启动瞬间没准备好」固化成「整场会话不可用」。
+  capabilityRecheckSteps: Schema.number().default(20),
+  budgetRecheckSteps: Schema.number().default(20)
 });
 var PROMPT_SECTION = "lrc:memory-capture";
 var PROMPT_TEXT = [
@@ -2395,7 +2638,18 @@ function apply(ctx, config) {
     log: (message) => ctx.logger.info(message)
   });
   let offloader = null;
-  let client = null;
+  const connection = new Recoverable(
+    async () => {
+      const result = await runtime.ensure({ force: true });
+      if (result.mode === "degraded") {
+        throw new Error(result.reason ?? "LRC 不可用");
+      }
+      const created = new LrcClient({ baseUrl: result.baseUrl, token: config.token || void 0 });
+      attachOffloader(created);
+      return created;
+    },
+    { backoff: { baseMs: config.reconnectBaseMs, maxMs: config.reconnectMaxMs } }
+  );
   let warnedShape = false;
   let warnedEmpty = false;
   let warnedNoConclusion = false;
@@ -2446,30 +2700,52 @@ function apply(ctx, config) {
   ctx.logger.info(
     `[lrc] compaction 服务：${compaction === void 0 ? "不可达（preset 隔离）" : typeof compaction.compactRegion === "function" ? "可用（支持 compactRegion）" : "存在但无 compactRegion"}`
   );
+  function attachOffloader(client) {
+    if (offloader === null) {
+      offloader = new Offloader(
+        client,
+        new CursorStore(join2(cacheDir, "cursor.json")),
+        {
+          turnsThreshold: config.offloadTurns,
+          charsThreshold: config.offloadChars,
+          stepsThreshold: config.offloadSteps,
+          project: config.project,
+          maxItems: config.maxItems
+        },
+        new RecentStore(join2(cacheDir, "recent.json"))
+      );
+    } else {
+      offloader.bind(client);
+    }
+  }
+  offloader = new Offloader(
+    null,
+    new CursorStore(join2(cacheDir, "cursor.json")),
+    {
+      turnsThreshold: config.offloadTurns,
+      charsThreshold: config.offloadChars,
+      stepsThreshold: config.offloadSteps,
+      project: config.project,
+      maxItems: config.maxItems
+    },
+    new RecentStore(join2(cacheDir, "recent.json"))
+  );
   void (async () => {
-    const result = await runtime.ensure();
-    if (result.mode === "degraded") {
-      ctx.logger.warn(`[lrc] 未启用记忆沉淀：${result.reason ?? "未知原因"}`);
+    const client = await connection.get();
+    if (client === null) {
+      const status = connection.status();
+      ctx.logger.warn(
+        `[lrc] 暂未连上 LRC（${status.lastError ?? "未知原因"}）。将在工具调用时按退避重试（下次最早 ${Math.round(status.retryInMs / 1e3)}s 后）。`
+      );
       return;
     }
-    client = new LrcClient({ baseUrl: result.baseUrl, token: config.token || void 0 });
-    offloader = new Offloader(
-      client,
-      new CursorStore(join2(cacheDir, "cursor.json")),
-      {
-        turnsThreshold: config.offloadTurns,
-        charsThreshold: config.offloadChars,
-        stepsThreshold: config.offloadSteps,
-        project: config.project,
-        maxItems: config.maxItems
-      },
-      new RecentStore(join2(cacheDir, "recent.json"))
-    );
-    ctx.logger.info(`[lrc] 记忆沉淀已就绪（${result.mode}）：${result.baseUrl}`);
+    ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
     void bootstrapSnapshot();
   })();
   async function bootstrapSnapshot() {
-    if (latestSnapshot.length > 0 || client === null) return;
+    if (latestSnapshot.length > 0) return;
+    const client = connection.peek();
+    if (client === null) return;
     try {
       const index = await client.index(config.project, 3);
       if (index.items.length === 0) return;
@@ -2483,9 +2759,31 @@ function apply(ctx, config) {
     } catch {
     }
   }
+  async function acquireClient() {
+    const client = await connection.get();
+    if (client !== null) return { client };
+    const status = connection.status();
+    const wait = Math.ceil(status.retryInMs / 1e3);
+    return {
+      reason: `LRC 暂时不可用：${status.lastError ?? "未知原因"}` + (wait > 0 ? `（约 ${wait}s 后自动重试）` : "")
+    };
+  }
+  function noteToolFailure(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isConnectionError(error)) {
+      connection.invalidate(message);
+      offloader?.bind(null);
+      ctx.logger.warn(`[lrc][tool] 连接失效，已标记重连：${message}`);
+    }
+    return message;
+  }
   async function flush(session, reason) {
     if (offloader === null || flushing) return;
     if (!offloader.hasPending()) return;
+    if (!offloader.connected) {
+      void connection.get();
+      return;
+    }
     flushing = true;
     try {
       const sessionId = session?.id ?? "default";
@@ -2536,9 +2834,14 @@ function apply(ctx, config) {
         );
       }
     } catch (error) {
-      ctx.logger.warn(
-        `[lrc] 沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      if (isConnectionError(error)) {
+        connection.invalidate(message);
+        offloader?.bind(null);
+        ctx.logger.warn(`[lrc] 沉淀失败，连接已标记失效（下次调用重连）：${message}`);
+      } else {
+        ctx.logger.warn(`[lrc] 沉淀失败（不影响对话）：${message}`);
+      }
     } finally {
       flushing = false;
     }
@@ -2630,11 +2933,34 @@ function apply(ctx, config) {
           `[lrc][cap] 能力探测异常：${error instanceof Error ? error.message : String(error)}`
         );
       }
+    } else if (governor.steps > 0 && governor.steps % config.capabilityRecheckSteps === 0) {
+      const before = governor.capabilities;
+      const needsRecheck = before === null || !before.compaction.available || !before.tokenMeter.available || !before.toolResultPruner.available;
+      if (needsRecheck) {
+        try {
+          const after = probeCapabilities(ctx, agent);
+          governor.capabilities = after;
+          const recovered = [];
+          if (before !== null && !before.compaction.available && after.compaction.available) {
+            recovered.push("compaction");
+          }
+          if (before !== null && !before.tokenMeter.available && after.tokenMeter.available) {
+            recovered.push("tokenMeter");
+          }
+          if (before !== null && !before.toolResultPruner.available && after.toolResultPruner.available) {
+            recovered.push("toolResultPruner");
+          }
+          if (recovered.length > 0) {
+            ctx.logger.info(`[lrc][cap] 复查后恢复可用：${recovered.join("、")}`);
+          }
+        } catch {
+        }
+      }
     }
     const caps = governor.capabilities;
-    if (budget === null) {
+    if (budget === null || budget.source === "fallback" && governor.steps % config.budgetRecheckSteps === 0) {
       try {
-        budget = await resolveBudget({
+        const resolved = await resolveBudget({
           ctx,
           agent,
           config: {
@@ -2645,7 +2971,10 @@ function apply(ctx, config) {
             pruneResultThreshold: config.pruneResultThreshold
           }
         });
-        ctx.logger.info(formatBudget(budget));
+        if (budget === null || resolved.source !== budget.source || resolved.windowTokens !== budget.windowTokens) {
+          ctx.logger.info(formatBudget(resolved));
+        }
+        budget = resolved;
       } catch (error) {
         ctx.logger.warn(
           `[lrc][budget] 预算解析失败，使用配置绝对值：${error instanceof Error ? error.message : String(error)}`
@@ -2809,9 +3138,11 @@ function apply(ctx, config) {
         ]
       },
       async execute(args) {
-        if (client === null) {
-          return { snapshot: "LRC 未就绪，本次未沉淀", distilled: 0, written: 0, merged: 0 };
+        const acquired = await acquireClient();
+        if ("reason" in acquired) {
+          return { snapshot: acquired.reason, distilled: 0, written: 0, merged: 0 };
         }
+        const { client } = acquired;
         try {
           const tag = extractMemoryTag(args.text);
           if (tag !== null) {
@@ -2842,7 +3173,7 @@ function apply(ctx, config) {
           };
         } catch (error) {
           return {
-            snapshot: `LRC 未连接，本次未沉淀（${String(error).slice(0, 120)}）`,
+            snapshot: `本次未沉淀：${noteToolFailure(error).slice(0, 160)}`,
             distilled: 0,
             written: 0,
             merged: 0
@@ -2884,13 +3215,15 @@ function apply(ctx, config) {
         render: (_args, value) => [{ type: "text", text: value.text }]
       },
       async execute(args) {
-        if (client === null) {
-          return { text: "LRC 未就绪，无法召回。", count: 0 };
-        }
         const query = typeof args.query === "string" ? args.query.trim() : "";
         if (query.length === 0) {
           return { text: "lrc_recall 需要非空的 query。", count: 0 };
         }
+        const acquired = await acquireClient();
+        if ("reason" in acquired) {
+          return { text: `${acquired.reason}。可先用内置搜索。`, count: 0 };
+        }
+        const { client } = acquired;
         try {
           const topK = Math.min(Math.max(args.top_k ?? 5, 1), 20);
           const result = await client.recall(query, {
@@ -2918,7 +3251,7 @@ ${m.content}`;
             count: result.memories.length
           };
         } catch (error) {
-          return { text: `LRC 召回失败：${String(error).slice(0, 200)}`, count: 0 };
+          return { text: `LRC 召回失败：${noteToolFailure(error).slice(0, 200)}`, count: 0 };
         }
       }
     })
@@ -2947,13 +3280,15 @@ ${m.content}`;
         render: (_args, value) => [{ type: "text", text: value.text }]
       },
       async execute(args) {
-        if (client === null) {
-          return { text: "LRC 未就绪，无法删除。", deleted: false };
-        }
         const memoryId = typeof args.memory_id === "string" ? args.memory_id.trim() : "";
         if (memoryId.length === 0) {
           return { text: "lrc_forget 需要非空的 memory_id。", deleted: false };
         }
+        const acquired = await acquireClient();
+        if ("reason" in acquired) {
+          return { text: acquired.reason, deleted: false };
+        }
+        const { client } = acquired;
         try {
           const result = await client.forget(memoryId);
           ctx.logger.info(
@@ -2967,7 +3302,7 @@ ${m.content}`;
           }
           return { text: `记忆 ${memoryId} 未删除（服务端返回 deleted=false）。`, deleted: false };
         } catch (error) {
-          return { text: `LRC 删除失败：${String(error).slice(0, 200)}`, deleted: false };
+          return { text: `LRC 删除失败：${noteToolFailure(error).slice(0, 200)}`, deleted: false };
         }
       }
     })
@@ -3010,6 +3345,7 @@ ${value.text}`
         const session = lastAgent?.session;
         const source = extractHandoffSource(session);
         let indexLines = [];
+        const client = connection.peek();
         if (client !== null) {
           try {
             const index = await client.index(config.project, 10);
@@ -3071,6 +3407,25 @@ ${value.text}`
         lines.push("## 动作状态");
         lines.push(formatGovernorState(governor));
         lines.push("");
+        lines.push("## 连接");
+        {
+          const conn = connection.status();
+          const rt = runtime.status();
+          const stateText = conn.state === "ready" ? "已连接" : conn.state === "failed" ? `未连接（${conn.lastError ?? "未知原因"}）` : "尚未尝试";
+          lines.push(
+            `- LRC 连接：${stateText}` + (conn.state === "ready" ? "" : `｜重试倒计时 ${Math.ceil(conn.retryInMs / 1e3)}s（退避 ${Math.round(conn.lastBackoffMs / 1e3)}s）`)
+          );
+          lines.push(
+            `- 累计：成功 ${conn.successes} 次 / 失败 ${conn.failures} 次（连续 ${conn.consecutiveFailures}）`
+          );
+          lines.push(
+            `- 运行时：${rt.mode}｜连续降级 ${rt.degradeCount} 次｜下次重探 ${Math.ceil(rt.retryInMs / 1e3)}s`
+          );
+          if (conn.lastError !== void 0 && conn.state !== "ready") {
+            lines.push(`- 最近错误：${conn.lastError}`);
+          }
+        }
+        lines.push("");
         lines.push("## 上下文画像");
         try {
           lines.push(formatProfile(profileSurface(lastAgent?.session)));
@@ -3083,6 +3438,9 @@ ${value.text}`
           lines.push("未启用");
         } else {
           const stats = offloader.stats();
+          if (!offloader.connected) {
+            lines.push("连接未就绪：本轮新增内容已计入待沉淀队列，连上后会自动补写。");
+          }
           lines.push(
             `累计 ${stats.flushCount} 次：新写入 ${stats.totalWritten} 条 / 合并 ${stats.totalMerged} 条 / 本地查重拦下 ${stats.totalDeduped} 块`
           );

@@ -54,10 +54,24 @@ export interface GovernorState {
   lastRunStep: Record<string, number>;
   /** 每个动作累计执行次数 */
   runs: Record<string, number>;
+  /** 每个动作熔断的时刻（`steps`），用于半开恢复 */
+  disabledAtStep: Record<string, number>;
 }
 
 /** 连续失败多少次后熔断。 */
 export const MAX_CONSECUTIVE_FAILURES = 3;
+
+/**
+ * 熔断后多少步进入「半开」：允许试跑一次。
+ *
+ * 为什么必须能恢复：上下文裁剪依赖的宿主服务可能是**后起**的（compaction
+ * 服务在 preset 里初始化，或用户中途切换模型导致 tokenMeter 就绪）。
+ * 此前熔断是「本次会话不再尝试」——一次瞬时故障就让整场会话失去裁剪能力，
+ * 上下文一路涨到爆，而 `lrc_status` 只显示一行「已熔断」，用户无从得知。
+ *
+ * 20 步 ≈ 一次中等长度的工具密集型任务，既不会每步空转，也不至于永久放弃。
+ */
+export const HALF_OPEN_AFTER_STEPS = 20;
 
 export function createGovernorState(): GovernorState {
   return {
@@ -68,6 +82,7 @@ export function createGovernorState(): GovernorState {
     lastOutcome: {},
     lastRunStep: {},
     runs: {},
+    disabledAtStep: {},
   };
 }
 
@@ -92,7 +107,15 @@ export async function runGovernor(deps: {
 
   for (const action of actions) {
     if (!action.enabled) continue;
-    if (state.disabled.has(action.name)) continue;
+    // 熔断中：等够 HALF_OPEN_AFTER_STEPS 步后放行一次（半开探测）
+    if (state.disabled.has(action.name)) {
+      const since = state.disabledAtStep[action.name] ?? state.steps;
+      if (state.steps - since < HALF_OPEN_AFTER_STEPS) continue;
+      state.disabled.delete(action.name);
+      delete state.disabledAtStep[action.name];
+      state.failures[action.name] = 0;
+      log(`[lrc][governor] ${action.name} 进入半开，允许试跑一次`);
+    }
 
     const throttle = action.throttleSteps ?? 1;
     const last = state.lastRunStep[action.name];
@@ -125,8 +148,10 @@ export async function runGovernor(deps: {
     state.failures[action.name] = failures;
     if (failures >= MAX_CONSECUTIVE_FAILURES) {
       state.disabled.add(action.name);
+      state.disabledAtStep[action.name] = state.steps;
       warn(
-        `[lrc][governor] ${action.name} 连续失败 ${failures} 次，已熔断（本次会话不再尝试）：${outcome.reason}`,
+        `[lrc][governor] ${action.name} 连续失败 ${failures} 次，已熔断` +
+          `（${HALF_OPEN_AFTER_STEPS} 步后半开重试）：${outcome.reason}`,
       );
     } else {
       warn(
@@ -155,7 +180,12 @@ export function formatGovernorState(state: GovernorState): string {
   }
   for (const name of names) {
     const outcome = state.lastOutcome[name];
-    const disabled = state.disabled.has(name) ? ' [已熔断]' : '';
+    let disabled = '';
+    if (state.disabled.has(name)) {
+      const since = state.disabledAtStep[name] ?? state.steps;
+      const remain = Math.max(0, HALF_OPEN_AFTER_STEPS - (state.steps - since));
+      disabled = ` [已熔断，${remain} 步后半开]`;
+    }
     const runs = state.runs[name] ?? 0;
     const failures = state.failures[name] ?? 0;
     lines.push(
