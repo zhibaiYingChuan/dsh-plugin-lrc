@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { LrcRuntime, extractSha256, BINARY_FILES } from '../src/runtime.ts';
+import { LrcRuntime, extractSha256, BINARY_FILES, orderDigestSources, BUILTIN_SOURCES } from '../src/runtime.ts';
 
 let failed = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -191,24 +191,17 @@ const verCache = join(workDir, 'e');
 const rmBin = () => join(verCache, 'bin', process.platform === 'win32' ? 'lrc-sidecar.exe' : 'lrc-sidecar');
 
 // 第一次：拉到 A 版（不注入 manifest ⇒ 哈希来自远端 .sha256）
-const v1 = new LrcRuntime({
-  cacheDir: verCache,
-  mirror: verUrl,
-  probeLocal: false,
-  healthTimeoutMs: 800,
-});
+// 注：本组要验证"每次启动都重新比对指纹"，故关掉复用窗口（recheckAfterMs=0）——
+// 线上默认 1 小时，见 runtime.ts 的说明。
+const verOpts = { cacheDir: verCache, mirror: verUrl, probeLocal: false, healthTimeoutMs: 800, recheckAfterMs: 0 };
+const v1 = new LrcRuntime(verOpts);
 await v1.ensure();
 v1.stop();
 check('首次按远端哈希下载', downloadCount === 1, `downloads=${downloadCount}`);
 check('缓存内容为 A 版', readFileSync(rmBin()).toString() === verBinA.toString(), '内容不符');
 
 // 第二次：哈希未变 ⇒ 复用，不应再下载
-const v2 = new LrcRuntime({
-  cacheDir: verCache,
-  mirror: verUrl,
-  probeLocal: false,
-  healthTimeoutMs: 800,
-});
+const v2 = new LrcRuntime(verOpts);
 await v2.ensure();
 v2.stop();
 check('哈希未变时复用（不重复下载）', downloadCount === 1, `downloads=${downloadCount}`);
@@ -216,18 +209,161 @@ check('哈希未变时复用（不重复下载）', downloadCount === 1, `downlo
 // 第三次：远端换成 B 版 ⇒ 必须自动重下
 currentBin = verBinB;
 currentHash = hashB;
-const v3 = new LrcRuntime({
-  cacheDir: verCache,
-  mirror: verUrl,
-  probeLocal: false,
-  healthTimeoutMs: 800,
-});
+const v3 = new LrcRuntime(verOpts);
 await v3.ensure();
 v3.stop();
 check('远端发新版后自动重下', downloadCount === 2, `downloads=${downloadCount}`);
 check('缓存已更新为 B 版', readFileSync(rmBin()).toString() === verBinB.toString(), '内容未更新');
 
 await new Promise<void>((resolve) => verServer.close(() => resolve()));
+
+// ── 6) 镜像滞后：版本仍按真源判定，且能自动绕过落后镜像 ─────────────
+//
+// 现实约束：国内镜像靠人工同步，LRC 发版后会滞后。若"第一个能连上的源"决定版本，
+// 用户会被永久钉在旧版上且毫无提示。这里锁住三条：
+//   a) 查指纹时真源排在镜像之前（顺序不因"下载要快"而被镜像抢占）；
+//   b) 指纹取真源；
+//   c) 镜像内容与真源指纹不符 ⇒ 判为"镜像落后"并继续换源，而不是当成篡改直接失败。
+console.log('=== 6) 镜像滞后：按真源判版本并绕过落后镜像 ===');
+
+// a) 顺序：显式源 > 真源 > 镜像
+{
+  const ordered = orderDigestSources(['http://explicit.local'], BUILTIN_SOURCES);
+  const mirrorIdx = ordered.indexOf('https://sfang.cc/xd/downloads');
+  const ghIdx = ordered.indexOf(
+    'https://github.com/zhibaiYingChuan/LRC/releases/latest/download',
+  );
+  check('显式源排第一', ordered[0] === 'http://explicit.local', ordered);
+  check('真源排在镜像之前', ghIdx !== -1 && mirrorIdx !== -1 && ghIdx < mirrorIdx, ordered);
+}
+
+// b)+c) 真源给新指纹、镜像给旧内容 ⇒ 必须跳过镜像并成功落到真源
+const freshBin = Buffer.from('FRESH-binary-latest');
+const freshHash = createHash('sha256').update(freshBin).digest('hex');
+const staleBin = Buffer.from('STALE-binary-previous-release');
+
+let staleHits = 0;
+let freshHits = 0;
+function makeBinServer(kind: 'fresh' | 'stale'): ReturnType<typeof createServer> {
+  return createServer((req, res) => {
+    if (req.url?.endsWith('.sha256')) {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end(`${kind === 'fresh' ? freshHash : 'f'.repeat(64)}  lrc-sidecar.exe`);
+      return;
+    }
+    if (kind === 'fresh') freshHits += 1;
+    else staleHits += 1;
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+    res.end(kind === 'fresh' ? freshBin : staleBin);
+  });
+}
+const staleServer = makeBinServer('stale');
+const freshServer = makeBinServer('fresh');
+await new Promise<void>((r) => staleServer.listen(0, '127.0.0.1', r));
+await new Promise<void>((r) => freshServer.listen(0, '127.0.0.1', r));
+const staleAddr = staleServer.address();
+const freshAddr = freshServer.address();
+if (staleAddr === null || typeof staleAddr === 'string') throw new Error('端口获取失败');
+if (freshAddr === null || typeof freshAddr === 'string') throw new Error('端口获取失败');
+const staleUrl = `http://127.0.0.1:${staleAddr.port}`;
+const freshUrl = `http://127.0.0.1:${freshAddr.port}`;
+const lagCache = join(workDir, 'f');
+const rmBinFor = (cache: string) =>
+  join(cache, 'bin', process.platform === 'win32' ? 'lrc-sidecar.exe' : 'lrc-sidecar');
+
+// 源表与线上同构：滞后镜像排第一（下载快），真源第二（版本准）
+const lagging = new LrcRuntime({
+  cacheDir: lagCache,
+  probeLocal: false,
+  healthTimeoutMs: 800,
+  builtinSources: [
+    { url: staleUrl, authoritative: false },
+    { url: freshUrl, authoritative: true },
+  ],
+});
+await lagging.ensure();
+lagging.stop();
+check(
+  '落后镜像不会把插件钉在旧版（缓存为真源版本）',
+  readFileSync(rmBinFor(lagCache)).toString() === freshBin.toString(),
+  '内容应为真源版本',
+);
+check('确实先试过落后镜像', staleHits >= 1, `stale=${staleHits}`);
+check('跳过落后镜像后仍从真源下载成功', freshHits >= 1, `fresh=${freshHits}`);
+
+// 极简延迟复用：本地完好且刚查过远端 ⇒ 不再打扰真源（国内用户启动不必等境外超时）
+const reuseCache = join(workDir, 'g');
+let reuseQueries = 0;
+const reuseServer = createServer((req, res) => {
+  if (req.url?.endsWith('.sha256')) {
+    reuseQueries += 1;
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(`${createHash('sha256').update(freshBin).digest('hex')}  lrc-sidecar.exe`);
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+  res.end(freshBin);
+});
+await new Promise<void>((r) => reuseServer.listen(0, '127.0.0.1', r));
+const reuseAddr = reuseServer.address();
+if (reuseAddr === null || typeof reuseAddr === 'string') throw new Error('端口获取失败');
+const reuseUrl = `http://127.0.0.1:${reuseAddr.port}`;
+
+for (let i = 0; i < 2; i += 1) {
+  const rt = new LrcRuntime({
+    cacheDir: reuseCache,
+    mirrors: [reuseUrl],
+    probeLocal: false,
+    healthTimeoutMs: 500,
+  });
+  await rt.ensure();
+  rt.stop();
+}
+check('复用期内不重复询问版本', reuseQueries === 1, `queries=${reuseQueries}`);
+
+// 窗口必须**续期**：否则只省一次，之后每次启动都还去连境外，等于没做
+const { utimesSync } = await import('node:fs');
+const stampFile = join(reuseCache, 'bin', `${process.platform === 'win32' ? 'lrc-sidecar.exe' : 'lrc-sidecar'}.version`);
+const old = new Date(Date.now() - 2 * 60 * 60 * 1000); // 2 小时前 ⇒ 已过默认窗口
+utimesSync(stampFile, old, old);
+{
+  const rt = new LrcRuntime({
+    cacheDir: reuseCache,
+    mirrors: [reuseUrl],
+    probeLocal: false,
+    healthTimeoutMs: 500,
+  });
+  await rt.ensure();
+  rt.stop();
+}
+check('过期后重新确认版本', reuseQueries === 2, `queries=${reuseQueries}`);
+{
+  const rt = new LrcRuntime({
+    cacheDir: reuseCache,
+    mirrors: [reuseUrl],
+    probeLocal: false,
+    healthTimeoutMs: 500,
+  });
+  await rt.ensure();
+  rt.stop();
+}
+check('确认后窗口已续期（下次不再查询）', reuseQueries === 2, `queries=${reuseQueries}`);
+
+// 关掉复用后必须重新查询
+const recheckRt = new LrcRuntime({
+  cacheDir: reuseCache,
+  mirrors: [reuseUrl],
+  probeLocal: false,
+  healthTimeoutMs: 500,
+  recheckAfterMs: 0,
+});
+await recheckRt.ensure();
+recheckRt.stop();
+check('recheckAfterMs=0 时每次都查', reuseQueries === 3, `queries=${reuseQueries}`);
+await new Promise<void>((resolve) => reuseServer.close(() => resolve()));
+
+await new Promise<void>((resolve) => staleServer.close(() => resolve()));
+await new Promise<void>((resolve) => freshServer.close(() => resolve()));
 
 await new Promise<void>((resolve) => fileServer.close(() => resolve()));
 rmSync(workDir, { recursive: true, force: true });

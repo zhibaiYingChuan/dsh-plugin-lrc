@@ -9,7 +9,16 @@ import { existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as rea
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync
+} from "node:fs";
 import { homedir, platform, arch } from "node:os";
 import { join } from "node:path";
 var BINARY_FILES = {
@@ -17,14 +26,20 @@ var BINARY_FILES = {
   "darwin-arm64": "lrc-sidecar-darwin-arm64",
   "linux-x64": "lrc-sidecar-linux-x64"
 };
-var DEFAULT_MIRRORS = [
-  // ① 国内直连（自家服务器，不依赖 GitHub 可达性）
-  "https://sfang.cc/xd/downloads",
+var GITHUB_LATEST = "https://github.com/zhibaiYingChuan/LRC/releases/latest/download";
+var BUILTIN_SOURCES = [
+  // ① 国内直连（自家服务器，不依赖 GitHub 可达性）—— 只提速，**不代表版本**
+  { url: "https://sfang.cc/xd/downloads", authoritative: false },
   // ② GitHub 官方稳定别名（永远指向最新 Release）
-  "https://github.com/zhibaiYingChuan/LRC/releases/latest/download",
-  // ③ GitHub 加速代理（前两者都失败时的兜底）
-  "https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/latest/download"
+  { url: GITHUB_LATEST, authoritative: true },
+  // ③ GitHub 加速代理（转发同一份 latest 内容，同样代表版本）
+  { url: `https://ghproxy.net/${GITHUB_LATEST}`, authoritative: true }
 ];
+function orderDigestSources(explicit, builtin) {
+  const authoritative = builtin.filter((s) => s.authoritative).map((s) => s.url);
+  const fallback = builtin.filter((s) => !s.authoritative).map((s) => s.url);
+  return [...explicit, ...authoritative, ...fallback];
+}
 function defaultCacheDir() {
   const dshHome = process.env.DSH_HOME ?? join(homedir(), ".dsh");
   return join(dshHome, "cache", "lrc-plugin");
@@ -67,12 +82,15 @@ async function isHealthy(baseUrl, timeoutMs = 3e3) {
 }
 var LrcRuntime = class {
   cacheDir;
-  mirror;
   log;
   healthTimeoutMs;
   manifest;
-  mirrors;
+  /** 显式指定的源（插件配置 / 环境变量 / 测试注入），优先且被视为可信。 */
+  explicitSources;
+  /** 内置源，带"是否版本真源"标记。 */
+  builtinSources;
   probeLocal;
+  recheckAfterMs;
   /** 显式实例地址：配置 `baseUrl` 优先，其次 `LRC_BASE` 环境变量。 */
   explicitBase;
   child = null;
@@ -80,14 +98,34 @@ var LrcRuntime = class {
   constructor(options = {}) {
     this.explicitBase = options.baseUrl?.trim() || process.env.LRC_BASE;
     this.cacheDir = options.cacheDir ?? defaultCacheDir();
-    this.mirror = options.mirror ?? process.env.LRC_MIRROR;
     this.log = options.log ?? (() => {
     });
     this.healthTimeoutMs = options.healthTimeoutMs ?? 15e3;
     this.manifest = options.manifest ?? {};
     this.probeLocal = options.probeLocal ?? true;
-    const extra = (options.mirrors ?? []).map((m) => m.replace(/\/+$/, "")).filter(Boolean);
-    this.mirrors = [...extra, ...DEFAULT_MIRRORS];
+    this.recheckAfterMs = options.recheckAfterMs ?? 60 * 60 * 1e3;
+    const explicit = [options.mirror ?? process.env.LRC_MIRROR ?? "", ...options.mirrors ?? []].map((m) => m.trim().replace(/\/+$/, "")).filter(Boolean);
+    this.explicitSources = [...new Set(explicit)];
+    this.builtinSources = options.builtinSources ?? BUILTIN_SOURCES;
+  }
+  /** 下载候选源：显式源优先，其次国内镜像（快），最后 GitHub。 */
+  downloadSources() {
+    return [...this.explicitSources, ...this.builtinSources.map((s) => s.url)];
+  }
+  /**
+   * 指纹查询源：**版本真源优先**。
+   *
+   * 顺序 = 显式源 > GitHub latest（及其代理）> 国内镜像（仅当真源全都不可达时兜底）。
+   * 国内镜像是人工同步的，可能落后一版甚至更久；若让它先出指纹，
+   * 用户在 LRC 发新版后会一直停在旧版，且毫无提示。
+   */
+  digestSources() {
+    return orderDigestSources(this.explicitSources, this.builtinSources);
+  }
+  /** 该源是否代表"当前最新版本"。 */
+  isAuthoritative(url) {
+    if (this.explicitSources.includes(url)) return true;
+    return this.builtinSources.some((s) => s.url === url && s.authoritative);
   }
   /** 幂等：多次调用只启动一次。 */
   async ensure() {
@@ -186,10 +224,18 @@ var LrcRuntime = class {
     const stampPath = join(binDir, `${binaryName()}.version`);
     mkdirSync(binDir, { recursive: true });
     const pinned = this.manifest[key]?.sha256;
+    if (pinned === void 0 && existsSync(target) && this.recentlyChecked(stampPath)) {
+      const cached = this.readStamp(stampPath);
+      if (cached !== null && this.verify(target, cached)) {
+        this.log("[lrc] 上次检查后本地二进制完好，跳过版本查询");
+        return target;
+      }
+    }
     const remote = await this.fetchRemoteDigest(file, pinned);
     if (existsSync(target) && remote.digest !== null) {
       const localStamp = this.readStamp(stampPath);
       if (localStamp === remote.digest && this.verify(target, remote.digest)) {
+        this.touch(stampPath);
         this.log(`[lrc] 复用已缓存二进制（${remote.digest.slice(0, 12)}…）`);
         return target;
       }
@@ -201,9 +247,9 @@ var LrcRuntime = class {
       }
       throw new Error(`无法获取版本指纹：${remote.error ?? "所有源均不可达"}`);
     }
-    const sources = this.mirror ? [this.mirror.replace(/\/+$/, ""), ...this.mirrors] : this.mirrors;
     let lastError = null;
-    for (const source of sources) {
+    let staleMirrors = 0;
+    for (const source of this.downloadSources()) {
       const url = `${source}/${file}`;
       try {
         this.log(`[lrc] 下载 ${url}`);
@@ -213,6 +259,12 @@ var LrcRuntime = class {
         writeFileSync(target, buffer);
         if (!this.verify(target, remote.digest)) {
           rmSync(target, { force: true });
+          if (remote.authoritative && !this.isAuthoritative(source)) {
+            staleMirrors += 1;
+            throw new Error(
+              `镜像内容落后于 ${remote.digest.slice(0, 12)}…（可能尚未同步新版），已跳过`
+            );
+          }
           throw new Error(
             `SHA256 校验失败（期望 ${remote.digest.slice(0, 12)}…）。文件可能被篡改或下载不完整，已删除。`
           );
@@ -228,22 +280,27 @@ var LrcRuntime = class {
         this.log(`[lrc] 源失败（${source}）：${msg}`);
       }
     }
+    const detail = lastError instanceof Error ? lastError.message : String(lastError);
     throw new Error(
-      `所有源均失败：${lastError instanceof Error ? lastError.message : String(lastError)}`
+      staleMirrors > 0 ? `所有源均失败：${detail}（${staleMirrors} 个镜像尚未同步新版，请稍后重试）` : `所有源均失败：${detail}`
     );
   }
   /**
    * 向各源查询二进制的当前版本指纹（`.sha256` 内容）。
    *
    * 返回 `digest` 为规范化后的 64 位小写十六进制；拿不到则 `digest === null`。
+   * `authoritative` 标记该指纹是否来自**版本真源**（GitHub latest 或其代理）——
+   * 只有真源给出的指纹才允许判定"镜像落后"，否则只能当篡改处理。
+   *
    * 注意各源 `.sha256` 格式不一：GitHub 的 Windows 产物是 `certutil` 输出
    * （带描述行），必须**从全部文本里提取哈希**而不是取首行。
    */
   async fetchRemoteDigest(file, pinned) {
-    if (pinned !== void 0) return { digest: pinned.toLowerCase() };
-    const sources = this.mirror ? [this.mirror.replace(/\/+$/, ""), ...this.mirrors] : this.mirrors;
+    if (pinned !== void 0) {
+      return { digest: pinned.toLowerCase(), authoritative: true };
+    }
     let lastError;
-    for (const source of sources) {
+    for (const source of this.digestSources()) {
       try {
         const response = await fetch(`${source}/${file}.sha256`, {
           signal: AbortSignal.timeout(1e4)
@@ -252,18 +309,41 @@ var LrcRuntime = class {
         const text = await response.text();
         const digest = extractSha256(text);
         if (digest === null) throw new Error(".sha256 内容无法解析");
-        return { digest };
+        const authoritative = this.isAuthoritative(source);
+        return { digest, authoritative };
       } catch (error) {
         lastError = `${source}: ${error instanceof Error ? error.message : String(error)}`;
       }
     }
-    return { digest: null, error: lastError };
+    return { digest: null, authoritative: false, error: lastError };
   }
   readStamp(path) {
     try {
       return readFileSync(path, "utf-8").trim() || null;
     } catch {
       return null;
+    }
+  }
+  /**
+   * 指纹文件是否"刚刚写过"。
+   *
+   * 用 mtime 而不是往文件里塞时间戳：格式保持不变，老缓存无需迁移。
+   */
+  recentlyChecked(stampPath) {
+    if (this.recheckAfterMs <= 0) return false;
+    try {
+      return Date.now() - statSync(stampPath).mtimeMs < this.recheckAfterMs;
+    } catch {
+      return false;
+    }
+  }
+  /** 续期检查窗口（只改 mtime，不动内容）。 */
+  touch(stampPath) {
+    if (this.recheckAfterMs <= 0) return;
+    try {
+      const now = /* @__PURE__ */ new Date();
+      utimesSync(stampPath, now, now);
+    } catch {
     }
   }
   verify(file, expected) {
