@@ -49,6 +49,27 @@ export const DEFAULT_BACKOFF: BackoffPolicy = {
   maxMs: 60_000,
 };
 
+/**
+ * 把外部传入的退避参数规范化。
+ *
+ * 为什么必须校验：配置对象来自宿主（`cordis.patch.yml` / 测试桩），
+ * 字段可能缺失或非数字。若直接把 `undefined` 参与算术，会得到 `NaN`，
+ * 而 `now() >= NaN` 恒为 false ⇒ `get()` 每次都真连 —— 退避静默消失，
+ * 从「自愈」退化成「每次调用都卡一次健康检查超时」。
+ *
+ * 这类失败是**静默**的（不报错、日志正常），实测正是它让 e2e-turn 在没有
+ * 新字段的情况下「通过」了测试。故在这里兜底，而不是依赖调用方守规矩。
+ */
+function normalizeBackoff(input: unknown): BackoffPolicy {
+  const raw = (input ?? {}) as Partial<BackoffPolicy>;
+  const pick = (value: unknown, fallback: number): number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+  const baseMs = pick(raw.baseMs, DEFAULT_BACKOFF.baseMs);
+  const maxMs = pick(raw.maxMs, DEFAULT_BACKOFF.maxMs);
+  // 上限不得小于起步，否则指数退避会「越退越快」，语义矛盾
+  return { baseMs, maxMs: Math.max(baseMs, maxMs) };
+}
+
 /** 状态快照（只读，供诊断使用）。 */
 export interface RecoverableStatus {
   state: RecoverableState;
@@ -100,7 +121,7 @@ export class Recoverable<T> {
   ) {
     this.factory = factory;
     this.now = options.now ?? (() => Date.now());
-    this.backoff = { ...DEFAULT_BACKOFF, ...options.backoff };
+    this.backoff = normalizeBackoff(options.backoff);
   }
 
   /** 当前是否已有可用值（不触发任何重试）。 */

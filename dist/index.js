@@ -241,6 +241,10 @@ var LrcRuntime = class {
    * 显式作废当前状态，下次 `ensure()` 立刻重新探测。
    *
    * 用于热路径发现连接断了：既然是刚断的，没必要再等退避窗口。
+   *
+   * 托管实例额外 `stop()` 掉子进程 —— 「进程还在但不应答」是最常见的死法，
+   * 直接复用只会立刻再次失败；杀掉后重探才会重新拉起。频繁重拉由调用方
+   * （`Recoverable` 的指数退避）节流，这里不再叠一层冷却，避免两套节奏打架。
    */
   invalidate(reason) {
     if (this.result?.mode === "managed") this.stop();
@@ -559,6 +563,13 @@ var DEFAULT_BACKOFF = {
   // 60s 封顶：即使连续失败很久，一分钟后至少还有一次机会自愈
   maxMs: 6e4
 };
+function normalizeBackoff(input) {
+  const raw = input ?? {};
+  const pick = (value, fallback) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+  const baseMs = pick(raw.baseMs, DEFAULT_BACKOFF.baseMs);
+  const maxMs = pick(raw.maxMs, DEFAULT_BACKOFF.maxMs);
+  return { baseMs, maxMs: Math.max(baseMs, maxMs) };
+}
 var Recoverable = class {
   factory;
   now;
@@ -583,7 +594,7 @@ var Recoverable = class {
   constructor(factory, options = {}) {
     this.factory = factory;
     this.now = options.now ?? (() => Date.now());
-    this.backoff = { ...DEFAULT_BACKOFF, ...options.backoff };
+    this.backoff = normalizeBackoff(options.backoff);
   }
   /** 当前是否已有可用值（不触发任何重试）。 */
   get ready() {
@@ -2615,20 +2626,36 @@ var PROMPT_TEXT = [
 function apply(ctx, config) {
   const cacheDir = join2(process.env.DSH_HOME ?? join2(homedir2(), ".dsh"), "cache", "lrc-plugin");
   const snapshotPath = join2(cacheDir, "snapshot.json");
+  function recheckInterval(value) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+    return Math.floor(value);
+  }
+  const capabilityRecheckSteps = recheckInterval(config.capabilityRecheckSteps);
+  const budgetRecheckSteps = recheckInterval(config.budgetRecheckSteps);
   function loadSnapshot() {
     try {
       if (!existsSync3(snapshotPath)) return "";
       const raw = JSON.parse(readFileSync3(snapshotPath, "utf8"));
       return typeof raw.text === "string" ? raw.text : "";
-    } catch {
+    } catch (error) {
+      ctx.logger.warn(
+        `[lrc] 快照文件读取失败，本次从空快照开始（${error instanceof Error ? error.message : String(error)}）：${snapshotPath}`
+      );
       return "";
     }
   }
+  let warnedSaveSnapshot = false;
   function saveSnapshot(text) {
     try {
       mkdirSync3(cacheDir, { recursive: true });
       writeFileSync3(snapshotPath, JSON.stringify({ text, updatedAt: Date.now() }), "utf8");
-    } catch {
+    } catch (error) {
+      if (!warnedSaveSnapshot) {
+        warnedSaveSnapshot = true;
+        ctx.logger.warn(
+          `[lrc] 快照落盘失败，重启后 [LRC 状态] 会缺失（${error instanceof Error ? error.message : String(error)}）`
+        );
+      }
     }
   }
   const runtime = new LrcRuntime({
@@ -2637,7 +2664,7 @@ function apply(ctx, config) {
     cacheDir,
     log: (message) => ctx.logger.info(message)
   });
-  let offloader = null;
+  let offloader;
   const connection = new Recoverable(
     async () => {
       const result = await runtime.ensure({ force: true });
@@ -2700,24 +2727,6 @@ function apply(ctx, config) {
   ctx.logger.info(
     `[lrc] compaction 服务：${compaction === void 0 ? "不可达（preset 隔离）" : typeof compaction.compactRegion === "function" ? "可用（支持 compactRegion）" : "存在但无 compactRegion"}`
   );
-  function attachOffloader(client) {
-    if (offloader === null) {
-      offloader = new Offloader(
-        client,
-        new CursorStore(join2(cacheDir, "cursor.json")),
-        {
-          turnsThreshold: config.offloadTurns,
-          charsThreshold: config.offloadChars,
-          stepsThreshold: config.offloadSteps,
-          project: config.project,
-          maxItems: config.maxItems
-        },
-        new RecentStore(join2(cacheDir, "recent.json"))
-      );
-    } else {
-      offloader.bind(client);
-    }
-  }
   offloader = new Offloader(
     null,
     new CursorStore(join2(cacheDir, "cursor.json")),
@@ -2730,6 +2739,9 @@ function apply(ctx, config) {
     },
     new RecentStore(join2(cacheDir, "recent.json"))
   );
+  function attachOffloader(client) {
+    offloader?.bind(client);
+  }
   void (async () => {
     const client = await connection.get();
     if (client === null) {
@@ -2778,7 +2790,7 @@ function apply(ctx, config) {
     return message;
   }
   async function flush(session, reason) {
-    if (offloader === null || flushing) return;
+    if (flushing) return;
     if (!offloader.hasPending()) return;
     if (!offloader.connected) {
       void connection.get();
@@ -2870,7 +2882,7 @@ function apply(ctx, config) {
     const reasoning = turnReasoning.join("\n");
     resetTurnState();
     await flush(session, "turn/end");
-    if (hadText || offloader === null || reasoning.length === 0) return;
+    if (hadText || reasoning.length === 0) return;
     const conclusions = conclusionsFromReasoning(reasoning);
     if (conclusions.length === 0) return;
     try {
@@ -2900,7 +2912,6 @@ function apply(ctx, config) {
       void finishTurn(session);
       return;
     }
-    if (offloader === null) return;
     if (type !== "assistant/message") return;
     const content = messageContent(event);
     const text = textBlocksOnly(content);
@@ -2933,7 +2944,7 @@ function apply(ctx, config) {
           `[lrc][cap] 能力探测异常：${error instanceof Error ? error.message : String(error)}`
         );
       }
-    } else if (governor.steps > 0 && governor.steps % config.capabilityRecheckSteps === 0) {
+    } else if (capabilityRecheckSteps > 0 && governor.steps > 0 && governor.steps % capabilityRecheckSteps === 0) {
       const before = governor.capabilities;
       const needsRecheck = before === null || !before.compaction.available || !before.tokenMeter.available || !before.toolResultPruner.available;
       if (needsRecheck) {
@@ -2958,7 +2969,7 @@ function apply(ctx, config) {
       }
     }
     const caps = governor.capabilities;
-    if (budget === null || budget.source === "fallback" && governor.steps % config.budgetRecheckSteps === 0) {
+    if (budget === null || budget.source === "fallback" && budgetRecheckSteps > 0 && governor.steps % budgetRecheckSteps === 0) {
       try {
         const resolved = await resolveBudget({
           ctx,
@@ -3080,12 +3091,10 @@ function apply(ctx, config) {
       } catch {
       }
     }
-    if (offloader !== null) {
-      offloader.observeStep();
-      if (offloader.shouldOffload()) {
-        const session = payload?.agent?.session;
-        void flush(session, "threshold");
-      }
+    offloader.observeStep();
+    if (offloader.shouldOffload()) {
+      const session = payload?.agent?.session;
+      void flush(session, "threshold");
     }
     const decision = await next();
     if (decision !== null && typeof decision === "object") {
@@ -3434,9 +3443,7 @@ ${value.text}`
         }
         lines.push("");
         lines.push("## 沉淀");
-        if (offloader === null) {
-          lines.push("未启用");
-        } else {
+        {
           const stats = offloader.stats();
           if (!offloader.connected) {
             lines.push("连接未就绪：本轮新增内容已计入待沉淀队列，连上后会自动补写。");

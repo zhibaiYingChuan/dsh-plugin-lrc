@@ -28,6 +28,13 @@ function check(name: string, condition: boolean, detail?: unknown): void {
 
 /** 与 Config schema 默认值一致的完整配置。 */
 const config = {
+  // ⚠ 这个端口**必定连不上**，本文件只验「加载不抛错 + 工具注册」。
+  //
+  // 历史教训：正因为这里用了必连不上的地址，`client` 一直是 null，
+  // 而本文件从不调用任何工具 execute()，于是「client 为 null 就永久返回
+  // 未就绪」的缺陷带着 15 套全绿测试发布出去了（真实事故 session-3b497669）。
+  //
+  // 工具**行为**的验证见 `e2e-entry-tools.ts`（真连 mock LRC，逐个 execute）。
   baseUrl: 'http://127.0.0.1:1',
   token: '',
   project: 'test',

@@ -212,6 +212,22 @@ export function apply(ctx: Context, config: Config): void {
   const snapshotPath = join(cacheDir, 'snapshot.json');
 
   /**
+   * 复查间隔规范化。
+   *
+   * 为什么必须兜底：宿主通过 `cordis.patch.yml` 传入的配置**不一定**包含新字段
+   * （老 patch 不会自动补齐）。缺失时 `steps % undefined` 得到 `NaN`，
+   * 而 `NaN === 0` 恒为 false ⇒ 复查永远不触发，且**不报错、日志正常**。
+   *
+   * 0 或负数表示「不复查」，显式短路，避免落入取模的 NaN 陷阱。
+   */
+  function recheckInterval(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0;
+    return Math.floor(value);
+  }
+  const capabilityRecheckSteps = recheckInterval(config.capabilityRecheckSteps);
+  const budgetRecheckSteps = recheckInterval(config.budgetRecheckSteps);
+
+  /**
    * 从磁盘恢复上次的快照。
    *
    * 不持久化的话，插件进程一重启 `latestSnapshot` 就变空串，
@@ -222,17 +238,31 @@ export function apply(ctx: Context, config: Config): void {
       if (!existsSync(snapshotPath)) return '';
       const raw = JSON.parse(readFileSync(snapshotPath, 'utf8')) as { text?: unknown };
       return typeof raw.text === 'string' ? raw.text : '';
-    } catch {
+    } catch (error) {
+      // 不能静默：快照损坏会让 `[LRC 状态]` 凭空消失，而用户只会觉得"插件不工作了"。
+      // 只告警一次，随后照常以降级方式继续（快照本身可以重建）。
+      ctx.logger.warn(
+        `[lrc] 快照文件读取失败，本次从空快照开始（${error instanceof Error ? error.message : String(error)}）：${snapshotPath}`,
+      );
       return '';
     }
   }
+
+  let warnedSaveSnapshot = false;
 
   function saveSnapshot(text: string): void {
     try {
       mkdirSync(cacheDir, { recursive: true });
       writeFileSync(snapshotPath, JSON.stringify({ text, updatedAt: Date.now() }), 'utf8');
-    } catch {
-      // 落盘失败不影响对话
+    } catch (error) {
+      // 落盘失败不影响本次对话，但**会让下次启动丢掉读路径**，必须让人知道。
+      // 只告警一次，避免每轮沉淀都刷屏。
+      if (!warnedSaveSnapshot) {
+        warnedSaveSnapshot = true;
+        ctx.logger.warn(
+          `[lrc] 快照落盘失败，重启后 [LRC 状态] 会缺失（${error instanceof Error ? error.message : String(error)}）`,
+        );
+      }
     }
   }
 
@@ -243,7 +273,14 @@ export function apply(ctx: Context, config: Config): void {
     log: (message) => ctx.logger.info(message),
   });
 
-  let offloader: Offloader | null = null;
+  /**
+   * 沉淀器**恒存在**（只是可能未连接）。
+   *
+   * 用确定类型而非 `| null`：一旦允许 null，调用点就会各自写
+   * `if (offloader === null) return`，LRC 恢复后那批内容便永久丢弃。
+   * 「未连接」由 `offloader.connected` 表达，语义更准确。
+   */
+  let offloader: Offloader;
   /**
    * LRC 连接：**可恢复**，不是启动时决定一次就永久定死。
    *
@@ -367,31 +404,11 @@ export function apply(ctx: Context, config: Config): void {
   );
 
   /**
-   * 连接就绪后挂上 Offloader。
+   * Offloader **一开始就以「未连接」状态创建**，计数器立即开始工作。
    *
-   * Offloader **一开始就创建**（计数器立即开始工作），只是先以「未连接」状态存在。
-   * 这样 LRC 晚启动时，之前那些轮次的 pending 计数不会丢 —— 一旦连上就立刻能沉淀。
+   * 这样 LRC 晚启动时，之前那些轮次的 pending 计数不会丢 —— 一旦连上就能补写。
+   * 此前是整个 Offloader 都不创建，LRC 恢复后那批内容已永久丢失。
    */
-  function attachOffloader(client: LrcClient): void {
-    if (offloader === null) {
-      offloader = new Offloader(
-        client,
-        new CursorStore(join(cacheDir, 'cursor.json')),
-        {
-          turnsThreshold: config.offloadTurns,
-          charsThreshold: config.offloadChars,
-          stepsThreshold: config.offloadSteps,
-          project: config.project,
-          maxItems: config.maxItems,
-        },
-        new RecentStore(join(cacheDir, 'recent.json')),
-      );
-    } else {
-      offloader.bind(client);
-    }
-  }
-
-  // 计数器立即开始工作（此时还没有连接，沉淀会被暂存而不是丢弃）
   offloader = new Offloader(
     null,
     new CursorStore(join(cacheDir, 'cursor.json')),
@@ -404,6 +421,11 @@ export function apply(ctx: Context, config: Config): void {
     },
     new RecentStore(join(cacheDir, 'recent.json')),
   );
+
+  /** 连接就绪后把 client 注入 Offloader（保留其全部计数器与游标）。 */
+  function attachOffloader(client: LrcClient): void {
+    offloader?.bind(client);
+  }
 
   // 预热：不阻塞插件加载，失败只记一次日志；之后由工具调用按需重试
   void (async () => {
@@ -490,7 +512,7 @@ export function apply(ctx: Context, config: Config): void {
    * 并发跑两次会把同一段文本写两遍。
    */
   async function flush(session: unknown, reason: string): Promise<void> {
-    if (offloader === null || flushing) return;
+    if (flushing) return;
     if (!offloader.hasPending()) return;
     // 未连接时**保留 pending 计数**，等连上再沉淀。
     // 此前是「offloader 为 null 直接 return」，LRC 一晚启动这批内容就永久丢了。
@@ -621,7 +643,7 @@ export function apply(ctx: Context, config: Config): void {
     await flush(session, 'turn/end');
 
     // 3. 兜底：本轮没有正文时，从推理里抽结论句
-    if (hadText || offloader === null || reasoning.length === 0) return;
+    if (hadText || reasoning.length === 0) return;
     const conclusions = conclusionsFromReasoning(reasoning);
     if (conclusions.length === 0) return;
     try {
@@ -661,7 +683,6 @@ export function apply(ctx: Context, config: Config): void {
       return;
     }
 
-    if (offloader === null) return;
     // 只关心助手消息；其余事件（用户消息、工具调用等）直接跳过，
     // 否则会在第一条非 assistant 事件上误报「取不到文本」。
     if (type !== 'assistant/message') return;
@@ -712,7 +733,11 @@ export function apply(ctx: Context, config: Config): void {
           `[lrc][cap] 能力探测异常：${error instanceof Error ? error.message : String(error)}`,
         );
       }
-    } else if (governor.steps > 0 && governor.steps % config.capabilityRecheckSteps === 0) {
+    } else if (
+      capabilityRecheckSteps > 0 &&
+      governor.steps > 0 &&
+      governor.steps % capabilityRecheckSteps === 0
+    ) {
       // 只复查「当前判定为不可用」的项：已可用的没必要反复探（省开销且更稳）
       const before = governor.capabilities;
       const needsRecheck =
@@ -751,7 +776,12 @@ export function apply(ctx: Context, config: Config): void {
     // 统一预算：按模型窗口比例推导阈值。
     // fallback（窗口未知）时允许复查 —— 模型可能中途切换（provider/model 变了），
     // 一次 fallback 就永久按绝对值裁剪并不合理。
-    if (budget === null || (budget.source === 'fallback' && governor.steps % config.budgetRecheckSteps === 0)) {
+    if (
+      budget === null ||
+      (budget.source === 'fallback' &&
+        budgetRecheckSteps > 0 &&
+        governor.steps % budgetRecheckSteps === 0)
+    ) {
       try {
         const resolved = await resolveBudget({
           ctx,
@@ -887,14 +917,12 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
 
-    if (offloader !== null) {
-      offloader.observeStep();
-      if (offloader.shouldOffload()) {
-        const session = (payload as { agent?: { session?: unknown } })?.agent?.session;
-        // **不 await**：沉淀要走 distill + migrate 两次 HTTP，
-        // 阻塞在这里会让模型调用前多等几百毫秒。`flushing` 已保证不并发。
-        void flush(session, 'threshold');
-      }
+    offloader.observeStep();
+    if (offloader.shouldOffload()) {
+      const session = (payload as { agent?: { session?: unknown } })?.agent?.session;
+      // **不 await**：沉淀要走 distill + migrate 两次 HTTP，
+      // 阻塞在这里会让模型调用前多等几百毫秒。`flushing` 已保证不并发。
+      void flush(session, 'threshold');
     }
     const decision = await next();
     // ★2026-11-07（缓存命中率）：把 runtime-context 快照移到当前用户消息**之前**。
@@ -1320,9 +1348,7 @@ export function apply(ctx: Context, config: Config): void {
         lines.push('');
 
         lines.push('## 沉淀');
-        if (offloader === null) {
-          lines.push('未启用');
-        } else {
+        {
           const stats = offloader.stats();
           // 未连接时 pending 只增不减是**预期行为**（等连上再沉淀），要显式说明，
           // 否则会被误读成"卡住了"。

@@ -391,9 +391,12 @@ export class LrcRuntime {
    * 显式作废当前状态，下次 `ensure()` 立刻重新探测。
    *
    * 用于热路径发现连接断了：既然是刚断的，没必要再等退避窗口。
+   *
+   * 托管实例额外 `stop()` 掉子进程 —— 「进程还在但不应答」是最常见的死法，
+   * 直接复用只会立刻再次失败；杀掉后重探才会重新拉起。频繁重拉由调用方
+   * （`Recoverable` 的指数退避）节流，这里不再叠一层冷却，避免两套节奏打架。
    */
   invalidate(reason?: string): void {
-    // 托管实例若已退出，留着等也没意义；先清掉句柄，重探时会重新拉起
     if (this.result?.mode === 'managed') this.stop();
     this.result = null;
     this.nextRetryAt = 0;

@@ -146,7 +146,11 @@ export class CursorStore {
       mkdirSync(dirname(this.filePath), { recursive: true });
       writeFileSync(this.filePath, JSON.stringify(all, null, 2), 'utf8');
     } catch {
-      // 落盘失败不影响本次卸载，下次会退回全量
+      // 落盘失败：下次会退回全量重扫。
+      // 这是**可接受**的降级，因为 RecentStore 的查重窗口同样落盘、
+      // 且内存态仍然有效，重复内容会被 `isDuplicate` 拦下，不会大量重复入库。
+      // 本模块不依赖宿主 logger，故不在此告警；症状可在 `lrc_status` 的
+      // 「本地查重拦下 N 块」计数上升中被观察到。
     }
   }
 }

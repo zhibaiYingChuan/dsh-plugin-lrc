@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-lrc",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "把 LRC 的结构化长期记忆接进 DeepSeek Harness：边聊边沉淀、按需召回、可纠错，让上下文不再需要频繁压缩",
   "type": "module",
   "main": "dist/index.js",
@@ -25,6 +25,7 @@
     "e2e": "node scripts/e2e-offload.ts",
     "e2e:runtime": "node scripts/e2e-runtime.ts",
     "e2e:recovery": "node scripts/e2e-recovery.ts",
+    "e2e:entry": "node --import ./scripts/register-loader.mjs scripts/e2e-entry-tools.ts",
     "e2e:host": "node scripts/e2e-host-payload.ts",
     "e2e:filter": "node scripts/e2e-filter.ts",
     "e2e:trim": "node scripts/e2e-trim.ts",
@@ -35,7 +36,7 @@
     "e2e:turn": "node --import ./scripts/register-loader.mjs scripts/e2e-turn.ts",
     "e2e:invariant": "node scripts/e2e-invariant.ts",
     "e2e:profile": "node scripts/e2e-profile.ts",
-    "test": "node scripts/smoke.ts && node scripts/e2e-offload.ts && node scripts/e2e-runtime.ts && node scripts/e2e-recovery.ts && node scripts/e2e-host-payload.ts && node scripts/e2e-filter.ts && node scripts/e2e-trim.ts && node scripts/e2e-host-surface.ts && node scripts/e2e-handoff.ts && node scripts/e2e-governor.ts && node scripts/e2e-budget.ts && node scripts/e2e-profile.ts && node scripts/e2e-invariant.ts && node --import ./scripts/register-loader.mjs scripts/e2e-apply.ts && node --import ./scripts/register-loader.mjs scripts/e2e-turn.ts"
+    "test": "node scripts/smoke.ts && node scripts/e2e-offload.ts && node scripts/e2e-runtime.ts && node scripts/e2e-recovery.ts && node --import ./scripts/register-loader.mjs scripts/e2e-entry-tools.ts && node scripts/e2e-host-payload.ts && node scripts/e2e-filter.ts && node scripts/e2e-trim.ts && node scripts/e2e-host-surface.ts && node scripts/e2e-handoff.ts && node scripts/e2e-governor.ts && node scripts/e2e-budget.ts && node scripts/e2e-profile.ts && node scripts/e2e-invariant.ts && node --import ./scripts/register-loader.mjs scripts/e2e-apply.ts && node --import ./scripts/register-loader.mjs scripts/e2e-turn.ts"
   },
   "keywords": [
     "dsh-plugin",

@@ -347,6 +347,58 @@ check('默认退避起步 2s', DEFAULT_BACKOFF.baseMs === 2000, DEFAULT_BACKOFF.
 check('默认退避封顶 60s', DEFAULT_BACKOFF.maxMs === 60000, DEFAULT_BACKOFF.maxMs);
 check('封顶 ≥ 起步', DEFAULT_BACKOFF.maxMs >= DEFAULT_BACKOFF.baseMs);
 
+// ── 10) 配置缺失/非法时退避不能静默失效 ────────────────────────────
+//
+// 这是本次自审抓到的真实回归：新配置项在旧 config（宿主 patch / 测试桩）
+// 里不存在时，`baseMs * 2**n` 会得到 NaN，而 `now() >= NaN` 恒为 false，
+// 于是**每次调用都真的去连** —— 退避静默消失，比不加退避更糟。
+// 这种失败不报错、日志正常，必须有断言盯着。
+console.log('=== 10) 退避参数兜底 ===');
+{
+  const cases: Array<[string, unknown]> = [
+    ['全缺', { backoff: {} as never }],
+    ['值为 undefined', { backoff: { baseMs: undefined, maxMs: undefined } as never }],
+    ['值为 null', { backoff: { baseMs: null, maxMs: null } as never }],
+    ['值为 NaN', { backoff: { baseMs: Number.NaN, maxMs: Number.NaN } as never }],
+    ['值为字符串', { backoff: { baseMs: '2000', maxMs: '60000' } as never }],
+    ['负值', { backoff: { baseMs: -5, maxMs: -1 } as never }],
+  ];
+  for (const [label, opts] of cases) {
+    let calls = 0;
+    const res = new Recoverable<string>(
+      async () => {
+        calls += 1;
+        throw new Error('boom');
+      },
+      opts as never,
+    );
+    await res.get();
+    const st = res.status();
+    await res.get();
+    await res.get();
+    const finite =
+      Number.isFinite(st.lastBackoffMs) && Number.isFinite(st.retryInMs) && st.lastBackoffMs > 0;
+    check(`${label}：退避是有限正数`, finite, { lastBackoffMs: st.lastBackoffMs, retryInMs: st.retryInMs });
+    check(`${label}：退避期间不重复连接`, calls === 1, `calls=${calls}`);
+  }
+
+  // 上限小于起步时应收敛为「上限 = 起步」，而不是越退越快
+  let calls2 = 0;
+  let now2 = 0;
+  const b2 = new Recoverable<string>(
+    async () => {
+      calls2 += 1;
+      throw new Error('boom');
+    },
+    { now: () => now2, backoff: { baseMs: 5000, maxMs: 1000 } },
+  );
+  await b2.get();
+  check('上限<起步时收敛为起步', b2.status().lastBackoffMs === 5000, b2.status().lastBackoffMs);
+  now2 += 5001;
+  await b2.get();
+  check('收敛后不会越退越快', b2.status().lastBackoffMs === 5000, b2.status().lastBackoffMs);
+}
+
 rmSync(workDir, { recursive: true, force: true });
 
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
