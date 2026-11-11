@@ -12,28 +12,18 @@ import { createServer } from "node:net";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform, arch } from "node:os";
 import { join } from "node:path";
-var BINARY_RELEASE = "v0.10.4";
-var BINARY_MANIFEST = {
-  "win32-x64": {
-    file: "lrc-v0.10.4-windows-x86_64.exe",
-    sha256: "4be3e0841bc312892e93e29ae416a8b7f2b793bdf2726f14ad3475d738e3c589"
-  },
-  "darwin-arm64": {
-    file: "lrc-v0.10.4-macos-arm64",
-    sha256: "0878cd748c800bc9d846abf1fe5a0671da80b504527c237318bb38ee1b29c49b"
-  },
-  "linux-x64": {
-    file: "lrc-v0.10.4-linux-x86_64",
-    sha256: "dbccf5cc0bc26667a0d880697b3e40b58fc119d7c3db6aa94140e207485a8a7c"
-  }
+var BINARY_FILES = {
+  "win32-x64": "lrc-sidecar-windows-x64.exe",
+  "darwin-arm64": "lrc-sidecar-darwin-arm64",
+  "linux-x64": "lrc-sidecar-linux-x64"
 };
 var DEFAULT_MIRRORS = [
-  // ① 国内直连（文件在 downloads 根下，不含版本子目录）
+  // ① 国内直连（自家服务器，不依赖 GitHub 可达性）
   "https://sfang.cc/xd/downloads",
-  // ② GitHub 原始地址（海外 / 国内可达时）
-  `https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
+  // ② GitHub 官方稳定别名（永远指向最新 Release）
+  "https://github.com/zhibaiYingChuan/LRC/releases/latest/download",
   // ③ GitHub 加速代理（前两者都失败时的兜底）
-  `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`
+  "https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/latest/download"
 ];
 function defaultCacheDir() {
   const dshHome = process.env.DSH_HOME ?? join(homedir(), ".dsh");
@@ -44,6 +34,10 @@ function platformKey() {
 }
 function binaryName() {
   return platform() === "win32" ? "lrc-sidecar.exe" : "lrc-sidecar";
+}
+function extractSha256(text) {
+  const match = /(?:^|[^0-9a-f])([0-9a-f]{64})(?![0-9a-f])/i.exec(text);
+  return match === null ? null : match[1].toLowerCase();
 }
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -90,13 +84,10 @@ var LrcRuntime = class {
     this.log = options.log ?? (() => {
     });
     this.healthTimeoutMs = options.healthTimeoutMs ?? 15e3;
-    this.manifest = options.manifest ?? BINARY_MANIFEST;
+    this.manifest = options.manifest ?? {};
     this.probeLocal = options.probeLocal ?? true;
-    const release = options.release ?? BINARY_RELEASE;
-    this.mirrors = [
-      `https://github.com/zhibaiYingChuan/LRC/releases/download/${release}`,
-      `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${release}`
-    ];
+    const extra = (options.mirrors ?? []).map((m) => m.replace(/\/+$/, "")).filter(Boolean);
+    this.mirrors = [...extra, ...DEFAULT_MIRRORS];
   }
   /** 幂等：多次调用只启动一次。 */
   async ensure() {
@@ -165,52 +156,115 @@ var LrcRuntime = class {
       return this.result;
     }
   }
-  /** 确保二进制存在且校验通过。 */
+  /**
+   * 确保二进制存在且校验通过。
+   *
+   * # 版本自发现（不硬编码任何版本号）
+   *
+   * 期望哈希**不在代码里写死**，而是每次启动时从下载源的 `<file>.sha256` 现取：
+   *   · 下载源路径本身稳定（国内 `/xd/downloads/`、GitHub `releases/latest/download/`）；
+   *   · `.sha256` 内容随 LRC 发版变化 ⇒ **哈希变即版本变**。
+   *
+   * 于是 LRC 发新版时，插件无需改一行代码：下次启动发现哈希与本地指纹不符，
+   * 自动重下新版本。
+   *
+   * # 降级策略
+   *
+   * 远端不可达（离线/被墙）且本地二进制**完好**时，用本地版本继续跑，不阻断用户。
+   * 只有"本地也没有 / 本地哈希与远端不符"才真正失败。
+   */
   async ensureBinary() {
     const key = platformKey();
-    const entry = this.manifest[key];
-    if (entry === void 0) {
+    const file = this.manifest[key]?.file ?? BINARY_FILES[key];
+    if (file === void 0) {
       throw new Error(
-        `没有 ${key} 的二进制清单。请手动安装 LRC 桌面端，或设置 LRC_BASE 指向已有实例。`
+        `没有 ${key} 的二进制文件名。请手动安装 LRC 桌面端，或设置 LRC_BASE 指向已有实例。`
       );
     }
     const binDir = join(this.cacheDir, "bin");
     const target = join(binDir, binaryName());
+    const stampPath = join(binDir, `${binaryName()}.version`);
     mkdirSync(binDir, { recursive: true });
-    if (existsSync(target) && this.verify(target, entry.sha256)) {
-      return target;
+    const pinned = this.manifest[key]?.sha256;
+    const remote = await this.fetchRemoteDigest(file, pinned);
+    if (existsSync(target) && remote.digest !== null) {
+      const localStamp = this.readStamp(stampPath);
+      if (localStamp === remote.digest && this.verify(target, remote.digest)) {
+        this.log(`[lrc] 复用已缓存二进制（${remote.digest.slice(0, 12)}…）`);
+        return target;
+      }
     }
-    const mirrors = this.mirror ? [this.mirror, ...this.mirrors] : this.mirrors;
+    if (remote.digest === null) {
+      if (existsSync(target)) {
+        this.log("[lrc] 无法确认远端版本，沿用本地已缓存二进制");
+        return target;
+      }
+      throw new Error(`无法获取版本指纹：${remote.error ?? "所有源均不可达"}`);
+    }
+    const sources = this.mirror ? [this.mirror.replace(/\/+$/, ""), ...this.mirrors] : this.mirrors;
     let lastError = null;
-    let hashMismatch = false;
-    for (const mirror of mirrors) {
-      const url = `${mirror.replace(/\/+$/, "")}/${entry.file}`;
+    for (const source of sources) {
+      const url = `${source}/${file}`;
       try {
         this.log(`[lrc] 下载 ${url}`);
         const response = await fetch(url, { signal: AbortSignal.timeout(12e4) });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const buffer = Buffer.from(await response.arrayBuffer());
         writeFileSync(target, buffer);
-        if (!this.verify(target, entry.sha256)) {
+        if (!this.verify(target, remote.digest)) {
           rmSync(target, { force: true });
-          hashMismatch = true;
-          throw new Error("SHA256 校验失败");
+          throw new Error(
+            `SHA256 校验失败（期望 ${remote.digest.slice(0, 12)}…）。文件可能被篡改或下载不完整，已删除。`
+          );
         }
         if (platform() !== "win32") chmodSync(target, 493);
+        writeFileSync(stampPath, remote.digest);
+        this.log(`[lrc] 已就绪（${remote.digest.slice(0, 12)}…）`);
         return target;
       } catch (error) {
         lastError = error;
-        this.log(`[lrc] 镜像失败（${mirror}）：${error instanceof Error ? error.message : error}`);
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.includes("SHA256 校验失败")) throw error;
+        this.log(`[lrc] 源失败（${source}）：${msg}`);
       }
     }
-    if (hashMismatch) {
-      throw new Error(
-        `SHA256 校验失败（期望 ${entry.sha256.slice(0, 12)}…）。文件可能被篡改或清单过期，已删除下载内容。`
-      );
-    }
     throw new Error(
-      `所有镜像均失败：${lastError instanceof Error ? lastError.message : String(lastError)}`
+      `所有源均失败：${lastError instanceof Error ? lastError.message : String(lastError)}`
     );
+  }
+  /**
+   * 向各源查询二进制的当前版本指纹（`.sha256` 内容）。
+   *
+   * 返回 `digest` 为规范化后的 64 位小写十六进制；拿不到则 `digest === null`。
+   * 注意各源 `.sha256` 格式不一：GitHub 的 Windows 产物是 `certutil` 输出
+   * （带描述行），必须**从全部文本里提取哈希**而不是取首行。
+   */
+  async fetchRemoteDigest(file, pinned) {
+    if (pinned !== void 0) return { digest: pinned.toLowerCase() };
+    const sources = this.mirror ? [this.mirror.replace(/\/+$/, ""), ...this.mirrors] : this.mirrors;
+    let lastError;
+    for (const source of sources) {
+      try {
+        const response = await fetch(`${source}/${file}.sha256`, {
+          signal: AbortSignal.timeout(1e4)
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const text = await response.text();
+        const digest = extractSha256(text);
+        if (digest === null) throw new Error(".sha256 内容无法解析");
+        return { digest };
+      } catch (error) {
+        lastError = `${source}: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    return { digest: null, error: lastError };
+  }
+  readStamp(path) {
+    try {
+      return readFileSync(path, "utf-8").trim() || null;
+    } catch {
+      return null;
+    }
   }
   verify(file, expected) {
     try {

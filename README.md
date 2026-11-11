@@ -90,10 +90,18 @@ dsh --profile desktop --dump-config | grep dsh-plugin-lrc
 
 **B. 没装就让插件自己拉**
 
-插件会按平台下载对应版本的 LRC 二进制（国内镜像优先，失败回退 GitHub），
-校验 SHA256 后在 `$DSH_HOME/cache/lrc-plugin/data` 启动一个**隔离实例**。
+插件会按平台下载 LRC 二进制，**不需要你指定版本**：
 
-> 隔离实例与你的桌面端 LRC 各用独立数据目录，互不影响。
+1. 先向下载源取当前版本的 `.sha256`（国内镜像优先，失败回退 GitHub）
+2. 与本地缓存比对：一致则直接复用，不一致（LRC 发了新版）则自动重下
+3. 下载后校验 SHA256，通过才启动
+4. 校验失败一律删除并报错，**绝不运行未校验的二进制**
+
+缓存位置 `$DSH_HOME/cache/lrc-plugin/bin`，与你的桌面端 LRC 数据目录互不影响。
+
+> 下载源只用稳定路径（`/xd/downloads/`、GitHub `releases/latest/download/`），
+> 版本号不写进插件代码——LRC 发新版时插件无需升级。
+> 离线且本地已有缓存时，直接沿用本地版本继续工作。
 
 **C. 都没有**
 

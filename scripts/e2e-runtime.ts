@@ -6,14 +6,17 @@
  * 覆盖三种模式与一条安全红线：
  *   1. external —— 已有 LRC 时直接复用，不下载
  *   2. managed  —— 下载 + SHA256 校验通过后启动
- *   3. degraded —— 清单缺失 / 哈希不符时降级，**绝不运行未校验的二进制**
+ *   3. degraded —— 拿不到二进制 / 哈希不符时降级，**绝不运行未校验的二进制**
+ *
+ * 注意：v0.2.2 起二进制清单不再硬编码版本号，期望哈希从远端 `.sha256` 现取
+ * （见 `runtime.ts` 的 `fetchRemoteDigest`），因此「manifest 为空」不再是失败条件。
  */
 import { createServer, type ServerResponse } from 'node:http';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { LrcRuntime } from '../src/runtime.ts';
+import { LrcRuntime, extractSha256, BINARY_FILES } from '../src/runtime.ts';
 
 let failed = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -51,17 +54,28 @@ check('没有下载二进制', !existsSync(join(workDir, 'a', 'bin')), 'bin 目�
 delete process.env.LRC_BASE;
 await new Promise<void>((resolve) => healthServer.close(() => resolve()));
 
-// ── 2) degraded：清单缺失 ─────────────────────────────
-console.log('=== 2) degraded：清单缺失 ===');
-const noManifest = new LrcRuntime({
+// ── 2) degraded：拿不到二进制 → 优雅降级 ─────────────
+//
+// ★ 语义已变更（v0.2.2）：清单不再强制要求——文件名有内置兜底
+//   （`BINARY_FILES`），因此「manifest 为空」不再等于失败，而是正常走下载。
+//   本用例改测真正的失败条件：所有源都拿不到该文件（用不存在的文件名模拟），
+//   且本地无缓存 ⇒ 必须降级，而不是崩溃。
+console.log('=== 2) degraded：拿不到二进制 ===');
+const noBinary = new LrcRuntime({
   cacheDir: join(workDir, 'b'),
-  manifest: {},
   probeLocal: false,
   healthTimeoutMs: 1000,
+  // 固定哈希避免依赖远端 .sha256；文件名故意不存在 ⇒ 所有源都会 404
+  manifest: {
+    [`${process.platform}-${process.arch}`]: {
+      file: 'definitely-not-a-real-lrc-binary.bin',
+      sha256: '0'.repeat(64),
+    },
+  },
 });
-const degraded1 = await noManifest.ensure();
+const degraded1 = await noBinary.ensure();
 check('降级为 degraded', degraded1.mode === 'degraded', degraded1);
-check('给出可读原因', (degraded1.reason ?? '').includes('二进制清单'), degraded1.reason);
+check('给出可读原因', (degraded1.reason ?? '').length > 0, degraded1.reason);
 
 // ── 3) degraded：哈希不符（安全红线）──────────────────
 console.log('=== 3) degraded：SHA256 不符 ===');
@@ -122,6 +136,98 @@ check(
   '校验通过的文件不应删除',
 );
 goodHashRuntime.stop();
+
+// ── 5) 版本自发现：从远端 .sha256 取指纹，哈希变即重下 ──────────
+//
+// 锁住两条不变量（v0.2.2 去版本硬编码后的核心）：
+//   a) 期望哈希来自远端 `.sha256`，代码里**不存任何版本号**；
+//   b) 远端哈希变化 ⇒ 本地缓存被判过期 ⇒ 自动重下，无需插件升级。
+//
+// 用本地 HTTP 服务器模拟"发新版"：先发 A 版，再换成 B 版内容与哈希。
+console.log('=== 5) 版本自发现：哈希变即重下 ===');
+
+// 两个 .sha256 文本格式都要能解析（CI 真实产出两种：sha256sum / certutil）
+const sumStyle = `${fakeHash}  lrc-sidecar.exe`;
+const certutilStyle =
+  `SHA256 hash of lrc-sidecar.exe:\r\n${fakeHash}\r\n` +
+  'CertUtil: -hashfile command completed successfully.\r\n';
+check('解析 sha256sum 格式', extractSha256(sumStyle) === fakeHash, extractSha256(sumStyle));
+check('解析 certutil 格式', extractSha256(certutilStyle) === fakeHash, extractSha256(certutilStyle));
+check('无哈希内容返回 null', extractSha256('no hash here') === null);
+
+// 内置稳定文件名必须不含版本号——否则又回到"LRC 发版插件就 404"
+const versioned = Object.entries(BINARY_FILES).filter(([, f]) => /\d+\.\d+\.\d+/.test(f));
+check('稳定文件名不含版本号', versioned.length === 0, versioned);
+
+// A 版 → 写入
+const verBinA = Buffer.from('AAAA-binary-v1');
+const hashA = createHash('sha256').update(verBinA).digest('hex');
+// B 版 → 模拟 LRC 发新版
+const verBinB = Buffer.from('BBBB-binary-v2-different');
+const hashB = createHash('sha256').update(verBinB).digest('hex');
+
+let currentBin = verBinA;
+let currentHash = hashA;
+let downloadCount = 0;
+const verServer = createServer((req, res) => {
+  if (req.url?.endsWith('.sha256')) {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(`${currentHash}  lrc-sidecar.exe`);
+    return;
+  }
+  if (req.url?.endsWith('lrc-sidecar') || req.url?.endsWith('.exe')) {
+    downloadCount += 1;
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+    res.end(currentBin);
+    return;
+  }
+  send(res, 404, {});
+});
+await new Promise<void>((resolve) => verServer.listen(0, '127.0.0.1', resolve));
+const verAddr = verServer.address();
+if (verAddr === null || typeof verAddr === 'string') throw new Error('端口获取失败');
+const verUrl = `http://127.0.0.1:${verAddr.port}`;
+const verCache = join(workDir, 'e');
+const rmBin = () => join(verCache, 'bin', process.platform === 'win32' ? 'lrc-sidecar.exe' : 'lrc-sidecar');
+
+// 第一次：拉到 A 版（不注入 manifest ⇒ 哈希来自远端 .sha256）
+const v1 = new LrcRuntime({
+  cacheDir: verCache,
+  mirror: verUrl,
+  probeLocal: false,
+  healthTimeoutMs: 800,
+});
+await v1.ensure();
+v1.stop();
+check('首次按远端哈希下载', downloadCount === 1, `downloads=${downloadCount}`);
+check('缓存内容为 A 版', readFileSync(rmBin()).toString() === verBinA.toString(), '内容不符');
+
+// 第二次：哈希未变 ⇒ 复用，不应再下载
+const v2 = new LrcRuntime({
+  cacheDir: verCache,
+  mirror: verUrl,
+  probeLocal: false,
+  healthTimeoutMs: 800,
+});
+await v2.ensure();
+v2.stop();
+check('哈希未变时复用（不重复下载）', downloadCount === 1, `downloads=${downloadCount}`);
+
+// 第三次：远端换成 B 版 ⇒ 必须自动重下
+currentBin = verBinB;
+currentHash = hashB;
+const v3 = new LrcRuntime({
+  cacheDir: verCache,
+  mirror: verUrl,
+  probeLocal: false,
+  healthTimeoutMs: 800,
+});
+await v3.ensure();
+v3.stop();
+check('远端发新版后自动重下', downloadCount === 2, `downloads=${downloadCount}`);
+check('缓存已更新为 B 版', readFileSync(rmBin()).toString() === verBinB.toString(), '内容未更新');
+
+await new Promise<void>((resolve) => verServer.close(() => resolve()));
 
 await new Promise<void>((resolve) => fileServer.close(() => resolve()));
 rmSync(workDir, { recursive: true, force: true });

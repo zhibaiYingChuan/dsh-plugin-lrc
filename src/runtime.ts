@@ -32,57 +32,38 @@ export interface RuntimeResult {
 }
 
 /**
- * 二进制清单：`<platform>-<arch>` → `{ file, sha256 }`。
+ * 二进制**稳定文件名**（不含版本号）：`<platform>-<arch>` → file。
  *
- * 文件名带版本号（`lrc-v0.10.4-...`），配合 `BINARY_RELEASE` 拼出**固定 URL**：
- * `releases/download/v0.10.4/<file>`。这样不会因为 `latest` 漂移而拿到未校验的版本。
+ * 为什么不用版本号：LRC 的发布口径是"只保留最新一个 Release"，旧 Release 会被删除。
+ * 若插件把版本号写死（如 `lrc-v0.10.4-...`），LRC 一发新版，这里的固定 URL 就全部
+ * 404，首次安装的用户直接拿不到二进制。v0.10.0 → v0.10.4 期间已真实发生过。
  *
- * ⚠ **Release 资产的生命周期约束**：LRC 仓库的发布口径是"只保留最新一个 Release"，
- * 旧版本的 Release 会被删除。因此这里的 `BINARY_RELEASE` 一旦落后于线上最新版，
- * 三个下载 URL 就会**全部 404**，首次安装插件的用户直接拿不到二进制。
- *
- * 维护动作（每次 LRC 发版必须做，否则插件静默失效）：
- *   1. `BINARY_RELEASE` 改为新版本 tag；
- *   2. `BINARY_MANIFEST` 的 `file` 与 `sha256` 同步更新；
- *   3. 国内镜像 URL 的版本号同步更新。
- * 依据：v0.10.0 的 Release 已删除，旧清单实测三个 URL 全 404。
+ * 现在改为下载 CI 产出的**稳定别名**（见 release.yml 的 "Publish plugin sidecar alias"）：
+ * 文件名不随版本变化，内容才是最新的那一个。
  */
-export const BINARY_RELEASE = 'v0.10.4';
-
-export const BINARY_MANIFEST: Record<string, { file: string; sha256: string }> = {
-  'win32-x64': {
-    file: 'lrc-v0.10.4-windows-x86_64.exe',
-    sha256: '4be3e0841bc312892e93e29ae416a8b7f2b793bdf2726f14ad3475d738e3c589',
-  },
-  'darwin-arm64': {
-    file: 'lrc-v0.10.4-macos-arm64',
-    sha256: '0878cd748c800bc9d846abf1fe5a0671da80b504527c237318bb38ee1b29c49b',
-  },
-  'linux-x64': {
-    file: 'lrc-v0.10.4-linux-x86_64',
-    sha256: 'dbccf5cc0bc26667a0d880697b3e40b58fc119d7c3db6aa94140e207485a8a7c',
-  },
+export const BINARY_FILES: Record<string, string> = {
+  'win32-x64': 'lrc-sidecar-windows-x64.exe',
+  'darwin-arm64': 'lrc-sidecar-darwin-arm64',
+  'linux-x64': 'lrc-sidecar-linux-x64',
 };
 
 /**
- * 下载镜像，按顺序尝试，**国内优先**。
+ * 下载源，按顺序尝试，**国内优先**。
  *
- * 注意拼接规则：最终 URL = `${mirror}/${entry.file}`，**mirror 本身不含版本段**。
- * 因此三条镜像的路径形态不同，各自要拼对：
- *   · 国内：文件平铺在 `/xd/downloads/` 根下（随版本改名，无子目录）；
- *   · GitHub：走 `/releases/download/<tag>/`，tag 必须写进 mirror。
+ * 两条源都提供稳定路径（不含版本号），因此**插件永远不需要跟着 LRC 改版本**：
+ *   · 国内：文件平铺在 `/xd/downloads/` 根下；
+ *   · GitHub：`releases/latest/download/` 是 GitHub 的稳定别名，永远指向最新 Release。
  *
- * 为什么国内地址排第一：GitHub Releases 在国内经常超时或被重置，
- * 而 sfang.cc 是自家的国内直连源（与 Releases 同名文件字节一致，
- * 已逐个下载回来比过 SHA256）。
+ * 版本识别不靠 URL，而靠同目录的 `<file>.sha256`：哈希变了就是新版本。
+ * 这样即使 LRC 换了版本号，插件也无需任何改动。
  */
 const DEFAULT_MIRRORS = [
-  // ① 国内直连（文件在 downloads 根下，不含版本子目录）
+  // ① 国内直连（自家服务器，不依赖 GitHub 可达性）
   'https://sfang.cc/xd/downloads',
-  // ② GitHub 原始地址（海外 / 国内可达时）
-  `https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
+  // ② GitHub 官方稳定别名（永远指向最新 Release）
+  'https://github.com/zhibaiYingChuan/LRC/releases/latest/download',
   // ③ GitHub 加速代理（前两者都失败时的兜底）
-  `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${BINARY_RELEASE}`,
+  'https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/latest/download',
 ];
 
 export interface RuntimeOptions {
@@ -101,12 +82,18 @@ export interface RuntimeOptions {
   log?: (message: string) => void;
   /** 健康检查超时（毫秒） */
   healthTimeoutMs?: number;
-  /** 覆盖二进制清单（测试用：可注入错误哈希验证降级） */
+  /**
+   * 覆盖二进制的**文件名**（测试用）。
+   *
+   * 注意：内核不持有"期望哈希"——期望值一律从下载源的 `<file>.sha256` 现取，
+   * 这样 LRC 发新版时插件无需改动。需要注入错误哈希验证降级时，
+   * 用 `manifest` 显式给出 sha256（一旦给出则以它为准，跳过远端查询）。
+   */
   manifest?: Record<string, { file: string; sha256: string }>;
-  /** 覆盖 Release 版本（测试用） */
-  release?: string;
   /** 是否探测本地 3099 端口（测试用：置 false 可强制走下载路径） */
   probeLocal?: boolean;
+  /** 额外下载源（优先于内置源，测试/自建镜像用） */
+  mirrors?: string[];
 }
 
 function defaultCacheDir(): string {
@@ -120,6 +107,20 @@ function platformKey(): string {
 
 function binaryName(): string {
   return platform() === 'win32' ? 'lrc-sidecar.exe' : 'lrc-sidecar';
+}
+
+/**
+ * 从 `.sha256` 文件内容里提取哈希。
+ *
+ * 两种格式并存（都是 CI 真实产出）：
+ *   · `sha256sum`：`abcdef...  lrc-sidecar-linux-x64`
+ *   · `certutil`（Windows）：三行，中间一行才是纯哈希
+ *
+ * 因此不能"取首行"，必须**全文匹配 64 位十六进制**。
+ */
+export function extractSha256(text: string): string | null {
+  const match = /(?:^|[^0-9a-f])([0-9a-f]{64})(?![0-9a-f])/i.exec(text);
+  return match === null ? null : match[1].toLowerCase();
 }
 
 /** 找一个空闲端口。 */
@@ -170,13 +171,11 @@ export class LrcRuntime {
     this.mirror = options.mirror ?? process.env.LRC_MIRROR;
     this.log = options.log ?? (() => {});
     this.healthTimeoutMs = options.healthTimeoutMs ?? 15_000;
-    this.manifest = options.manifest ?? BINARY_MANIFEST;
+    this.manifest = options.manifest ?? {};
     this.probeLocal = options.probeLocal ?? true;
-    const release = options.release ?? BINARY_RELEASE;
-    this.mirrors = [
-      `https://github.com/zhibaiYingChuan/LRC/releases/download/${release}`,
-      `https://ghproxy.net/https://github.com/zhibaiYingChuan/LRC/releases/download/${release}`,
-    ];
+    // 额外源优先于内置源（测试/自建镜像）；去掉空串与末尾斜杠。
+    const extra = (options.mirrors ?? []).map((m) => m.replace(/\/+$/, '')).filter(Boolean);
+    this.mirrors = [...extra, ...DEFAULT_MIRRORS];
   }
 
   /** 幂等：多次调用只启动一次。 */
@@ -256,57 +255,138 @@ export class LrcRuntime {
     }
   }
 
-  /** 确保二进制存在且校验通过。 */
+  /**
+   * 确保二进制存在且校验通过。
+   *
+   * # 版本自发现（不硬编码任何版本号）
+   *
+   * 期望哈希**不在代码里写死**，而是每次启动时从下载源的 `<file>.sha256` 现取：
+   *   · 下载源路径本身稳定（国内 `/xd/downloads/`、GitHub `releases/latest/download/`）；
+   *   · `.sha256` 内容随 LRC 发版变化 ⇒ **哈希变即版本变**。
+   *
+   * 于是 LRC 发新版时，插件无需改一行代码：下次启动发现哈希与本地指纹不符，
+   * 自动重下新版本。
+   *
+   * # 降级策略
+   *
+   * 远端不可达（离线/被墙）且本地二进制**完好**时，用本地版本继续跑，不阻断用户。
+   * 只有"本地也没有 / 本地哈希与远端不符"才真正失败。
+   */
   private async ensureBinary(): Promise<string> {
     const key = platformKey();
-    const entry = this.manifest[key];
-    if (entry === undefined) {
+    const file = this.manifest[key]?.file ?? BINARY_FILES[key];
+    if (file === undefined) {
       throw new Error(
-        `没有 ${key} 的二进制清单。请手动安装 LRC 桌面端，或设置 LRC_BASE 指向已有实例。`,
+        `没有 ${key} 的二进制文件名。请手动安装 LRC 桌面端，或设置 LRC_BASE 指向已有实例。`,
       );
     }
 
     const binDir = join(this.cacheDir, 'bin');
     const target = join(binDir, binaryName());
+    const stampPath = join(binDir, `${binaryName()}.version`);
     mkdirSync(binDir, { recursive: true });
 
-    if (existsSync(target) && this.verify(target, entry.sha256)) {
-      return target;
+    const pinned = this.manifest[key]?.sha256;
+
+    // ── 1. 向各源取"当前版本指纹"（.sha256 内容）──
+    const remote = await this.fetchRemoteDigest(file, pinned);
+
+    // ── 2. 本地已是最新？直接复用（不重复下载）──
+    if (existsSync(target) && remote.digest !== null) {
+      const localStamp = this.readStamp(stampPath);
+      if (localStamp === remote.digest && this.verify(target, remote.digest)) {
+        this.log(`[lrc] 复用已缓存二进制（${remote.digest.slice(0, 12)}…）`);
+        return target;
+      }
     }
 
-    const mirrors = this.mirror ? [this.mirror, ...this.mirrors] : this.mirrors;
+    // ── 3. 远端不可达：本地完好就继续用（离线可用）──
+    if (remote.digest === null) {
+      if (existsSync(target)) {
+        this.log('[lrc] 无法确认远端版本，沿用本地已缓存二进制');
+        return target;
+      }
+      throw new Error(`无法获取版本指纹：${remote.error ?? '所有源均不可达'}`);
+    }
+
+    // ── 4. 下载并校验 ──
+    const sources = this.mirror
+      ? [this.mirror.replace(/\/+$/, ''), ...this.mirrors]
+      : this.mirrors;
     let lastError: unknown = null;
-    let hashMismatch = false;
-    for (const mirror of mirrors) {
-      const url = `${mirror.replace(/\/+$/, '')}/${entry.file}`;
+    for (const source of sources) {
+      const url = `${source}/${file}`;
       try {
         this.log(`[lrc] 下载 ${url}`);
         const response = await fetch(url, { signal: AbortSignal.timeout(120_000) });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const buffer = Buffer.from(await response.arrayBuffer());
         writeFileSync(target, buffer);
-        if (!this.verify(target, entry.sha256)) {
+        if (!this.verify(target, remote.digest)) {
           rmSync(target, { force: true });
-          hashMismatch = true;
-          throw new Error('SHA256 校验失败');
+          // 哈希不符是**安全信号**：宁可失败也不能运行被篡改的二进制
+          throw new Error(
+            `SHA256 校验失败（期望 ${remote.digest.slice(0, 12)}…）。` +
+              '文件可能被篡改或下载不完整，已删除。',
+          );
         }
         if (platform() !== 'win32') chmodSync(target, 0o755);
+        writeFileSync(stampPath, remote.digest);
+        this.log(`[lrc] 已就绪（${remote.digest.slice(0, 12)}…）`);
         return target;
       } catch (error) {
         lastError = error;
-        this.log(`[lrc] 镜像失败（${mirror}）：${error instanceof Error ? error.message : error}`);
+        const msg = error instanceof Error ? error.message : String(error);
+        // 校验失败不换源重试——同一哈希下换了源也一样不对，且会掩盖篡改
+        if (msg.includes('SHA256 校验失败')) throw error;
+        this.log(`[lrc] 源失败（${source}）：${msg}`);
       }
     }
-    // 哈希不符是**安全信号**，优先级高于网络错误：必须让用户看到真正的原因
-    if (hashMismatch) {
-      throw new Error(
-        `SHA256 校验失败（期望 ${entry.sha256.slice(0, 12)}…）。` +
-          '文件可能被篡改或清单过期，已删除下载内容。',
-      );
-    }
     throw new Error(
-      `所有镜像均失败：${lastError instanceof Error ? lastError.message : String(lastError)}`,
+      `所有源均失败：${lastError instanceof Error ? lastError.message : String(lastError)}`,
     );
+  }
+
+  /**
+   * 向各源查询二进制的当前版本指纹（`.sha256` 内容）。
+   *
+   * 返回 `digest` 为规范化后的 64 位小写十六进制；拿不到则 `digest === null`。
+   * 注意各源 `.sha256` 格式不一：GitHub 的 Windows 产物是 `certutil` 输出
+   * （带描述行），必须**从全部文本里提取哈希**而不是取首行。
+   */
+  private async fetchRemoteDigest(
+    file: string,
+    pinned?: string,
+  ): Promise<{ digest: string | null; error?: string }> {
+    if (pinned !== undefined) return { digest: pinned.toLowerCase() };
+
+    const sources = this.mirror
+      ? [this.mirror.replace(/\/+$/, ''), ...this.mirrors]
+      : this.mirrors;
+    let lastError: string | undefined;
+    for (const source of sources) {
+      try {
+        const response = await fetch(`${source}/${file}.sha256`, {
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const text = await response.text();
+        const digest = extractSha256(text);
+        if (digest === null) throw new Error('.sha256 内容无法解析');
+        return { digest };
+      } catch (error) {
+        lastError = `${source}: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    return { digest: null, error: lastError };
+  }
+
+  private readStamp(path: string): string | null {
+    try {
+      return readFileSync(path, 'utf-8').trim() || null;
+    } catch {
+      return null;
+    }
   }
 
   private verify(file: string, expected: string): boolean {
