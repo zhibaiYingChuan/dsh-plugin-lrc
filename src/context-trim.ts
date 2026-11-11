@@ -350,6 +350,9 @@ const NOISE_PREFIXES = [
   '<compacted-summary>',
   '</compacted-summary>',
   '<system-reminder>',
+  // 系统提示首句（`systemPromptUpdate: in-history` 时它作为 role:'system'
+  // 消息进入重放历史；即使 role 字段丢失，也不能把它当结论收进摘要）
+  'You are an AI agent powered by DeepSeek Harness',
   'The available skill catalog changed',
   'The user changed the approval policy',
   'Approval prompts are disabled',
@@ -424,6 +427,52 @@ function absorbPriorSummary(
 }
 
 /**
+ * 摘要收录的消息角色**白名单**。
+ *
+ * ## 为什么必须白名单，而不是「非 user 即 assistant」
+ *
+ * 原实现是：`role === 'tool'` 走工具分支、`role === 'user'` 进「用户请求」、
+ * **其余一切** 都进「助手结论」。而 DSH 的模型配置是
+ * `systemPromptUpdate: in-history` —— 系统提示会作为 `role: 'system'`
+ * 的消息出现在重放历史里，于是它落进 else 分支。
+ *
+ * 后果（实测 2026-11-12，session-644bba1d，5 份摘要全部中招）：
+ *
+ * ```
+ * ### 助手结论
+ * - You are an AI agent powered by DeepSeek Harness. You are a coding agent
+ *   powered by the deepseek/deepseek-v4.1-flash model. Tokens prefixed with @ ...
+ * ```
+ *
+ * 三重危害：
+ * 1. **挤占**：结论区上限 15 条，系统提示通常是全历史最长的一条，
+ *    `oneLine(300)` 之后仍占满首条；实测所有摘要的结论区只有这 1 条。
+ * 2. **污染**：被裁剪后，系统提示的残片变成了「历史对话里的一段助手结论」，
+ *    模型会把对自己的指令当成过往讨论内容。
+ * 3. **静默**：不报错，摘要长度看起来正常（2.3KB 写满），信息量却是零。
+ *
+ * 这与 `event-classify.ts` 采用白名单是同一个理由：新角色出现时最坏是
+ * 「不收录」，而不是「被误当成结论」。
+ *
+ * ## 为什么 `undefined` 单独放行到「按内容判定」
+ *
+ * 白名单一旦漏掉某个宿主版本（重放消息不带 `role`），代价是**所有 assistant
+ * 正文被静默丢光**，摘要只剩「用户请求」区 —— 比原来的污染更糟（那时至少有字）。
+ * 而系统提示的文字有稳定首句，`NOISE_PREFIXES` 已能拦下。
+ * 所以 `role === undefined` 不在这一层拒绝，交给内容判定。
+ */
+function isConversationRole(role: unknown): boolean {
+  return role === 'user' || role === 'assistant' || role === undefined;
+}
+
+/** 是否该把该角色的文本收进「助手结论」区。 */
+function isConclusionRole(role: unknown): boolean {
+  // 缺 role 时按 assistant 处理：真实重放里 user 消息一定带 role
+  // （否则连「用户请求」区都收不到，那是另一种可观测的异常）。
+  return role === 'assistant' || role === undefined;
+}
+
+/**
  * 生成确定性摘要（零 LLM）。
  *
  * 只保留四类信息：用户请求、工具调用、工具错误、助手结论。
@@ -489,10 +538,16 @@ export function buildDeterministicSummary(
         }
         // 宿主每轮注入的运行时事实 / 技能目录 / 审批策略：不是用户说的话
         if (isNoiseText(b.text)) continue;
+        // 系统提示：既不是用户请求也不是助手结论。
+        // `systemPromptUpdate: in-history` 时它会出现在重放历史里，
+        // 必须在这里显式拦掉（见 `isConclusionRole` 注释）。
+        if (!isConversationRole(message.role)) continue;
         const line = oneLine(b.text, 300);
         if (message.role === 'user') collect(requests, seen, `- ${line}`, 12);
         // 过程叙述（「接下来我要…」）不是结论，不进 `### 助手结论`
-        else if (!isProcessNarration(b.text)) collect(conclusions, seen, `- ${line}`, 15);
+        else if (isConclusionRole(message.role) && !isProcessNarration(b.text)) {
+          collect(conclusions, seen, `- ${line}`, 15);
+        }
       } else if (b?.type === 'tool-call') {
         const name = typeof b.name === 'string' ? b.name : 'tool';
         const args = typeof b.arguments === 'string' ? oneLine(b.arguments, 150) : '';

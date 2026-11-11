@@ -1,7 +1,7 @@
 // src/index.ts
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
-import { join as join2 } from "node:path";
+import { dirname as dirname2, join as join2 } from "node:path";
 import { homedir as homedir2 } from "node:os";
 import { existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
 
@@ -1757,6 +1757,9 @@ var NOISE_PREFIXES = [
   "<compacted-summary>",
   "</compacted-summary>",
   "<system-reminder>",
+  // 系统提示首句（`systemPromptUpdate: in-history` 时它作为 role:'system'
+  // 消息进入重放历史；即使 role 字段丢失，也不能把它当结论收进摘要）
+  "You are an AI agent powered by DeepSeek Harness",
   "The available skill catalog changed",
   "The user changed the approval policy",
   "Approval prompts are disabled",
@@ -1804,6 +1807,12 @@ function absorbPriorSummary(text, buckets, seen) {
     collect(buckets[section], seen, `- ${body}`, limits[section]);
   }
 }
+function isConversationRole(role) {
+  return role === "user" || role === "assistant" || role === void 0;
+}
+function isConclusionRole(role) {
+  return role === "assistant" || role === void 0;
+}
 function buildDeterministicSummary(messages, maxChars, realCounts) {
   const requests = [];
   const calls = [];
@@ -1832,9 +1841,12 @@ function buildDeterministicSummary(messages, maxChars, realCounts) {
           continue;
         }
         if (isNoiseText(b.text)) continue;
+        if (!isConversationRole(message.role)) continue;
         const line = oneLine(b.text, 300);
         if (message.role === "user") collect(requests, seen, `- ${line}`, 12);
-        else if (!isProcessNarration2(b.text)) collect(conclusions, seen, `- ${line}`, 15);
+        else if (isConclusionRole(message.role) && !isProcessNarration2(b.text)) {
+          collect(conclusions, seen, `- ${line}`, 15);
+        }
       } else if (b?.type === "tool-call") {
         const name2 = typeof b.name === "string" ? b.name : "tool";
         const args = typeof b.arguments === "string" ? oneLine(b.arguments, 150) : "";
@@ -2403,6 +2415,7 @@ function formatCapabilities(matrix) {
 // src/budget.ts
 var MIN_SANE_WINDOW = 8192;
 var MAX_TRUSTED_WINDOW = 1e6;
+var MIN_TRIM_TOKENS = 8e3;
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
@@ -2421,12 +2434,23 @@ function routedTarget(session) {
   if (provider.length === 0 || model.length === 0) return void 0;
   return { provider, model };
 }
+function declaredWindow(session) {
+  const context = session?.requestContext?.();
+  const window = context?.contextWindow;
+  if (typeof window !== "number" || !Number.isFinite(window) || window <= 0) return void 0;
+  if (window < MIN_SANE_WINDOW || window > 1e8) return void 0;
+  return window;
+}
 async function resolveBudget(deps) {
   const { ctx, agent, config } = deps;
   if (config.contextWindowTokens > 0) {
     return derive(config.contextWindowTokens, config, "configured");
   }
   const session = agent?.session;
+  const declared = declaredWindow(session);
+  if (declared !== void 0) {
+    return { ...derive(declared, config, "configured"), note: "from requestContext" };
+  }
   const target = routedTarget(session);
   if (target === void 0) {
     return {
@@ -2476,7 +2500,13 @@ async function resolveBudget(deps) {
 function derive(windowTokens, config, source) {
   return {
     windowTokens,
-    trimMinTokens: clamp(Math.floor(windowTokens * config.trimRatio), 8e3, 2e5),
+    // 下限用 MIN_TRIM_TOKENS：窗口按比例算出来太小时，攒够再裁，
+    // 避免「一次工具输出就超阈值 ⇒ 每步重写历史 ⇒ 缓存永不命中」。
+    trimMinTokens: clamp(
+      Math.floor(windowTokens * config.trimRatio),
+      MIN_TRIM_TOKENS,
+      2e5
+    ),
     pruneResultThreshold: clamp(Math.floor(windowTokens * config.pruneRatio), 2048, 8192),
     source
   };
@@ -2707,10 +2737,16 @@ var Config = Schema.object({
   // 统一保留策略：trim 与 prune-reasoning 共用，避免两套 keep-recent 漂移
   keepRecentNodes: Schema.number().default(8),
   trimEnabled: Schema.boolean().default(true),
-  // 阈值按模型窗口比例推导：1M 窗口 → trim 30000 / prune 4000；
-  // 128K 窗口 → trim 8000（下限）/ prune 2048（下限）。
+  // 阈值按模型窗口比例推导：1M 窗口 → trim 100000 / prune 4000；
+  // 128K 窗口 → trim 12800 / prune 2048。
+  //
+  // ★2026-11-12：0.03 → 0.10。原比例实测代价极高：trim 会重写早期历史，
+  // 而 KV 缓存是前缀缓存 ⇒ 每次 trim 后整段缓存失效（实测 2 次 cacheRead=0
+  // 全价重发，另 2 次丢 14K tokens 前缀）。而 trim 当次只降 3~7K tokens，
+  // 上下文几步后又涨回原水位 —— **净亏**。
+  // 0.10 让压缩在「真有必要」时才发生，而不是刚过 3% 就反复重写。
   contextWindowTokens: Schema.number().default(0),
-  trimRatio: Schema.number().default(0.03),
+  trimRatio: Schema.number().default(0.1),
   pruneRatio: Schema.number().default(4e-3),
   // 窗口探测失败时的绝对值兜底
   trimMinTokens: Schema.number().default(3e4),
@@ -2793,22 +2829,42 @@ function apply(ctx, config) {
   const capabilityRecheckSteps = recheckInterval(config.capabilityRecheckSteps);
   const budgetRecheckSteps = recheckInterval(config.budgetRecheckSteps);
   function loadSnapshot() {
+    const empty = { text: "", sessionId: "" };
     try {
-      if (!existsSync3(snapshotPath)) return "";
+      if (!existsSync3(snapshotPath)) return empty;
       const raw = JSON.parse(readFileSync3(snapshotPath, "utf8"));
-      return typeof raw.text === "string" ? raw.text : "";
+      return {
+        text: typeof raw.text === "string" ? raw.text : "",
+        sessionId: typeof raw.sessionId === "string" ? raw.sessionId : ""
+      };
     } catch (error) {
       ctx.logger.warn(
         `[lrc] 快照文件读取失败，本次从空快照开始（${error instanceof Error ? error.message : String(error)}）：${snapshotPath}`
       );
-      return "";
+      return empty;
     }
   }
   let warnedSaveSnapshot = false;
-  function saveSnapshot(text) {
+  function saveSnapshot(text, sessionId) {
+    if (sessionId.length > 0 && currentSessionId.length > 0 && sessionId !== currentSessionId) {
+      ctx.logger.info(
+        `[lrc] 丢弃属于已离开会话（${sessionId}）的快照，当前为 ${currentSessionId}`
+      );
+      return false;
+    }
+    if (text.length > 0 && sessionId.length > 0) {
+      latestSnapshot = text;
+      snapshotOwner = sessionId;
+    } else if (text.length > 0 && snapshotOwner === currentSessionId) {
+      latestSnapshot = text;
+    }
     try {
       mkdirSync3(cacheDir, { recursive: true });
-      writeFileSync3(snapshotPath, JSON.stringify({ text, updatedAt: Date.now() }), "utf8");
+      writeFileSync3(
+        snapshotPath,
+        JSON.stringify({ text, sessionId, updatedAt: Date.now() }),
+        "utf8"
+      );
     } catch (error) {
       if (!warnedSaveSnapshot) {
         warnedSaveSnapshot = true;
@@ -2817,6 +2873,7 @@ function apply(ctx, config) {
         );
       }
     }
+    return true;
   }
   const runtime = new LrcRuntime({
     // 配置里的 baseUrl 必须传下去，否则 patch 里写 3111 也会打到 3099
@@ -2859,12 +2916,39 @@ function apply(ctx, config) {
   let turnTagSeen = false;
   let turnReasoning = [];
   let turnReasoningChars = 0;
-  let latestSnapshot = loadSnapshot();
+  const storedSnapshot = loadSnapshot();
+  let latestSnapshot = "";
+  let snapshotOwner = storedSnapshot.sessionId;
+  let currentSessionId = "";
   let snapshotServed = false;
   const governor = createGovernorState();
   let budget = null;
   const trimReasonsLogged = /* @__PURE__ */ new Set();
   let lastAgent;
+  function bindSnapshotToSession(sessionId) {
+    if (sessionId.length === 0) return;
+    if (sessionId === currentSessionId) return;
+    currentSessionId = sessionId;
+    if (recallText.length > 0 || recallFingerprint.length > 0) {
+      recallText = "";
+      recallFingerprint = "";
+      recallGeneration += 1;
+    }
+    if (snapshotOwner !== sessionId) {
+      if (storedSnapshot.text.length > 0) {
+        ctx.logger.info(
+          `[lrc] 快照属于其他会话（${snapshotOwner || "无归属"}），已丢弃 ${storedSnapshot.text.length} 字符，避免跨会话误导`
+        );
+      }
+      latestSnapshot = "";
+      snapshotServed = false;
+      return;
+    }
+    if (latestSnapshot.length === 0 && storedSnapshot.text.length > 0) {
+      latestSnapshot = storedSnapshot.text;
+      ctx.logger.info(`[lrc] 快照归属本会话（${sessionId}），已恢复 ${latestSnapshot.length} 字符`);
+    }
+  }
   const recallInjectOn = config.recallInjectEnabled === true;
   const systemPrompt = ctx.get("systemPrompt");
   if (typeof systemPrompt?.section === "function") {
@@ -2931,19 +3015,13 @@ ${latestSnapshot}`;
     void bootstrapSnapshot();
   })();
   async function bootstrapSnapshot() {
-    if (latestSnapshot.length > 0) return;
     const client = connection.peek();
     if (client === null) return;
     try {
       const index = await client.index(config.project, 3);
-      if (index.items.length === 0) return;
-      const picked = index.items.map((item) => {
-        const body = item.content_preview.replace(/^\[[^\]]+\]\s*/, "");
-        return body.length > 120 ? `${body.slice(0, 120)}…` : body;
-      });
-      latestSnapshot = `[LRC 状态] ${picked.join("；")}。细节在 LRC，需要时 recall。`;
-      saveSnapshot(latestSnapshot);
-      ctx.logger.info(`[lrc] 快照已从 LRC 索引重建（${index.items.length} 条）`);
+      ctx.logger.info(
+        `[lrc] 项目索引可用（${index.total} 条）。注意：跨会话记忆不注入为 [LRC 状态]，需要时用 lrc_recall 或开启 recallInjectEnabled`
+      );
     } catch {
     }
   }
@@ -3009,7 +3087,7 @@ ${latestSnapshot}`;
     }
     flushing = true;
     try {
-      const sessionId = session?.id ?? "default";
+      const sessionId = session?.id ?? "";
       const lines = linesFromSession(session);
       if (lines.length === 0) {
         if (!warnedEmpty) {
@@ -3028,8 +3106,7 @@ ${latestSnapshot}`;
             const result2 = await offloader.offloadItems(itemsFromTag(conclusions.join("\n")));
             if (result2.distilled > 0) {
               if (result2.snapshot.length > 0 && snapshotChanged(latestSnapshot, result2.snapshot)) {
-                latestSnapshot = result2.snapshot;
-                saveSnapshot(result2.snapshot);
+                saveSnapshot(result2.snapshot, sessionId);
               }
               ctx.logger.info(
                 `[lrc] 推理兜底沉淀 ${result2.distilled} 条（写入 ${result2.written}，合并 ${result2.merged}${result2.deduped > 0 ? `；本地去重 ${result2.deduped}` : ""}，触发：${reason}）`
@@ -3049,8 +3126,7 @@ ${latestSnapshot}`;
       const result = await offloader.offload(sessionId, lines);
       if (result !== null) {
         if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-          latestSnapshot = result.snapshot;
-          saveSnapshot(result.snapshot);
+          saveSnapshot(result.snapshot, sessionId);
         }
         ctx.logger.info(
           `[lrc] 已沉淀 ${result.distilled} 条（写入 ${result.written}，其中合并 ${result.merged}${result.deduped > 0 ? `；本地去重 ${result.deduped}` : ""}，触发：${reason}）`
@@ -3092,6 +3168,7 @@ ${latestSnapshot}`;
     const hadText = turnHadText;
     const reasoning = turnReasoning.join("\n");
     resetTurnState();
+    const sessionId = session?.id ?? "";
     await flush(session, "turn/end");
     if (hadText || reasoning.length === 0) return;
     const conclusions = conclusionsFromReasoning(reasoning);
@@ -3100,8 +3177,7 @@ ${latestSnapshot}`;
       const result = await offloader.offloadItems(itemsFromTag(conclusions.join("\n")));
       if (result.distilled > 0) {
         if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-          latestSnapshot = result.snapshot;
-          saveSnapshot(result.snapshot);
+          saveSnapshot(result.snapshot, sessionId);
         }
         ctx.logger.info(
           `[lrc] 推理兜底沉淀 ${result.distilled} 条（写入 ${result.written}，合并 ${result.merged}${result.deduped > 0 ? `；本地去重 ${result.deduped}` : ""}）`
@@ -3115,6 +3191,8 @@ ${latestSnapshot}`;
   }
   ctx.on("session/event", (session, event) => {
     const type = event?.type;
+    const sessionId = session?.id ?? "";
+    bindSnapshotToSession(sessionId);
     if (type === "turn/start") {
       resetTurnState();
       return;
@@ -3184,7 +3262,7 @@ ${latestSnapshot}`;
       }
     }
     const caps = governor.capabilities;
-    if (budget === null || budget.source === "fallback" && budgetRecheckSteps > 0 && governor.steps % budgetRecheckSteps === 0) {
+    if (budget === null || budgetRecheckSteps > 0 && governor.steps % budgetRecheckSteps === 0) {
       try {
         const resolved = await resolveBudget({
           ctx,
@@ -3685,6 +3763,22 @@ ${value.text}`
             `offload=${config.offloadTurns} 轮 / ${config.offloadChars} 字符 / ${config.offloadSteps} 步`
           ].join("\n")
         );
+        if (!recallInjectOn) {
+          const dshHome = dirname2(dirname2(cacheDir));
+          const patchPath = join2(dshHome, "profiles", "desktop", "cordis.patch.yml");
+          lines.push("");
+          lines.push("### 主动召回注入未启用");
+          lines.push(
+            `在 \`${patchPath}\` 的 \`id: dsh-plugin-lrc\` → \`config:\` 下补以下四行，然后重启 DSH：`
+          );
+          lines.push("```yaml");
+          lines.push("        recallInjectEnabled: true");
+          lines.push("        recallInjectMaxItems: 2");
+          lines.push("        recallInjectMinScore: 0.5");
+          lines.push("        recallInjectMaxCharsPerItem: 80");
+          lines.push("```");
+          lines.push("（上溯路径来自本插件实际使用的缓存目录；多 profile 时请确认当前 profile 名。）");
+        }
         lines.push("");
         lines.push("## 快照");
         lines.push(

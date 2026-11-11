@@ -23,7 +23,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import Schema from '@deepseek-ai/schemastery';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { LrcRuntime } from './runtime.ts';
@@ -148,10 +148,16 @@ export const Config: Schema = Schema.object({
   // 统一保留策略：trim 与 prune-reasoning 共用，避免两套 keep-recent 漂移
   keepRecentNodes: Schema.number().default(8),
   trimEnabled: Schema.boolean().default(true),
-  // 阈值按模型窗口比例推导：1M 窗口 → trim 30000 / prune 4000；
-  // 128K 窗口 → trim 8000（下限）/ prune 2048（下限）。
+  // 阈值按模型窗口比例推导：1M 窗口 → trim 100000 / prune 4000；
+  // 128K 窗口 → trim 12800 / prune 2048。
+  //
+  // ★2026-11-12：0.03 → 0.10。原比例实测代价极高：trim 会重写早期历史，
+  // 而 KV 缓存是前缀缓存 ⇒ 每次 trim 后整段缓存失效（实测 2 次 cacheRead=0
+  // 全价重发，另 2 次丢 14K tokens 前缀）。而 trim 当次只降 3~7K tokens，
+  // 上下文几步后又涨回原水位 —— **净亏**。
+  // 0.10 让压缩在「真有必要」时才发生，而不是刚过 3% 就反复重写。
   contextWindowTokens: Schema.number().default(0),
-  trimRatio: Schema.number().default(0.03),
+  trimRatio: Schema.number().default(0.1),
   pruneRatio: Schema.number().default(0.004),
   // 窗口探测失败时的绝对值兜底
   trimMinTokens: Schema.number().default(30000),
@@ -278,28 +284,90 @@ export function apply(ctx: Context, config: Config): void {
    *
    * 不持久化的话，插件进程一重启 `latestSnapshot` 就变空串，
    * 读路径（`[LRC 状态]` 注入）直接断掉 —— 而 LRC 里的记忆还在。
+   *
+   * 返回快照文本与其归属的会话 ID。**归属必须一起读出来**：
+   * 快照是「本会话的沉淀状态」，不是全局事实。没有归属时，新会话
+   * 会继承上一个会话的结论（实测：新开会话注入
+   * 「[LRC 状态] 方向已定，不再问你」，而模型完全不知道「方向」指什么）。
    */
-  function loadSnapshot(): string {
+  function loadSnapshot(): { text: string; sessionId: string } {
+    const empty = { text: '', sessionId: '' };
     try {
-      if (!existsSync(snapshotPath)) return '';
-      const raw = JSON.parse(readFileSync(snapshotPath, 'utf8')) as { text?: unknown };
-      return typeof raw.text === 'string' ? raw.text : '';
+      if (!existsSync(snapshotPath)) return empty;
+      const raw = JSON.parse(readFileSync(snapshotPath, 'utf8')) as {
+        text?: unknown;
+        sessionId?: unknown;
+      };
+      return {
+        text: typeof raw.text === 'string' ? raw.text : '',
+        sessionId: typeof raw.sessionId === 'string' ? raw.sessionId : '',
+      };
     } catch (error) {
       // 不能静默：快照损坏会让 `[LRC 状态]` 凭空消失，而用户只会觉得"插件不工作了"。
       // 只告警一次，随后照常以降级方式继续（快照本身可以重建）。
       ctx.logger.warn(
         `[lrc] 快照文件读取失败，本次从空快照开始（${error instanceof Error ? error.message : String(error)}）：${snapshotPath}`,
       );
-      return '';
+      return empty;
     }
   }
 
   let warnedSaveSnapshot = false;
 
-  function saveSnapshot(text: string): void {
+  /**
+   * 快照落盘 + 内存态更新（**唯一入口**）。
+   *
+   * ## 为什么 sessionId 必须显式传入
+   *
+   * 曾把 `currentSessionId` 藏在函数内部读，理由是「收口到一处就不可能写错」。
+   * 那是错的：`currentSessionId` 是「最近一次收到事件的会话」，而 `flush()`
+   * 是异步的（要等 distill + migrate 两次 HTTP）。真实时序：
+   *
+   * ```
+   * A 的 turn/end → flush(A) 进入 await
+   *   → B 的 turn/start 到达，bindSnapshotToSession('B') 改写 currentSessionId
+   *   → A 的 HTTP 返回，saveSnapshot(A 的内容) 落盘时标成 B
+   * ```
+   *
+   * 落盘归属看起来「有值且合理」，实际是错的 —— 比空值更难排查。
+   * 所以由调用方传入它**当时那个 session 的真实 ID**。
+   *
+   * ## 为什么还要比较 currentSessionId
+   *
+   * 上面那段时序里，A 的内容不只落盘错，还会被 A 的调用点写进
+   * `latestSnapshot`（全局单值），立刻出现在 B 的 `text()` 里被注入 ——
+   * 此时 `bindSnapshotToSession` 已不会再触发（B 已是 current），
+   * **归属判定被完全绕过**。故这里直接拒绝：不是当前会话的内容不进内存。
+   *
+   * @returns 是否接受本次写入（false = 内容属于已离开的会话，已丢弃）
+   */
+  function saveSnapshot(text: string, sessionId: string): boolean {
+    // 已切走：写盘也不该覆盖当前会话的归属，内存更不能污染
+    if (sessionId.length > 0 && currentSessionId.length > 0 && sessionId !== currentSessionId) {
+      ctx.logger.info(
+        `[lrc] 丢弃属于已离开会话（${sessionId}）的快照，当前为 ${currentSessionId}`,
+      );
+      return false;
+    }
+
+    // 空 sessionId 表示「取不到会话标识」（异常宿主形状）。此时**不更新归属**：
+    // 否则会把 `snapshotOwner` 写成 ''，下次正常会话启动时判定
+    // `'' !== sessionId` ⇒ 把自己刚写的内容当别人的丢掉，且无从排查。
+    if (text.length > 0 && sessionId.length > 0) {
+      latestSnapshot = text;
+      snapshotOwner = sessionId;
+    } else if (text.length > 0 && snapshotOwner === currentSessionId) {
+      // 同一会话但取不到 ID：内容仍是自己的，可以进内存（归属不变）
+      latestSnapshot = text;
+    }
+
     try {
       mkdirSync(cacheDir, { recursive: true });
-      writeFileSync(snapshotPath, JSON.stringify({ text, updatedAt: Date.now() }), 'utf8');
+      writeFileSync(
+        snapshotPath,
+        JSON.stringify({ text, sessionId, updatedAt: Date.now() }),
+        'utf8',
+      );
     } catch (error) {
       // 落盘失败不影响本次对话，但**会让下次启动丢掉读路径**，必须让人知道。
       // 只告警一次，避免每轮沉淀都刷屏。
@@ -310,6 +378,7 @@ export function apply(ctx: Context, config: Config): void {
         );
       }
     }
+    return true;
   }
 
   const runtime = new LrcRuntime({
@@ -405,8 +474,38 @@ export function apply(ctx: Context, config: Config): void {
   let turnTagSeen = false;
   let turnReasoning: string[] = [];
   let turnReasoningChars = 0;
-  /** 最近一次沉淀产出的状态快照，注入下一轮上下文（闭环的"读"路径）。 */
-  let latestSnapshot = loadSnapshot();
+  /**
+   * 磁盘上那份快照（**只读一次**，进程启动时的值）。
+   *
+   * 它是「上一个进程留下的」内容，可能属于本会话也可能属于别的会话。
+   * 只在 `bindSnapshotToSession()` 确认归属后才允许进入 `latestSnapshot`。
+   */
+  const storedSnapshot = loadSnapshot();
+  /**
+   * 最近一次沉淀产出的状态快照，注入下一轮上下文（闭环的"读"路径）。
+   *
+   * **初值必须为空**，不能预置 `storedSnapshot.text`：
+   * `text()` 回调签名是 `() => string`，拿不到 session 参数，所以它在
+   * **任何**时刻被调用都只能返回当前变量值。而宿主恢复会话时不会重放
+   * `session/event`（`dsh-session` 源码：seed events 从不 publish），
+   * 于是「进程已启动、快照已读入、`currentSessionId` 还是空」这个窗口里，
+   * 任何一次渲染（打开会话 / UI 预览 / 标题生成）都会把**上一个会话**
+   * 的快照注入进来 —— 这正是那起「方向已定，不再问你」事故的成因。
+   *
+   * 代价是「首次沉淀前读路径为空」，可以接受：一次沉淀即可重建。
+   */
+  let latestSnapshot = '';
+  /**
+   * 当前`latestSnapshot` 归属的会话 ID。
+   *
+   * 必须与 `currentSessionId` 分开：前者是「这份内容是谁的」，
+   * 后者是「现在在跟谁说话」。两者不一致时**绝不能注入**。
+   * 用一个可变变量而不是拿启动时的 `storedSnapshot.sessionId` 比对，
+   * 否则 A→B→A 切回时会把 A 刚写的内容误判成别人的（见 `bindSnapshotToSession`）。
+   */
+  let snapshotOwner = storedSnapshot.sessionId;
+  /** 当前会话 ID（用于判定快照归属）。空串表示还没见过会话事件。 */
+  let currentSessionId = '';
   /** 快照是否已被渲染层取走（只记一次日志）。 */
   let snapshotServed = false;
   /** 步进控制器：能力门控 + 熔断 + 节流 + 有序执行。 */
@@ -417,6 +516,76 @@ export function apply(ctx: Context, config: Config): void {
   const trimReasonsLogged = new Set<string>();
   /** 最近一次 pre-step 的 agent：`lrc_handoff` 工具需要它拿当前会话。 */
   let lastAgent: unknown;
+
+  /**
+   * 把状态快照绑定到当前会话：**归属不符就丢弃**。
+   *
+   * ## 为什么必须有这一步
+   *
+   * 快照文件是进程级单例，语义却是「本会话沉淀出的状态」。实测事故
+   * （2026-11-12，session-644bba1d 新开会话）第一轮就被注入：
+   *
+   * ```
+   * [LRC 状态] 方向已定，不再问你。细节在 LRC，需要时 recall。
+   * ```
+   *
+   * 这句话来自**上一个会话**（做视频时定的方向），新会话的模型
+   * 根本不知道「方向」指什么。它不会报错，只会：
+   * 1. 把「方向已定」当成既定前提，跳过需求确认；
+   * 2. 或反复追问「什么方向」——两者都是误导。
+   *
+   * ## 为什么用可变的 `snapshotOwner`，而不是比 `storedSnapshot.sessionId`
+   *
+   * `storedSnapshot` 是**进程启动时**的磁盘值，之后再不变。用它比对会出现
+   * 「A→B→A 切回时丢掉 A 自己刚写的快照」：A 写了 T_A，切到 B，再切回 A，
+   * 判定仍是 `storedSnapshot.sessionId(=OLD) !== 'A'` ⇒ 把 T_A 丢掉，
+   * 症状是「切回来状态行消失且不会自己回来」，而 `lrc_status` 还显示
+   * 「为空（还没有成功沉淀过）」——与事实相反。
+   *
+   * 所以归属必须跟着**内存里的实际内容**走：`saveSnapshot` 写谁就更新谁。
+   *
+   * @param sessionId - 本次会话 ID
+   */
+  function bindSnapshotToSession(sessionId: string): void {
+    if (sessionId.length === 0) return;
+    if (sessionId === currentSessionId) return;
+    currentSessionId = sessionId;
+
+    // ── 所有「会话级状态」必须在这里一并重置 ──
+    //
+    // 引入会话边界后，只修快照是不够的：召回注入的 `recallText`/`recallFingerprint`
+    // 同样是会话级的。若不清，新会话第一句若恰好算出与旧会话相同的指纹
+    // （例如都以「继续」开头，而指纹继承逻辑会沿用上一指纹），
+    // 就会直接跳过检索、沿用**上一个会话**注入的记忆 —— 与快照泄漏同构，
+    // 只是更难观察（要撞上同指纹才复现）。
+    if (recallText.length > 0 || recallFingerprint.length > 0) {
+      recallText = '';
+      recallFingerprint = '';
+      recallGeneration += 1;
+    }
+
+    // 归属不符：磁盘里那份是别人的，不能带进本会话
+    if (snapshotOwner !== sessionId) {
+      // 注意判据是「磁盘上有没有内容」，不是 `latestSnapshot.length`：
+      // 初值已置空（见 `latestSnapshot` 声明处），后者恒为 0，会让这条
+      // 本该出现的日志永远不打印 —— 而「快照被丢弃」正是排障时最需要看到的。
+      if (storedSnapshot.text.length > 0) {
+        ctx.logger.info(
+          `[lrc] 快照属于其他会话（${snapshotOwner || '无归属'}），` +
+            `已丢弃 ${storedSnapshot.text.length} 字符，避免跨会话误导`,
+        );
+      }
+      latestSnapshot = '';
+      snapshotServed = false;
+      return;
+    }
+
+    // 归属相符（同一会话的重启续跑）：恢复磁盘内容
+    if (latestSnapshot.length === 0 && storedSnapshot.text.length > 0) {
+      latestSnapshot = storedSnapshot.text;
+      ctx.logger.info(`[lrc] 快照归属本会话（${sessionId}），已恢复 ${latestSnapshot.length} 字符`);
+    }
+  }
 
   /**
    * 注入开关的单一判定点。
@@ -546,26 +715,43 @@ export function apply(ctx: Context, config: Config): void {
   })();
 
   /**
-   * 启动时从 LRC 索引重建快照。
+   * 启动时确认 LRC 索引可用（**不再用它拼装 `[LRC 状态]`**）。
    *
-   * 快照原本只在上次沉淀成功时写盘；如果上次进程没来得及沉淀，
-   * 重启后读路径就是空的。这里用 `/v1/context/index` 兜底，
-   * 让 `[LRC 状态]` 在重启后也能立刻出现。
+   * ## 为什么原来要重建，现在为什么不能
+   *
+   * 原实现从项目级索引取最近 3 条记忆，拼成
+   * `[LRC 状态] …。细节在 LRC，需要时 recall。` 注入上下文，目的是
+   * 让进程重启后读路径不空。
+   *
+   * 但这个「状态」标签是**谎报**：索引是**跨会话的项目级记忆**，
+   * 不含任何会话边界。实测事故（2026-11-12，新会话说 `session-644bba1d`）：
+   *
+   * ```
+   * [LRC 状态] 方向已定，不再问你。细节在 LRC，需要时 recall。
+   * ```
+   *
+   * 「方向」是上一场会话（做视频）的指代，新会话的模型无从解释 ——
+   * 只能把「方向已定」当既定前提，跳过需求确认，或反复追问「什么方向」。
+   *
+   * ## 缺口已由别处覆盖
+   *
+   * 它想解决的「重启后读路径为空」，现在由**带会话归属的磁盘快照**
+   * 覆盖（见 `bindSnapshotToSession`）：同一会话重启照常恢复，
+   * 换会话则正确丢弃。项目级记忆的正确入口是 `lrc_recall` / 主动召回注入，
+   * 那里天然带查询语义，模型知道「这是检索结果」而不是「我的状态」。
+   *
+   * 因此这里退化为**只做可用性探测**：确认索引服务在，便于 `lrc_status`
+   * 排障，但绝不把跨会话记忆打扮成会话状态。
    */
   async function bootstrapSnapshot(): Promise<void> {
-    if (latestSnapshot.length > 0) return;
     const client = connection.peek();
     if (client === null) return;
     try {
       const index = await client.index(config.project, 3);
-      if (index.items.length === 0) return;
-      const picked = index.items.map((item) => {
-        const body = item.content_preview.replace(/^\[[^\]]+\]\s*/, '');
-        return body.length > 120 ? `${body.slice(0, 120)}…` : body;
-      });
-      latestSnapshot = `[LRC 状态] ${picked.join('；')}。细节在 LRC，需要时 recall。`;
-      saveSnapshot(latestSnapshot);
-      ctx.logger.info(`[lrc] 快照已从 LRC 索引重建（${index.items.length} 条）`);
+      ctx.logger.info(
+        `[lrc] 项目索引可用（${index.total} 条）。注意：跨会话记忆不注入为 [LRC 状态]，` +
+          `需要时用 lrc_recall 或开启 recallInjectEnabled`,
+      );
     } catch {
       // 索引不可用不影响对话
     }
@@ -703,7 +889,10 @@ export function apply(ctx: Context, config: Config): void {
     }
     flushing = true;
     try {
-      const sessionId = (session as { id?: string })?.id ?? 'default';
+      // 用 `''` 而不是 `'default'`：假 ID 会让快照被标成「属于 default」，
+      // 而 `bindSnapshotToSession` 拿到的是真实 ID ⇒ 下次启动判定归属不符、
+      // 把本会话的快照丢掉。空串让"取不到 ID"这件事显式可辨（见 saveSnapshot）。
+      const sessionId = (session as { id?: string })?.id ?? '';
       const lines = linesFromSession(session);
       if (lines.length === 0) {
         // 只警告一次：否则每一步都会刷同一条日志
@@ -727,8 +916,8 @@ export function apply(ctx: Context, config: Config): void {
             if (result.distilled > 0) {
               // ★2026-11-07：只有实质变化才更新快照，避免宿主每轮 append 新 runtime-context
               if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-                latestSnapshot = result.snapshot;
-                saveSnapshot(result.snapshot);
+                // sessionId 用本函数开头捕获的真实值，不用全局 currentSessionId
+                saveSnapshot(result.snapshot, sessionId);
               }
               ctx.logger.info(
                 `[lrc] 推理兜底沉淀 ${result.distilled} 条（写入 ${result.written}，合并 ${result.merged}` +
@@ -756,8 +945,7 @@ export function apply(ctx: Context, config: Config): void {
         // 快照回填：下一轮上下文会带上这一行。
         // ★2026-11-07：只有实质变化才更新，避免宿主每轮 append 新 runtime-context。
         if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-          latestSnapshot = result.snapshot;
-          saveSnapshot(result.snapshot);
+          saveSnapshot(result.snapshot, sessionId);
         }
         // LRC 的 `written` 是"成功处理条数"，`merged` 是"其中走合并的条数"，
         // 两者是包含关系，不是互斥的"新增 / 合并"。
@@ -819,6 +1007,10 @@ export function apply(ctx: Context, config: Config): void {
     const reasoning = turnReasoning.join('\n');
     resetTurnState();
 
+    // 本轮的会话 ID **在 await 之前**捕获：`flush` 内部要等两次 HTTP，
+    // 期间用户可能已经切到别的会话，之后再读全局 currentSessionId 就是别人的。
+    const sessionId = (session as { id?: string })?.id ?? '';
+
     // 2. 主路径：正文行（长任务的最终报告只在这里出现一次）
     await flush(session, 'turn/end');
 
@@ -831,8 +1023,7 @@ export function apply(ctx: Context, config: Config): void {
       if (result.distilled > 0) {
         // ★2026-11-07：只有实质变化才更新快照，避免宿主每轮 append 新 runtime-context
         if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-          latestSnapshot = result.snapshot;
-          saveSnapshot(result.snapshot);
+          saveSnapshot(result.snapshot, sessionId);
         }
         ctx.logger.info(
           `[lrc] 推理兜底沉淀 ${result.distilled} 条（写入 ${result.written}，合并 ${result.merged}` +
@@ -851,6 +1042,14 @@ export function apply(ctx: Context, config: Config): void {
   // 订阅会话事件：累计新增文本 + turn 结束时兜底沉淀
   ctx.on('session/event', (session: unknown, event: unknown) => {
     const type = (event as { type?: string })?.type;
+
+    // 会话归属确认：**必须排在所有分支之前**。
+    // 快照在构造时就已从磁盘读入（可能是上一个会话的状态），
+    // 若在确认归属前就被渲染层取走，新会话就会带着别人的结论开局
+    // （实测「方向已定，不再问你」泄漏到新会话）。
+    // `session/event` 是能拿到 session.id 的最早入口，故在此收口。
+    const sessionId = (session as { id?: string })?.id ?? '';
+    bindSnapshotToSession(sessionId);
 
     if (type === 'turn/start') {
       resetTurnState();
@@ -967,13 +1166,20 @@ export function apply(ctx: Context, config: Config): void {
     const caps = governor.capabilities;
 
     // 统一预算：按模型窗口比例推导阈值。
-    // fallback（窗口未知）时允许复查 —— 模型可能中途切换（provider/model 变了），
-    // 一次 fallback 就永久按绝对值裁剪并不合理。
+    //
+    // ## 为什么按固定步数复查，而不是「只在 fallback 时复查」
+    //
+    // 原逻辑：只有 `source === 'fallback'` 才复查。它默认「一旦拿到可信窗口，
+    // 窗口就不会变」——但用户**随时可以换模型**（1M 的 flash ↔ 128K 的小模型），
+    // 换完窗口就完全不同，而预算永远停在旧值：
+    // - 1M → 128K：阈值仍是按 1M 算的 100000，128K 窗口永远到不了 ⇒ **一次都不裁**；
+    // - 128K → 1M：阈值 12800 ⇒ 每步都裁 ⇒ 缓存全废（本轮的实测事故就是这个量级）。
+    //
+    // 所以按步数定期复查所有来源，并在「窗口或来源变化」时打日志。
+    // 复查成本很低：`requestHeader()` 是同步读取，只在没声明窗口时才走异步探测。
     if (
       budget === null ||
-      (budget.source === 'fallback' &&
-        budgetRecheckSteps > 0 &&
-        governor.steps % budgetRecheckSteps === 0)
+      (budgetRecheckSteps > 0 && governor.steps % budgetRecheckSteps === 0)
     ) {
       try {
         const resolved = await resolveBudget({
@@ -1576,6 +1782,34 @@ export function apply(ctx: Context, config: Config): void {
             `offload=${config.offloadTurns} 轮 / ${config.offloadChars} 字符 / ${config.offloadSteps} 步`,
           ].join('\n'),
         );
+        // 宿主**不会**为老 patch 自动补齐新配置项（`cordis.patch.yml` 里
+        // 没写的字段在 apply 时就是 undefined）。因此「有这个开关」和
+        // 「用户能打开它」是两件事：不给出文件路径与可粘贴片段，
+        // 用户就永远不知道该怎么启用（实测新会话 0 次注入，正是因为
+        // 真实 patch 里没有 recallInjectEnabled 这一行）。
+        if (!recallInjectOn) {
+          // 路径从 `cacheDir` 反推，不能直接 `DSH_HOME ?? homedir()`：
+          // 本机实测 `DSH_HOME` 未设置、`homedir()` 是 `C:\Users\Administrator`，
+          // 而 DSH 真实 home 是 `D:\Users\.dsh`（由 DSH NEXT 的
+          // `desktop-next-location.json` 指向）。
+          // C 盘那个同名目录**确实存在**且含 cordis.patch.yml，但里面没有
+          // dsh-plugin-lrc 段 —— 照它改，改完重启什么都不会发生。
+          // `cacheDir` 已由宿主 HOME 推导且实测落盘正确，上溯两级最可靠。
+          const dshHome = dirname(dirname(cacheDir));
+          const patchPath = join(dshHome, 'profiles', 'desktop', 'cordis.patch.yml');
+          lines.push('');
+          lines.push('### 主动召回注入未启用');
+          lines.push(
+            `在 \`${patchPath}\` 的 \`id: dsh-plugin-lrc\` → \`config:\` 下补以下四行，然后重启 DSH：`,
+          );
+          lines.push('```yaml');
+          lines.push('        recallInjectEnabled: true');
+          lines.push('        recallInjectMaxItems: 2');
+          lines.push('        recallInjectMinScore: 0.5');
+          lines.push('        recallInjectMaxCharsPerItem: 80');
+          lines.push('```');
+          lines.push('（上溯路径来自本插件实际使用的缓存目录；多 profile 时请确认当前 profile 名。）');
+        }
         lines.push('');
 
         lines.push('## 快照');

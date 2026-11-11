@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-lrc",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "把 LRC 的结构化长期记忆接进 DeepSeek Harness：边聊边沉淀、按需召回、可纠错，让上下文不再需要频繁压缩",
   "type": "module",
   "main": "dist/index.js",
@@ -38,7 +38,8 @@
     "e2e:profile": "node scripts/e2e-profile.ts",
     "e2e:recall": "node scripts/e2e-recall-injection.ts",
     "e2e:recall:e2e": "node --import ./scripts/register-loader.mjs scripts/e2e-recall-e2e.ts",
-    "test": "node scripts/smoke.ts && node scripts/e2e-offload.ts && node scripts/e2e-runtime.ts && node scripts/e2e-recovery.ts && node --import ./scripts/register-loader.mjs scripts/e2e-entry-tools.ts && node scripts/e2e-host-payload.ts && node scripts/e2e-filter.ts && node scripts/e2e-trim.ts && node scripts/e2e-host-surface.ts && node scripts/e2e-handoff.ts && node scripts/e2e-governor.ts && node scripts/e2e-budget.ts && node scripts/e2e-profile.ts && node scripts/e2e-invariant.ts && node scripts/e2e-recall-injection.ts && node --import ./scripts/register-loader.mjs scripts/e2e-apply.ts && node --import ./scripts/register-loader.mjs scripts/e2e-turn.ts && node --import ./scripts/register-loader.mjs scripts/e2e-recall-e2e.ts"
+    "e2e:scope": "node --import ./scripts/register-loader.mjs scripts/e2e-session-scope.ts",
+    "test": "node scripts/smoke.ts && node scripts/e2e-offload.ts && node scripts/e2e-runtime.ts && node scripts/e2e-recovery.ts && node --import ./scripts/register-loader.mjs scripts/e2e-entry-tools.ts && node scripts/e2e-host-payload.ts && node scripts/e2e-filter.ts && node scripts/e2e-trim.ts && node scripts/e2e-host-surface.ts && node scripts/e2e-handoff.ts && node scripts/e2e-governor.ts && node scripts/e2e-budget.ts && node scripts/e2e-profile.ts && node scripts/e2e-invariant.ts && node scripts/e2e-recall-injection.ts && node --import ./scripts/register-loader.mjs scripts/e2e-apply.ts && node --import ./scripts/register-loader.mjs scripts/e2e-turn.ts && node --import ./scripts/register-loader.mjs scripts/e2e-recall-e2e.ts && node --import ./scripts/register-loader.mjs scripts/e2e-session-scope.ts"
   },
   "keywords": [
     "dsh-plugin",

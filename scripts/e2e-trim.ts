@@ -397,6 +397,70 @@ check('超限时先牺牲工具调用', !heavyTrimmed.includes('结果 19'), hea
 check('超限后仍守上限', heavyTrimmed.length <= 400, heavyTrimmed.length);
 
 // ────────────────────────────────────────────────────────────
+// 2e. ★2026-11-12 实测回归：系统提示不得被当成「助手结论」
+//
+// 事故（session-644bba1d）：DSH 的模型配置是 `systemPromptUpdate: in-history`，
+// 系统提示以 `role:'system'` 出现在重放历史里。原实现「非 user 非 tool 即
+// 助手结论」把它收了进去，导致 5 份摘要的结论区**只有这一条**：
+//   ### 助手结论
+//   - You are an AI agent powered by DeepSeek Harness. You are a coding agent…
+// 真实结论被挤掉，且系统提示残片变成了「历史里的助手发言」。
+console.log('=== 2e) 系统提示不得进摘要 ===');
+{
+  const systemPrompt =
+    'You are an AI agent powered by DeepSeek Harness. You are a coding agent powered by ' +
+    'the deepseek/deepseek-v4.1-flash model. Tokens prefixed with @ are paths the user ' +
+    'explicitly referenced. '.repeat(3);
+
+  const withSystem = [
+    { role: 'system', content: [{ type: 'text', text: systemPrompt }] },
+    { role: 'user', content: [{ type: 'text', text: '把插件改成 external 模式' }] },
+    { role: 'assistant', content: [{ type: 'text', text: '结论：改用 serviceFor 拿引擎' }] },
+  ];
+  const s = buildDeterministicSummary(withSystem, 4000);
+  console.log(`  摘要:\n${s.split('\n').map((l) => '    ' + l).join('\n')}`);
+  check('系统提示不进助手结论', !s.includes('You are an AI agent powered by DeepSeek Harness'), s);
+  check('真实结论仍在', s.includes('改用 serviceFor 拿引擎'), s);
+  check('用户请求仍在', s.includes('把插件改成 external 模式'), s);
+
+  // 兜底：role 字段丢失（某些版本重放不带 role）时也不能收进结论
+  const noRole = [
+    { content: [{ type: 'text', text: systemPrompt }] },
+    { role: 'assistant', content: [{ type: 'text', text: '结论：真实结论' }] },
+  ];
+  const s2 = buildDeterministicSummary(noRole, 4000);
+  check('无 role 时系统提示仍被拦下', !s2.includes('You are an AI agent'), s2);
+  check('无 role 时真实结论保留', s2.includes('真实结论'), s2);
+
+  // ★关键：白名单不能把「无 role 的 assistant 正文」全部丢光
+  //
+  // 若 `isConversationRole` 只认 user|assistant，缺 role 的重放会让
+  // 摘要只剩「用户请求」区、结论区全空 —— 比原来的污染更糟（那时至少有字），
+  // 而且不报错、长度看起来正常。这里必须断言它**保留**。
+  const noRoleAssistant = [
+    { role: 'user', content: [{ type: 'text', text: '需求：修好摘要' }] },
+    { content: [{ type: 'text', text: '结论：改为角色白名单' }] },
+    { content: [{ type: 'text', text: '结论：补 no-role 用例' }] },
+  ];
+  const s2b = buildDeterministicSummary(noRoleAssistant, 4000);
+  check('无 role 的 assistant 正文保留为结论', s2b.includes('改为角色白名单'), s2b);
+  check('多条无 role 结论都保留', s2b.includes('补 no-role 用例'), s2b);
+  check('用户请求区仍正常', s2b.includes('需求：修好摘要'), s2b);
+
+  // 系统提示不得挤占结论槽位：给足真实结论时全部保留
+  const manyConclusions = [
+    { role: 'system', content: [{ type: 'text', text: systemPrompt }] },
+    ...Array.from({ length: 5 }, (_, i) => ({
+      role: 'assistant',
+      content: [{ type: 'text', text: `结论 ${i}：第 ${i} 项已验证` }],
+    })),
+  ];
+  const s3 = buildDeterministicSummary(manyConclusions, 4000);
+  const conclusionCount = s3.split('\n').filter((l) => l.startsWith('- 结论 ')).length;
+  check('真实结论不被系统提示挤占', conclusionCount === 5, { conclusionCount, s3 });
+}
+
+// ────────────────────────────────────────────────────────────
 // 3. trimContext 全链路
 // ────────────────────────────────────────────────────────────
 console.log('=== 3) trimContext 全链路 ===');
