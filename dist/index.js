@@ -684,6 +684,139 @@ function isConnectionError(error) {
   );
 }
 
+// src/recall-injection.ts
+var DEFAULT_RECALL_INJECTION = {
+  // 2 条足够覆盖"用户偏好 + 关键决定"这类最常见场景，再多就是噪音
+  maxItems: 2,
+  maxCharsPerItem: 80,
+  // 与快照 220 字符同量级，避免单次注入就把上下文撑大
+  maxTotalChars: 240,
+  // enrich 的 score_norm 是相对 top1 归一化的，低于 0.5 基本是"沾边"
+  minScore: 0.5
+};
+function normalizeRecallOptions(input) {
+  const raw = input ?? {};
+  const num = (value, fallback) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return {
+    // 0 是合法值（显式关闭），负数一律归 0
+    maxItems: Math.max(0, Math.floor(num(raw.maxItems, DEFAULT_RECALL_INJECTION.maxItems))),
+    maxCharsPerItem: Math.max(
+      1,
+      Math.floor(num(raw.maxCharsPerItem, DEFAULT_RECALL_INJECTION.maxCharsPerItem))
+    ),
+    maxTotalChars: Math.max(
+      1,
+      Math.floor(num(raw.maxTotalChars, DEFAULT_RECALL_INJECTION.maxTotalChars))
+    ),
+    // 相关度必须落在 [0,1]，否则过滤条件会恒真或恒假
+    minScore: Math.min(1, Math.max(0, num(raw.minScore, DEFAULT_RECALL_INJECTION.minScore)))
+  };
+}
+function formatRecallInjection(memories, options = DEFAULT_RECALL_INJECTION) {
+  if (options.maxItems <= 0) return "";
+  const picked = memories.filter((m) => typeof m.content === "string" && m.content.trim().length > 0).filter((m) => (m.score_norm ?? 1) >= options.minScore).slice(0, options.maxItems);
+  if (picked.length === 0) return "";
+  const lines = picked.map((m) => {
+    const body = m.content.trim().replace(/\s+/g, " ");
+    const cut = body.length > options.maxCharsPerItem ? `${body.slice(0, options.maxCharsPerItem)}…` : body;
+    return `- ${cut}`;
+  });
+  let text = `[LRC 相关记忆]
+${lines.join("\n")}`;
+  while (text.length > options.maxTotalChars && picked.length > 1) {
+    picked.pop();
+    const kept = picked.map((m) => {
+      const body = m.content.trim().replace(/\s+/g, " ");
+      return `- ${body.length > options.maxCharsPerItem ? `${body.slice(0, options.maxCharsPerItem)}…` : body}`;
+    });
+    text = `[LRC 相关记忆]
+${kept.join("\n")}`;
+  }
+  if (text.length > options.maxTotalChars) {
+    text = `${text.slice(0, options.maxTotalChars - 1)}…`;
+  }
+  return text;
+}
+var CONTINUATION_HINTS = [
+  "继续",
+  "接着",
+  "然后",
+  "往下",
+  "下一步",
+  "再来",
+  "好的",
+  "好",
+  "行",
+  "可以",
+  "go on",
+  "continue",
+  "next",
+  "ok",
+  "okay",
+  "proceed",
+  "carry on"
+];
+function isContinuation(text) {
+  const t = text.toLowerCase().trim().replace(/[\s\p{P}\p{S}]+/gu, "");
+  if (t.length === 0 || t.length > 8) return false;
+  for (const h of CONTINUATION_HINTS) {
+    const stripped = t.replace(h, "");
+    if (stripped.length !== t.length && stripped.length <= 2) return true;
+  }
+  return false;
+}
+function topicFingerprint(text, previous) {
+  if (previous !== void 0 && previous.length > 0 && isContinuation(text)) {
+    return previous;
+  }
+  const normalized = text.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, " ").trim();
+  if (normalized.length === 0) return "";
+  const STOP = /* @__PURE__ */ new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "you",
+    "can",
+    "please",
+    "然后",
+    "继续",
+    "现在",
+    "这个",
+    "那个",
+    "帮我",
+    "一下",
+    "可以",
+    "怎么",
+    "什么",
+    "还是",
+    "就是",
+    "已经",
+    "需要",
+    "的",
+    "了",
+    "吗",
+    "呢"
+  ]);
+  const tokens = [];
+  for (const part of normalized.split(" ")) {
+    if (part.length === 0) continue;
+    if (/^[a-z0-9_.-]+$/.test(part)) {
+      if (part.length >= 2 && !STOP.has(part)) tokens.push(part);
+      continue;
+    }
+    const cleaned = [...part].filter((ch) => !STOP.has(ch)).join("");
+    if (cleaned.length === 1) tokens.push(cleaned);
+    for (let i = 0; i + 2 <= cleaned.length; i += 1) tokens.push(cleaned.slice(i, i + 2));
+  }
+  const uniq = [...new Set(tokens)].sort();
+  const bucket = Math.floor(normalized.length / 20);
+  if (uniq.length === 0) return `len:${bucket}`;
+  return `len:${bucket}|${uniq.slice(0, 6).join(",")}`;
+}
+
 // src/cursor.ts
 import { createHash as createHash2 } from "node:crypto";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
@@ -1463,6 +1596,11 @@ function hasMalformedTextBlock(content) {
     const b = block;
     return (b?.type === "text" || b?.type === "reasoning") && typeof b.text !== "string";
   });
+}
+function userMessageText(event) {
+  const candidate = event;
+  if (candidate?.type !== "user/message") return "";
+  return textBlocksOnly(candidate.data?.content);
 }
 function isRealUserMessage(event) {
   return isRealUserEvent(event);
@@ -2595,34 +2733,56 @@ var Config = Schema.object({
   // 宿主服务可能后起（compaction 在 preset 初始化 / tokenMeter 随模型切换就绪）。
   // 一次性探测会把「启动瞬间没准备好」固化成「整场会话不可用」。
   capabilityRecheckSteps: Schema.number().default(20),
-  budgetRecheckSteps: Schema.number().default(20)
+  budgetRecheckSteps: Schema.number().default(20),
+  // ── 主动召回注入 ──
+  // 实测（2026-11-12，379 步真实会话）：模型从未想起调用 lrc_recall，
+  // 系统提示写了也没用。改为由插件主动把相关记忆推进上下文。
+  // 默认关闭：先让用户按需开启并观察缓存命中率，确认无副作用再改默认值。
+  /** 是否主动注入相关记忆 */
+  recallInjectEnabled: Schema.boolean().default(false),
+  /** 最多注入几条 */
+  recallInjectMaxItems: Schema.number().default(2),
+  /** 低于该相关度不注入（0–1） */
+  recallInjectMinScore: Schema.number().default(0.5),
+  /** 单条截断字符数 */
+  recallInjectMaxCharsPerItem: Schema.number().default(80)
 });
 var PROMPT_SECTION = "lrc:memory-capture";
-var PROMPT_TEXT = [
-  "## 长期记忆（LRC）",
-  "",
-  "涉及项目历史、用户偏好、之前做过的决定、上次怎么改的，**先调 `lrc_recall` 工具**，",
-  "不要直接 Grep 或翻文件。检索为空时才回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。",
-  "",
-  "发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），",
-  "不要让它继续污染后续对话。",
-  "",
-  "## 长期记忆沉淀（必须遵守）",
-  "",
-  "每次回答的最后一行，必须输出一个 <lrc_memory> 块，格式固定：",
-  "",
-  "<lrc_memory>",
-  "- 决策：…",
-  "- 约束：…",
-  "- 结论：…",
-  "</lrc_memory>",
-  "",
-  "规则：",
-  "- 只写本轮产生的决策、约束、最终结论；没有的条目直接省略。",
-  "- 本轮没有任何值得长期保留的内容时，输出 <lrc_memory>无新增</lrc_memory>。",
-  "- 只写结论，不写过程、待办清单、选项罗列或代码。",
-  "- 标签必须出现在回答的最末尾，且每轮只出现一次。"
-].join("\n");
+function buildPromptText(recallInjected) {
+  const recallRule = recallInjected ? [
+    "上下文里可能已出现 `[LRC 相关记忆]` 段落，那是插件按当前话题**自动检索**的结果，",
+    "直接当事实使用，不需要再调 `lrc_recall` 确认。",
+    "只有当该段落缺失、或明显不足以回答（例如需要更早的细节）时，才调 `lrc_recall` 补充检索；",
+    "检索为空时回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。"
+  ] : [
+    "涉及项目历史、用户偏好、之前做过的决定、上次怎么改的，**先调 `lrc_recall` 工具**，",
+    "不要直接 Grep 或翻文件。检索为空时才回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。"
+  ];
+  return [
+    "## 长期记忆（LRC）",
+    "",
+    ...recallRule,
+    "",
+    "发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），",
+    "不要让它继续污染后续对话。",
+    "",
+    "## 长期记忆沉淀（必须遵守）",
+    "",
+    "每次回答的最后一行，必须输出一个 <lrc_memory> 块，格式固定：",
+    "",
+    "<lrc_memory>",
+    "- 决策：…",
+    "- 约束：…",
+    "- 结论：…",
+    "</lrc_memory>",
+    "",
+    "规则：",
+    "- 只写本轮产生的决策、约束、最终结论；没有的条目直接省略。",
+    "- 本轮没有任何值得长期保留的内容时，输出 <lrc_memory>无新增</lrc_memory>。",
+    "- 只写结论，不写过程、待办清单、选项罗列或代码。",
+    "- 标签必须出现在回答的最末尾，且每轮只出现一次。"
+  ].join("\n");
+}
 function apply(ctx, config) {
   const cacheDir = join2(process.env.DSH_HOME ?? join2(homedir2(), ".dsh"), "cache", "lrc-plugin");
   const snapshotPath = join2(cacheDir, "snapshot.json");
@@ -2682,6 +2842,16 @@ function apply(ctx, config) {
   let warnedNoConclusion = false;
   let flushing = false;
   let probed = false;
+  let recallText = "";
+  let recallFingerprint = "";
+  let recallGeneration = 0;
+  let recallRewrites = 0;
+  const recallOptions = normalizeRecallOptions({
+    maxItems: config.recallInjectMaxItems,
+    maxCharsPerItem: config.recallInjectMaxCharsPerItem,
+    maxTotalChars: 240,
+    minScore: config.recallInjectMinScore
+  });
   let turnHits = 0;
   let turnMisses = 0;
   let turnNoText = 0;
@@ -2695,10 +2865,11 @@ function apply(ctx, config) {
   let budget = null;
   const trimReasonsLogged = /* @__PURE__ */ new Set();
   let lastAgent;
+  const recallInjectOn = config.recallInjectEnabled === true;
   const systemPrompt = ctx.get("systemPrompt");
   if (typeof systemPrompt?.section === "function") {
     try {
-      systemPrompt.section({ name: PROMPT_SECTION, order: 9e3, text: PROMPT_TEXT });
+      systemPrompt.section({ name: PROMPT_SECTION, order: 9e3, text: buildPromptText(recallInjectOn) });
       systemPrompt.context?.({
         name: "lrc:snapshot",
         // ★2026-11-07（缓存命中率）：order 取 9999，让 LRC 快照排在
@@ -2707,11 +2878,16 @@ function apply(ctx, config) {
         // 因此快照位于历史之后、不打断前缀；order 只决定块内顺序。
         order: 9999,
         text: () => {
-          if (latestSnapshot.length > 0 && !snapshotServed) {
+          const merged = recallText.length === 0 ? latestSnapshot : latestSnapshot.length === 0 ? recallText : `${recallText}
+
+${latestSnapshot}`;
+          if (merged.length > 0 && !snapshotServed) {
             snapshotServed = true;
-            ctx.logger.info(`[lrc] 快照已注入上下文（${latestSnapshot.length} 字符）`);
+            ctx.logger.info(
+              `[lrc] 已注入上下文（${merged.length} 字符${recallText.length > 0 ? `，含召回 ${recallText.length}` : ""}）`
+            );
           }
-          return latestSnapshot;
+          return merged;
         }
       });
     } catch (error) {
@@ -2788,6 +2964,41 @@ function apply(ctx, config) {
       ctx.logger.warn(`[lrc][tool] 连接失效，已标记重连：${message}`);
     }
     return message;
+  }
+  async function refreshRecallInjection(rawQuery) {
+    if (!recallInjectOn || recallOptions.maxItems <= 0) return;
+    const query = textBlocksOnly(rawQuery).trim();
+    if (query.length === 0) return;
+    const fingerprint = topicFingerprint(query, recallFingerprint);
+    if (fingerprint.length === 0) return;
+    if (fingerprint === recallFingerprint) return;
+    const generation = recallGeneration + 1;
+    recallGeneration = generation;
+    const acquired = await acquireClient();
+    if ("reason" in acquired) {
+      return;
+    }
+    try {
+      const result = await acquired.client.recall(query.slice(0, 200), {
+        topK: Math.max(recallOptions.maxItems * 3, 3)
+      });
+      if (generation !== recallGeneration) return;
+      const next = formatRecallInjection(result.memories, recallOptions);
+      recallFingerprint = fingerprint;
+      if (next === recallText) return;
+      recallText = next;
+      recallRewrites += 1;
+      ctx.logger.info(
+        next.length === 0 ? `[lrc] 本轮无相关记忆，不注入（指纹 ${fingerprint}）` : `[lrc] 注入 ${result.memories.length} 条候选中的 ${recallOptions.maxItems} 条（${next.length} 字符，指纹 ${fingerprint}，累计改写 ${recallRewrites} 次）`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isConnectionError(error)) {
+        connection.invalidate(message);
+        offloader.bind(null);
+      }
+      ctx.logger.warn(`[lrc] 召回注入失败（保留上次内容）：${message}`);
+    }
   }
   async function flush(session, reason) {
     if (flushing) return;
@@ -2910,6 +3121,10 @@ function apply(ctx, config) {
     }
     if (type === "turn/end") {
       void finishTurn(session);
+      return;
+    }
+    if (type === "user/message" && isRealUserMessage(event)) {
+      void refreshRecallInjection(userMessageText(event));
       return;
     }
     if (type !== "assistant/message") return;
@@ -3475,6 +3690,23 @@ ${value.text}`
         lines.push(
           latestSnapshot.length > 0 ? `已存在（${latestSnapshot.length} 字符）${snapshotServed ? "，已被渲染层取走" : "，尚未被取走"}` : "为空（还没有成功沉淀过）"
         );
+        lines.push("");
+        lines.push("## 主动召回注入");
+        if (!recallInjectOn) {
+          lines.push("已关闭（recallInjectEnabled=false）");
+        } else {
+          lines.push(
+            recallText.length > 0 ? `已注入 ${recallText.length} 字符｜指纹 ${recallFingerprint}` : `本轮无匹配，未注入｜指纹 ${recallFingerprint || "(空)"}`
+          );
+          lines.push(
+            `配置：最多 ${recallOptions.maxItems} 条｜阈值 ${recallOptions.minScore}｜单条 ${recallOptions.maxCharsPerItem} 字符｜总长 ${recallOptions.maxTotalChars}`
+          );
+          lines.push(`累计改写 ${recallRewrites} 次（每次改写会打断一次前缀缓存）`);
+          if (recallText.length > 0) {
+            lines.push("内容：");
+            for (const line of recallText.split("\n")) lines.push(`  ${line}`);
+          }
+        }
         return { text: lines.join("\n") };
       }
     })

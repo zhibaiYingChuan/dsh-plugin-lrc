@@ -29,14 +29,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { LrcRuntime } from './runtime.ts';
 import { LrcClient } from './lrc-client.ts';
 import { Recoverable, isConnectionError } from './recoverable.ts';
+import { normalizeRecallOptions, formatRecallInjection, topicFingerprint } from './recall-injection.ts';
 import { CursorStore, RecentStore, snapshotChanged } from './cursor.ts';
 import { Offloader, itemsFromTag } from './offloader.ts';
 import {
   hasMalformedTextBlock,
+  isRealUserMessage,
   linesFromSession,
   messageContent,
   reasoningBlocksOnly,
   textBlocksOnly,
+  userMessageText,
 } from './session-text.ts';
 import { conclusionsFromReasoning, extractMemoryTag, isNoUpdate } from './memory-filter.ts';
 import {
@@ -113,6 +116,14 @@ export interface Config {
   capabilityRecheckSteps: number;
   /** 预算复查间隔（步）：窗口未知时每 N 步重探一次，0 = 不复查 */
   budgetRecheckSteps: number;
+  /** 是否主动把相关记忆注入上下文 */
+  recallInjectEnabled: boolean;
+  /** 最多注入几条 */
+  recallInjectMaxItems: number;
+  /** 低于该相关度不注入（0–1） */
+  recallInjectMinScore: number;
+  /** 单条截断字符数 */
+  recallInjectMaxCharsPerItem: number;
 }
 
 export const Config: Schema = Schema.object({
@@ -167,45 +178,80 @@ export const Config: Schema = Schema.object({
   // 一次性探测会把「启动瞬间没准备好」固化成「整场会话不可用」。
   capabilityRecheckSteps: Schema.number().default(20),
   budgetRecheckSteps: Schema.number().default(20),
+
+  // ── 主动召回注入 ──
+  // 实测（2026-11-12，379 步真实会话）：模型从未想起调用 lrc_recall，
+  // 系统提示写了也没用。改为由插件主动把相关记忆推进上下文。
+  // 默认关闭：先让用户按需开启并观察缓存命中率，确认无副作用再改默认值。
+  /** 是否主动注入相关记忆 */
+  recallInjectEnabled: Schema.boolean().default(false),
+  /** 最多注入几条 */
+  recallInjectMaxItems: Schema.number().default(2),
+  /** 低于该相关度不注入（0–1） */
+  recallInjectMinScore: Schema.number().default(0.5),
+  /** 单条截断字符数 */
+  recallInjectMaxCharsPerItem: Schema.number().default(80),
 });
 
 /** 系统提示段落名（全局唯一，避免与宿主段落冲突）。 */
 const PROMPT_SECTION = 'lrc:memory-capture';
 
 /**
- * 让宿主 LLM 顺手做提炼。
+ * 构建系统提示段落。
  *
- * 为什么放在系统提示而不是再起一次 LLM 调用：宿主本来就要生成回答，
- * 顺手多写 1~3 句结论是零额外成本；单独调用一次模型既慢又费钱。
+ * 让宿主 LLM 顺手做提炼：为什么放在系统提示而不是再起一次 LLM 调用 ——
+ * 宿主本来就要生成回答，顺手多写 1~3 句结论是零额外成本；单独调用一次
+ * 模型既慢又费钱。为什么要求"每次都输出"：实测把标签写成可选项时，
+ * 模型十来轮一次都没照做，这一层等于不存在。改成强制契约后，触发率可观测，
+ * 也能用 `无新增` 明确表达空。
  *
- * 为什么要求"每次都输出"：实测把标签写成可选项时，模型十来轮一次都没照做，
- * 这一层等于不存在。改成强制契约后，触发率可观测，也能用 `无新增` 明确表达空。
+ * # 为什么按配置分两版
+ *
+ * 开启主动注入后，`[LRC 相关记忆]` 已经出现在上下文里。此时若仍写
+ * 「先调 `lrc_recall` 工具」，模型会面对**两套相互竞争的指令**：
+ * 一边已经拿到记忆，一边被要求再去调工具查一遍。实测这类矛盾提示会
+ * 让模型两头都不做（既不调工具，也不信任注入内容）。
+ *
+ * 所以注入开启时，提示改成「记忆已给你，不足才查」，让两条路径互补而非冲突。
  */
-const PROMPT_TEXT = [
-  '## 长期记忆（LRC）',
-  '',
-  '涉及项目历史、用户偏好、之前做过的决定、上次怎么改的，**先调 `lrc_recall` 工具**，',
-  '不要直接 Grep 或翻文件。检索为空时才回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。',
-  '',
-  '发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），',
-  '不要让它继续污染后续对话。',
-  '',
-  '## 长期记忆沉淀（必须遵守）',
-  '',
-  '每次回答的最后一行，必须输出一个 <lrc_memory> 块，格式固定：',
-  '',
-  '<lrc_memory>',
-  '- 决策：…',
-  '- 约束：…',
-  '- 结论：…',
-  '</lrc_memory>',
-  '',
-  '规则：',
-  '- 只写本轮产生的决策、约束、最终结论；没有的条目直接省略。',
-  '- 本轮没有任何值得长期保留的内容时，输出 <lrc_memory>无新增</lrc_memory>。',
-  '- 只写结论，不写过程、待办清单、选项罗列或代码。',
-  '- 标签必须出现在回答的最末尾，且每轮只出现一次。',
-].join('\n');
+function buildPromptText(recallInjected: boolean): string {
+  const recallRule = recallInjected
+    ? [
+        '上下文里可能已出现 `[LRC 相关记忆]` 段落，那是插件按当前话题**自动检索**的结果，',
+        '直接当事实使用，不需要再调 `lrc_recall` 确认。',
+        '只有当该段落缺失、或明显不足以回答（例如需要更早的细节）时，才调 `lrc_recall` 补充检索；',
+        '检索为空时回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。',
+      ]
+    : [
+        '涉及项目历史、用户偏好、之前做过的决定、上次怎么改的，**先调 `lrc_recall` 工具**，',
+        '不要直接 Grep 或翻文件。检索为空时才回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。',
+      ];
+
+  return [
+    '## 长期记忆（LRC）',
+    '',
+    ...recallRule,
+    '',
+    '发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），',
+    '不要让它继续污染后续对话。',
+    '',
+    '## 长期记忆沉淀（必须遵守）',
+    '',
+    '每次回答的最后一行，必须输出一个 <lrc_memory> 块，格式固定：',
+    '',
+    '<lrc_memory>',
+    '- 决策：…',
+    '- 约束：…',
+    '- 结论：…',
+    '</lrc_memory>',
+    '',
+    '规则：',
+    '- 只写本轮产生的决策、约束、最终结论；没有的条目直接省略。',
+    '- 本轮没有任何值得长期保留的内容时，输出 <lrc_memory>无新增</lrc_memory>。',
+    '- 只写结论，不写过程、待办清单、选项罗列或代码。',
+    '- 标签必须出现在回答的最末尾，且每轮只出现一次。',
+  ].join('\n');
+}
 
 export function apply(ctx: Context, config: Config): void {
   const cacheDir = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'cache', 'lrc-plugin');
@@ -311,6 +357,40 @@ export function apply(ctx: Context, config: Config): void {
   /** 能力矩阵是否已探测（首次 pre-step 探测一次）。 */
   let probed = false;
   /**
+   * 主动召回注入的当前状态。
+   *
+   * 为什么要"按话题指纹"而不是每轮查：
+   * 宿主按前缀复用 KV 缓存（实测基线命中率 92.2% / P50 96.6%）。
+   * 每轮注入不同文本会把命中率打下来，所以同一话题内**保持文本完全不变**，
+   * 只在该话题首次进入时更新一次。
+   */
+  let recallText = '';
+  let recallFingerprint = '';
+  /**
+   * 召回注入的并发代次。
+   *
+   * 每发起一次召回就递增；结果回来时若代次已变，说明有更新的一次在飞，
+   * 本次结果直接丢弃。没有这道闸门时，用户连发两条不同话题的消息，
+   * 先发的慢查询会覆盖后发的结果 —— 注入内容与当前问题无关，
+   * 且会一直错到下次换话题。
+   */
+  let recallGeneration = 0;
+  /** 注入文本累计改写次数（缓存代价的唯一实测口径，`lrc_status` 展示）。 */
+  let recallRewrites = 0;
+  /**
+   * 规范化后的注入参数（**只算一次**）。
+   *
+   * 不能直接用 `config.recallInjectMaxItems` 等字段：宿主传的裸配置可能缺字段，
+   * `undefined` 会让「最多 N 条」变成「全部」、让相关度过滤恒为 false。
+   * 详见 `normalizeRecallOptions` 注释。
+   */
+  const recallOptions = normalizeRecallOptions({
+    maxItems: config.recallInjectMaxItems,
+    maxCharsPerItem: config.recallInjectMaxCharsPerItem,
+    maxTotalChars: 240,
+    minScore: config.recallInjectMinScore,
+  });
+  /**
    * `<lrc_memory>` 命中统计：**按轮计，不按消息计**。
    *
    * 按消息计时，工具密集型轮次里的中间说明（"我先看下文件"）会被算成失败，
@@ -338,6 +418,14 @@ export function apply(ctx: Context, config: Config): void {
   /** 最近一次 pre-step 的 agent：`lrc_handoff` 工具需要它拿当前会话。 */
   let lastAgent: unknown;
 
+  /**
+   * 注入开关的单一判定点。
+   *
+   * 配置可能来自裸对象（缺字段），必须走 `=== true` 而不是真值判断：
+   * 宿主若传字符串 `"false"`，真值判断会把它当成开启 —— 用户明明关了却还在注入。
+   */
+  const recallInjectOn = config.recallInjectEnabled === true;
+
   // 注册系统提示段落：让模型在回答末尾输出 <lrc_memory>。
   //
   // 用 `ctx.get()` 而不是 `inject`：systemPrompt 是可选依赖 ——
@@ -350,7 +438,7 @@ export function apply(ctx: Context, config: Config): void {
     | undefined;
   if (typeof systemPrompt?.section === 'function') {
     try {
-      systemPrompt.section({ name: PROMPT_SECTION, order: 9000, text: PROMPT_TEXT });
+      systemPrompt.section({ name: PROMPT_SECTION, order: 9000, text: buildPromptText(recallInjectOn) });
     // 快照回填：把最近一次沉淀的状态注入下一轮上下文。
     // 这是闭环的"读"路径 —— 之前 buildSnapshot() 只作为工具返回值渲染，
     // 下一轮上下文里根本看不到 `[LRC 状态]`。
@@ -363,14 +451,28 @@ export function apply(ctx: Context, config: Config): void {
       // 因此快照位于历史之后、不打断前缀；order 只决定块内顺序。
       order: 9999,
       text: () => {
-        // 诊断：确认快照到底有没有被渲染层取走。
+        // 两段内容拼在一起，共用同一个注入点（避免多开一个 context 段，
+        // 那会让宿主多 append 一条 user 消息，反而更伤缓存）：
+        //   · recallText：本轮话题相关的历史（按话题指纹更新）
+        //   · latestSnapshot：上一轮沉淀的状态（低频变化）
+        const merged =
+          recallText.length === 0
+            ? latestSnapshot
+            : latestSnapshot.length === 0
+              ? recallText
+              : `${recallText}\n\n${latestSnapshot}`;
+
+        // 诊断：确认注入到底有没有被渲染层取走。
         // `systemPrompt.context` 是**动态 user-role 快照**，不进 system prompt，
         // 所以查 `request/header.system` 永远看不到它 —— 这条日志才是判据。
-        if (latestSnapshot.length > 0 && !snapshotServed) {
+        if (merged.length > 0 && !snapshotServed) {
           snapshotServed = true;
-          ctx.logger.info(`[lrc] 快照已注入上下文（${latestSnapshot.length} 字符）`);
+          ctx.logger.info(
+            `[lrc] 已注入上下文（${merged.length} 字符` +
+              `${recallText.length > 0 ? `，含召回 ${recallText.length}` : ''}）`,
+          );
         }
-        return latestSnapshot;
+        return merged;
       },
     });
     } catch (error) {
@@ -503,6 +605,84 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.warn(`[lrc][tool] 连接失效，已标记重连：${message}`);
     }
     return message;
+  }
+
+  /**
+   * 刷新「相关记忆」注入。
+   *
+   * # 为什么要有这一层
+   *
+   * 实测（379 步真实会话）模型**从未想起**调用 `lrc_recall` ——
+   * 系统提示写了"涉及历史先调 lrc_recall"，工具也注册了，但它的注意力
+   * 全在当前任务上，记忆检索没进候选集。这不是"规则不够硬"，是
+   * **决策点本身就该被消除**：由插件把记忆推进去。
+   *
+   * # 三道防护（缺一不可）
+   *
+   * 1. **话题指纹去重**：同一话题的多轮追问（"先做A"→"A好了"→"继续"）
+   *    指纹相同 ⇒ 完全不重算、不改文本 ⇒ 缓存不受影响。
+   * 2. **失败不清空**：查询失败时保留上一次的 recallText。
+   *    清空会让文本变化（反而伤缓存），且丢了本来有效的信息。
+   * 3. **无结果不注入**：返回空串时保持 recallText=''，
+   *    此时注入文本一个字符都不变，等同"没开这个功能"。
+   */
+  async function refreshRecallInjection(rawQuery: unknown): Promise<void> {
+    // maxItems=0 是「显式不要注入」：连检索都不该发，省一次 HTTP 往返
+    if (!recallInjectOn || recallOptions.maxItems <= 0) return;
+
+    const query = textBlocksOnly(rawQuery).trim();
+    if (query.length === 0) return;
+
+    // 传 previous：让"继续/然后呢"这类续接短句沿用上一指纹，不打断缓存
+    const fingerprint = topicFingerprint(query, recallFingerprint);
+    if (fingerprint.length === 0) return;
+    // 同一话题：完全不动作（这是缓存友好的核心）
+    if (fingerprint === recallFingerprint) return;
+
+    // 并发闸门：用户连发两条不同话题时，两次 recall 会同时在飞。
+    // 若不加代次校验，先发的慢查询可能后回来，把新话题的注入**覆盖成旧话题**
+    // ——模型于是拿到与当前问题无关的记忆，且这个错误会持续到下次换话题。
+    const generation = recallGeneration + 1;
+    recallGeneration = generation;
+
+    const acquired = await acquireClient();
+    if ('reason' in acquired) {
+      // 拿不到连接：保留旧文本，等下次用户发言再试
+      return;
+    }
+
+    try {
+      // 截断 query：enrich 不需要长文本，过长反而稀释语义
+      const result = await acquired.client.recall(query.slice(0, 200), {
+        topK: Math.max(recallOptions.maxItems * 3, 3),
+      });
+      // 已被更新的一次调用取代：直接丢弃本次结果（连指纹也不写）
+      if (generation !== recallGeneration) return;
+
+      const next = formatRecallInjection(result.memories, recallOptions);
+
+      recallFingerprint = fingerprint;
+      if (next === recallText) return;
+
+      recallText = next;
+      // 计数：注入文本每变一次，宿主的前缀缓存就断一次。
+      // 这是评估"注入代价"的唯一实测口径，必须可观测。
+      recallRewrites += 1;
+      ctx.logger.info(
+        next.length === 0
+          ? `[lrc] 本轮无相关记忆，不注入（指纹 ${fingerprint}）`
+          : `[lrc] 注入 ${result.memories.length} 条候选中的 ${recallOptions.maxItems} 条` +
+              `（${next.length} 字符，指纹 ${fingerprint}，累计改写 ${recallRewrites} 次）`,
+      );
+    } catch (error) {
+      // 保留旧值：失败不应让上下文抖动
+      const message = error instanceof Error ? error.message : String(error);
+      if (isConnectionError(error)) {
+        connection.invalidate(message);
+        offloader.bind(null);
+      }
+      ctx.logger.warn(`[lrc] 召回注入失败（保留上次内容）：${message}`);
+    }
   }
 
   /**
@@ -680,6 +860,19 @@ export function apply(ctx: Context, config: Config): void {
     // turn 结束：长任务的最终报告只在这里出现一次，必须兜底收走
     if (type === 'turn/end') {
       void finishTurn(session);
+      return;
+    }
+
+    // 用户发言：刷新「相关记忆」注入（主动推，不依赖模型想起调 lrc_recall）
+    //
+    // 为什么挂在这里而不是 turn/start：turn/start 时本轮用户消息还没进 log，
+    // 拿不到 query。用户消息事件是**最早能拿到 query 的时刻**，
+    // 且此时尚未到下一次 LLM 请求，改 recallText 还来得及生效。
+    //
+    // 必须用 `userMessageText`：`messageContent` 只认 assistant 消息，
+    // 对用户消息恒返回 undefined（曾因此让本功能从未触发过）。
+    if (type === 'user/message' && isRealUserMessage(event)) {
+      void refreshRecallInjection(userMessageText(event));
       return;
     }
 
@@ -1391,6 +1584,27 @@ export function apply(ctx: Context, config: Config): void {
             ? `已存在（${latestSnapshot.length} 字符）${snapshotServed ? '，已被渲染层取走' : '，尚未被取走'}`
             : '为空（还没有成功沉淀过）',
         );
+        lines.push('');
+
+        lines.push('## 主动召回注入');
+        if (!recallInjectOn) {
+          lines.push('已关闭（recallInjectEnabled=false）');
+        } else {
+          lines.push(
+            recallText.length > 0
+              ? `已注入 ${recallText.length} 字符｜指纹 ${recallFingerprint}`
+              : `本轮无匹配，未注入｜指纹 ${recallFingerprint || '(空)'}`,
+          );
+          lines.push(
+            `配置：最多 ${recallOptions.maxItems} 条｜阈值 ${recallOptions.minScore}` +
+              `｜单条 ${recallOptions.maxCharsPerItem} 字符｜总长 ${recallOptions.maxTotalChars}`,
+          );
+          lines.push(`累计改写 ${recallRewrites} 次（每次改写会打断一次前缀缓存）`);
+          if (recallText.length > 0) {
+            lines.push('内容：');
+            for (const line of recallText.split('\n')) lines.push(`  ${line}`);
+          }
+        }
 
         return { text: lines.join('\n') };
       },

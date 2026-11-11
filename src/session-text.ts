@@ -124,6 +124,25 @@ export function hasContentBlocks(event: unknown): boolean {
 }
 
 /**
+ * 取用户消息的正文文本（`user/message` 的 `data.content`）。
+ *
+ * # 为什么必须单独有这个函数
+ *
+ * `messageContent()` 只认 `assistant/message`（它读 `data.message.content`），
+ * 对用户消息**恒返回 `undefined`**。曾经在 `session/event` 里用
+ * `refreshRecallInjection(messageContent(event))` 取 query，结果
+ * `textBlocksOnly(undefined)` 恒为空串 ⇒ 召回注入**一次都不可能触发**，
+ * 而且不报错、日志也看不出问题。用户消息的内容在 `data.content`，不是
+ * `data.message.content` —— 这两个形状的差异必须由本模块统一吸收，
+ * 不能让调用方各自拼接。口径与 `linesFromSession` 完全一致。
+ */
+export function userMessageText(event: unknown): string {
+  const candidate = event as { type?: string; data?: { content?: unknown } };
+  if (candidate?.type !== 'user/message') return '';
+  return textBlocksOnly(candidate.data?.content);
+}
+
+/**
  * 是否是用户真正说的话。
  *
  * DSH 的 `user/message` 事件里 `data.source.kind` 有多种取值：
