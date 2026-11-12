@@ -41,8 +41,18 @@ import {
   textBlocksOnly,
   userMessageText,
 } from './session-text.ts';
-import { conclusionsFromReasoning, constraintsFromProse, extractMemoryTag, isNoUpdate } from './memory-filter.ts';
 import {
+  conclusionsFromReasoning,
+  constraintsFromProse,
+  constraintsFromUser,
+  extractMemoryTag,
+  isNoUpdate,
+} from './memory-filter.ts';
+import {
+  DEFAULT_KEEP_RECENT,
+  DEFAULT_MAX_NODES_PER_RUN,
+  normalizeCount,
+  normalizeMaxNodes,
   pruneReasoning,
   pruneToolCallArguments,
   pruneToolResults,
@@ -292,18 +302,18 @@ export function apply(ctx: Context, config: Config): void {
   const budgetRecheckSteps = recheckInterval(config.budgetRecheckSteps);
 
   /**
-   * 正整数配置归一化（带兜底默认值）。
+   * 单次裁剪节点数上限（统一走 `normalizeMaxNodes`）。
    *
-   * 与 `recheckInterval` 同一类防护：宿主 patch 里**不会**包含新字段，
-   * 传进来就是 `undefined`。而 `undefined` 参与算术会静默变形 ——
-   * 实测 `trimMaxNodesPerRun` 缺失时单次裁 132 个（旧行为），
-   * 传 `'40'` 时限制完全失效（裁 139），传 `40.5` 时完全裁不动（null）。
+   * ## 为什么必须与 `selectTrimRange` 用同一个函数
+   *
+   * 上一版在这里写 `normalizeCount(config.trimMaxNodesPerRun, 40, 1)`，
+   * 而 `selectTrimRange` 用 `normalizeMaxNodes` —— 同一个配置在 `0.3` 上
+   * 分别得到 40 和 1。e2e 断言的是后者，真实装配走的是前者 ⇒ 测试没验证真实路径。
+   *
+   * 现在只有一份语义（见 `normalizeMaxNodes`），两处结果必然一致。
+   * 配置缺省（`undefined`）时取默认上限，**不再退化成「不限制」**。
    */
-  function positiveInt(value: unknown, fallback: number): number {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
-    return Math.floor(value);
-  }
-  const trimMaxNodesPerRun = positiveInt(config.trimMaxNodesPerRun, 40);
+  const trimMaxNodesPerRun = normalizeMaxNodes(config.trimMaxNodesPerRun) ?? DEFAULT_MAX_NODES_PER_RUN;
 
   /**
    * 从磁盘恢复上次的快照。
@@ -501,14 +511,48 @@ export function apply(ctx: Context, config: Config): void {
    */
   let proseTurns = 0;
   /**
-   * 未连接时暂存的正文档约束（上限 30）。
+   * 未连接时暂存的正文约束（上限 30），**按归属会话分桶**。
    *
-   * 为什么需要：`assistant/message` 事件**不会被回放**。LRC 桌面端比 DSH
-   * 晚起 20 分钟是已发生过的真实事故，那段时间里抽到的约束若直接丢弃，
-   * 就永久消失了（`flush()` 为此保留了 pending 计数，prose 路径同理）。
+   * ## 为什么必须按会话分桶
+   *
+   * `assistant/message` 事件**不会被回放**。LRC 桌面端比 DSH 晚起 20 分钟
+   * 是已发生过的真实事故，那段时间里抽到的约束若直接丢弃就永久消失了。
+   *
+   * 但也不能像上一版那样在切会话时整体清空 —— 那等于「离线期间攒的 20 条
+   * 约束，用户一切会话就全丢」，与「绝不丢」的目标直接冲突。
+   * 分桶后：A 会话的残留仍标着 A，补写时按原归属落库；
+   * 桶总量仍受 `PROSE_BACKLOG_MAX` 约束（按最旧淘汰）。
    */
-  let proseBacklog: DistilledItem[] = [];
+  const proseBacklog = new Map<string, DistilledItem[]>();
   const PROSE_BACKLOG_MAX = 30;
+
+  /** 当前 backlog 总条数。 */
+  function proseBacklogSize(): number {
+    let total = 0;
+    for (const list of proseBacklog.values()) total += list.length;
+    return total;
+  }
+
+  /**
+   * 往 backlog 追加一批条目（带全局上限）。
+   *
+   * @param owner - 归属会话 ID（空串表示「未知归属」，补写时按当前会话处理）
+   * @param items - 条目
+   */
+  function pushProseBacklog(owner: string, items: DistilledItem[]): void {
+    const list = proseBacklog.get(owner) ?? [];
+    list.push(...items);
+    proseBacklog.set(owner, list);
+    // 超限从**最旧的那个桶**开始丢（Map 保留插入顺序）
+    while (proseBacklogSize() > PROSE_BACKLOG_MAX) {
+      const first = proseBacklog.keys().next();
+      if (first.done === true) break;
+      const head = proseBacklog.get(first.value) ?? [];
+      const over = proseBacklogSize() - PROSE_BACKLOG_MAX;
+      if (head.length <= over) proseBacklog.delete(first.value);
+      else proseBacklog.set(first.value, head.slice(over));
+    }
+  }
   /**
    * 快照写入代次（防乱序覆盖）。
    *
@@ -617,7 +661,8 @@ export function apply(ctx: Context, config: Config): void {
     // 快照候选池同样是会话级状态：换会话后不能继续用上一场的约束拼快照，
     // 与 `latestSnapshot` 归属判定同源（`bindSnapshotToSession` 的目的）。
     offloader.resetSnapshotPool();
-    proseBacklog = [];
+    // **proseBacklog 不清**：它按会话分桶，切会话后仍按原归属补写。
+    // 上一版在这里整体清空，等于「离线期间攒的约束，用户一切会话就全丢」。
     snapshotGeneration += 1;
 
     // 归属不符：磁盘里那份是别人的，不能带进本会话
@@ -752,6 +797,126 @@ export function apply(ctx: Context, config: Config): void {
   /** 连接就绪后把 client 注入 Offloader（保留其全部计数器与游标）。 */
   function attachOffloader(client: LrcClient): void {
     offloader?.bind(client);
+    // **每次连接就绪都要回灌**，不只是启动时。
+    //
+    // `assistant/message` 不会被回放，未连接期间抽到的约束错过就永久丢。
+    // 原来这段写在启动 IIFE 里、且在 `if (client === null) return` 之后 ——
+    // 而它要解决的正是「启动时连不上」的场景，于是永远走不到（死代码）。
+    // 实测：LRC 晚起 → 收到约束 → 重连成功 → 旧约束从未被补写。
+    drainProseBacklog();
+  }
+
+  /**
+   * 把未连接期间暂存的正文约束补写出去（**按归属会话逐桶处理**）。
+   *
+   * 由 `attachOffloader`（连接就绪路径）调用 —— 每次重连都会触发，
+   * 因此不依赖「启动那一刻就连上」这个不成立的前提。
+   *
+   * ## 为什么不能整体取出再一次性写
+   *
+   * 各桶的归属会话不同。合并成一批会把 A 的约束写成 B 的归属
+   * （`saveSnapshot` 的归属就是错的）。而整体清空再失败回滚，
+   * 又会把 B 的条目塞进 A 的桶 —— 所以逐桶独立处理。
+   */
+  function drainProseBacklog(): void {
+    for (const [owner, list] of [...proseBacklog.entries()]) {
+      if (list.length === 0) continue;
+      proseBacklog.delete(owner);
+      const pending = list;
+      // 归属为空表示「离线时还不知道是哪个会话」，退化为当前会话
+      const ownerSessionId = owner.length > 0 ? owner : currentSessionId;
+      void offloader
+        // **intoPool: false** —— 补写的是**旧会话**的 backlog，此时池子
+        // 已属于当前会话。若照常入池，当前会话下一次注入会变成
+        // 「B 的约束；A 会话私有：不要用 IDM」（实测已复现）。
+        // 记忆仍写进 LRC，只是不参与当前会话的快照。
+        .offloadItems(pending, { intoPool: owner === currentSessionId })
+        .then((result) => {
+          if (result.distilled > 0) {
+            // 空归属不落盘：写出去只会变成「无归属快照」，下次启动必被丢弃
+            if (result.snapshot.length > 0 && ownerSessionId.length > 0) {
+              saveSnapshot(result.snapshot, ownerSessionId);
+            }
+            ctx.logger.info(
+              `[lrc] 补写未连接期间的 ${result.distilled} 条约束/决策（写入 ${result.written}）`,
+            );
+          }
+        })
+        .catch((error: unknown) => {
+          // **只有连接类错误才回队重试**。
+          //
+          // 上一版不区分错误类型：LRC 明确拒绝（业务错误，如字段校验失败）
+          // 也会回队，于是每次重连都重发同一批、每次都失败 —— 死循环，
+          // 而且日志看起来像「一直在努力补写」。
+          //
+          // 连接类错误（超时 / 断连）才可能下次成功。注意：若 migrate 实际
+          // 已落库但响应超时，回队重试会产生一次重复入库 —— LRC 侧有合并
+          // 阈值会吃掉，且 `written/merged` 统计会略偏高。这是「宁重不漏」
+          // 的已知代价，不再回滚本地 recent 掩盖它。
+          if (isConnectionError(error)) {
+            pushProseBacklog(owner, pending);
+            ctx.logger.warn(
+              `[lrc] 补写暂存约束失败（已放回队列重试）：${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return;
+          }
+          ctx.logger.warn(
+            `[lrc] 补写暂存约束被 LRC 拒绝，已丢弃 ${pending.length} 条（不重试）：${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+    }
+  }
+
+  /**
+   * 把一批抽取到的条目送进 LRC，并更新快照。
+   *
+   * 正文路径与用户纠正路径共用：两条来源不同，但「未连接先暂存、
+   * 代次闸门防乱序、失败只告警」这套处理完全一样，分开写必然漂移。
+   *
+   * @param items - 已分类条目
+   * @param ownerSessionId - 归属会话（**同步阶段捕获**，不能等 `.then` 再读）
+   * @param label - 日志用来源名（「正文抽取」/「用户纠正」）
+   */
+  function offloadExtracted(
+    items: DistilledItem[],
+    ownerSessionId: string,
+    label: string,
+  ): void {
+    // **未连接时不直接丢**：这类事件不会被回放，而 LRC 桌面端比 DSH
+    // 晚起 20 分钟是已发生过的真实事故。那段时间里若直接 catch 掉，
+    // 这批约束就永久丢了。
+    if (!offloader.connected) {
+      pushProseBacklog(ownerSessionId, items);
+      void connection.get();
+      return;
+    }
+
+    proseTurns += 1;
+    // 代次闸门：多次 HTTP 往返可能乱序（migrate 超时 20s），
+    // 晚完成的那条会用更早的内容覆盖快照 —— 症状是注入内容「倒退」。
+    const gen = ++snapshotGeneration;
+    void offloader
+      .offloadItems(items)
+      .then((result) => {
+        if (gen !== snapshotGeneration) return; // 有更新的一次在飞，丢弃
+        if (result.distilled > 0) {
+          if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+            saveSnapshot(result.snapshot, ownerSessionId);
+          }
+          ctx.logger.info(`[lrc] ${label} ${result.distilled} 条约束/决策（写入 ${result.written}）`);
+        }
+      })
+      .catch((error: unknown) => {
+        ctx.logger.warn(
+          `[lrc] ${label}沉淀失败（不影响对话）：${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
   }
 
   // 预热：不阻塞插件加载，失败只记一次日志；之后由工具调用按需重试
@@ -768,27 +933,7 @@ export function apply(ctx: Context, config: Config): void {
     ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
     // 快照与写入解耦：上次进程没来得及沉淀时，从 LRC 索引重建
     void bootstrapSnapshot();
-    // 回灌「未连接期间」暂存的正文约束。
-    // `assistant/message` 不会被回放，错过就永久丢（见 proseBacklog）。
-    if (proseBacklog.length > 0) {
-      const pending = proseBacklog;
-      proseBacklog = [];
-      void offloader
-        .offloadItems(pending)
-        .then((result) => {
-          if (result.distilled > 0) {
-            if (result.snapshot.length > 0) saveSnapshot(result.snapshot, currentSessionId);
-            ctx.logger.info(
-              `[lrc] 补写未连接期间的 ${result.distilled} 条约束/决策（写入 ${result.written}）`,
-            );
-          }
-        })
-        .catch((error: unknown) => {
-          ctx.logger.warn(
-            `[lrc] 补写暂存约束失败：${error instanceof Error ? error.message : String(error)}`,
-          );
-        });
-    }
+    drainProseBacklog();
   })();
 
   /**
@@ -1154,7 +1299,20 @@ export function apply(ctx: Context, config: Config): void {
     // 必须用 `userMessageText`：`messageContent` 只认 assistant 消息，
     // 对用户消息恒返回 undefined（曾因此让本功能从未触发过）。
     if (type === 'user/message' && isRealUserMessage(event)) {
-      void refreshRecallInjection(userMessageText(event));
+      const userText = userMessageText(event);
+      void refreshRecallInjection(userText);
+
+      // ★用户**纠正/重申**的约束必须入库。
+      //
+      // `linesFromSession` 的门槛是 `hasConstraintMarker`（必须/不要/禁止），
+      // 而真实会话里最关键的约束常用反问句表达：
+      // 「不是告诉你音频在的位置了吗？你一点击下载就会调起 IDM…」
+      // 这条既没有命令式词，模型也从未在正文复述 ⇒ 三重落空，
+      // 约束从未入库，下一轮照旧去点下载链接。
+      const corrections = constraintsFromUser(userText);
+      if (corrections.length > 0) {
+        offloadExtracted(itemsFromTag(corrections.join('\n')), sessionId, '用户纠正');
+      }
       return;
     }
 
@@ -1189,45 +1347,7 @@ export function apply(ctx: Context, config: Config): void {
         // migrate 两次 HTTP），期间用户可能已切到别的会话。若那时才读
         // `currentSessionId`，会把 A 的约束写成 B 的归属 —— 正是上一轮
         // 在 `flush()` 里修过的同一个坑，不能在新路径上重犯。
-        const proseSessionId = sessionId;
-        const items = itemsFromTag(prose.join('\n'));
-
-        // **未连接时不直接丢**：`assistant/message` 事件不会被回放，
-        // 而 LRC 桌面端比 DSH 晚起 20 分钟是已发生过的真实事故。
-        // 那 20 分钟里若直接 catch 掉，这批约束就永久丢了。
-        if (!offloader.connected) {
-          proseBacklog.push(...items);
-          if (proseBacklog.length > PROSE_BACKLOG_MAX) {
-            proseBacklog = proseBacklog.slice(-PROSE_BACKLOG_MAX);
-          }
-          void connection.get();
-          return;
-        }
-
-        proseTurns += 1;
-        // 代次闸门：多条 prose 的 HTTP 往返可能乱序（migrate 超时 20s），
-        // 晚完成的那条会用更早的内容覆盖快照 —— 症状是注入内容「倒退」。
-        const gen = ++snapshotGeneration;
-        void offloader
-          .offloadItems(items)
-          .then((result) => {
-            if (gen !== snapshotGeneration) return; // 有更新的一次在飞，丢弃
-            if (result.distilled > 0) {
-              if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-                saveSnapshot(result.snapshot, proseSessionId);
-              }
-              ctx.logger.info(
-                `[lrc] 正文抽取 ${result.distilled} 条约束/决策（写入 ${result.written}）`,
-              );
-            }
-          })
-          .catch((error: unknown) => {
-            ctx.logger.warn(
-              `[lrc] 正文抽取沉淀失败（不影响对话）：${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-          });
+        offloadExtracted(itemsFromTag(prose.join('\n')), sessionId, '正文抽取');
       }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       // 只有「声明了 text/reasoning 块但 text 不是字符串」才是结构异常。
@@ -1419,8 +1539,17 @@ export function apply(ctx: Context, config: Config): void {
               keepRecentNodes: config.keepRecentNodes,
               maxSummaryChars: config.trimMaxSummaryChars,
               force,
-              // 用归一化后的值：宿主 patch 通常不含该字段，直接用会退化为旧行为
-              maxNodesPerRun: force ? trimMaxNodesPerRun : undefined,
+              // **两条路径都必须限流，不只 force**。
+              //
+              // 事故形态（141 节点裁 131 / 137 裁 127）在真实日志里正是
+              // 「节点数 >120 ⇒ force」触发的，所以上一版只给 force 加限制，
+              // 看起来修好了。但 token 触发路径（窗口 300K~800K 时
+              // trimMin 降到 8 万，节点数 114 就触发）传的是 `undefined`
+              // ⇒ 一次裁 104（91%），**同一事故原样复发**。
+              //
+              // 节点数硬上限只是个「兜底触发器」；真正决定「一次裁多少」的
+              // 是这里。所以两条路径统一用一个上限：见 `trimMaxNodesPerRun`。
+              maxNodesPerRun: trimMaxNodesPerRun,
             },
             log: (message) => ctx.logger.info(message),
           });

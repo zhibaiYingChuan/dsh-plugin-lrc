@@ -571,23 +571,184 @@ check('force 跳过 token 阈值', forced.ok === true && forced.reason === 'ok',
   check('不限制时裁得更多', unlimitedCount > limitedCount, { limitedCount, unlimitedCount });
   check('渐进裁剪不是一次砍光', limitedCount < unlimitedCount, { limitedCount, unlimitedCount });
 
-  // ★独立审查发现：`maxNodesPerRun` 非正整数时三种失效形态
-  // （'40' → 限制失效裁 139；40.5 → 返回 null 完全裁不动；NaN → 限制失效）
-  const badCases: Array<[string, unknown]> = [
+  // ★第三次独立审查：上一版把 `'40'` 断言成「视为不限制」，等于把事故根因
+  // （限制失效 ⇒ 一次裁 92%）固化成回归锁。**非法值必须退化到安全侧（40）**。
+  // 这里的 6 节点夹具只有 4 个可裁节点，limit=40 天然不生效 ——
+  // 真正的判据在 §1b 的真实 145 节点 surface 上。
+  // 字符串是宿主 patch 的真实形态，必须转数后生效
+  const strLimited = selectTrimRange(nodes, events, 2, '3' as unknown as number);
+  check('字符串 "3" 被转数并生效', strLimited !== null && strLimited.endIdx - strLimited.startIdx + 1 <= 3, strLimited);
+  // 小数应向下取整，而不是参与非法算术
+  const frac = selectTrimRange(nodes, events, 2, 3.7);
+  check('小数 3.7 向下取整为 3', frac !== null && frac.endIdx - frac.startIdx + 1 <= 3, frac);
+}
+
+// ────────────────────────────────────────────────────────────
+// 1b) 真实 surface 回归锁（session-e1419190，145 节点）
+//
+// ★第二次独立审查的核心批评：上一版用 6 节点玩具 fixture 验证渐进裁剪，
+// 而「遇到不可替换就 break」的旧实现在小 surface 上也能得同样结果 ——
+// 断言无法区分对错。这里用**按 session-e1419190 真实节点构成拼装的 fixture**
+// （145 节点，20 step/start、23 tool/call、22 tool/result、19 step/end、
+//  16 assistant+1toolcall、3 个 assistant+2toolcall、2 compact-checkpoint、
+//  15 job/registered、15 job/settled 等 —— 构成比例取自解码日志）。
+//
+// **注意诚实边界**：这是「同量级的真实构成」，不是逐事件原样拷贝
+// （真实 145 节点时刻只有一个 compact-checkpoint，此处为覆盖多摘要场景放了 2 个）。
+// 判据体现在三处：不限制应砍掉绝大部分、limit=40 必须落在 [30,40]、
+// 端点必须工具配对平衡。用 HEAD 旧算法在同一 fixture 上跑 limit=40 得「裁 1」，
+// 即断言能真正区分对错。
+//
+// 结构编码：
+//   C=compact-checkpoint  S=skill-catalog  R=runtime-context  U=user
+//   A=assistant(1 tool-call)  A2=assistant(≥2 并行 tool-call)  A0=assistant(纯文本)
+//   c=tool/call  r=tool/result  s=step/start  e=step/end
+//   j=job/registered  J=job/settled  B=compaction/start  E=compaction/end
+//   M=compaction/summary  H=request/header
+// ────────────────────────────────────────────────────────────
+console.log('=== 1b) 真实 surface 回归锁（145 节点） ===');
+{
+  const encoded = [
+    'C,E,s,S,H,A,c,j,J,r,e,s,A,c,j,J,r,e,s,A',
+    'c,j,J,r,e,s,A,c,j,J,r,e,s,A,c,r,e,s,A,c',
+    'j,J,r,e,s,A,c,r,e,s,A,c,j,J,r,e,s,A,c,j',
+    'J,r,e,s,A,c,j,J,r,e,B,M,C,E,s,R,S,H,A2,c',
+    'r,c,j,J,r,e,s,A,c,r,e,J,s,A,c,r,e,s,A,c',
+    'j,J,r,e,s,A2,c,c,r,r,e,s,A2,c,r,c,j,J,r,e',
+    's,A,c,j,J,r,e,s,A,c,j,J,r,e,s,A,c,j,J,r',
+    'e,s,A,c,j',
+  ].join(',').split(',');
+
+  // 编码 → 逼真的宿主事件形状（字段必须让 classifyEvent / toolDelta 认得出）
+  const realEvents: unknown[] = encoded.map((code): unknown => {
+    switch (code) {
+      case 'C':
+        return {
+          type: 'user/message',
+          data: { source: { kind: 'compact-checkpoint' }, content: [{ type: 'text', text: 'summary' }] },
+        };
+      case 'S':
+      case 'R':
+        return {
+          type: 'user/message',
+          data: {
+            source: { kind: code === 'S' ? 'skill-catalog' : 'runtime-context' },
+            content: [{ type: 'text', text: 'ctx' }],
+          },
+        };
+      case 'U':
+        return { type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } };
+      case 'A':
+        return {
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'reasoning', text: 'r' }, { type: 'tool-call' }] } },
+        };
+      case 'A2':
+        return {
+          type: 'assistant/message',
+          data: {
+            message: {
+              content: [
+                { type: 'reasoning', text: 'r' },
+                { type: 'tool-call' },
+                { type: 'tool-call' },
+              ],
+            },
+          },
+        };
+      case 'A0':
+        return { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'x' }] } } };
+      case 'r':
+        return { type: 'tool/result', data: { content: [{ type: 'text', text: 'out' }] } };
+      default:
+        // c/s/e/j/J/B/E/M/H 都是「非对话、不参与 tool 平衡」的节点
+        return { type: code === 'c' ? 'tool/call' : 'other', data: {} };
+    }
+  });
+  const realNodes = realEvents.map((_, i) => i);
+  check('fixture 节点数与真实一致（145）', realNodes.length === 145, realNodes.length);
+
+  const unlimited = selectTrimRange(realNodes, realEvents, 8);
+  const capped = selectTrimRange(realEvents.map((_, i) => i), realEvents, 8, 40);
+  const cntOf = (r: typeof unlimited): number => (r === null ? 0 : r.endIdx - r.startIdx + 1);
+  console.log(`    不限制: 裁 ${cntOf(unlimited)}；limit=40: 裁 ${cntOf(capped)}`);
+
+  check('不限制时确实会砍掉绝大部分（>100）', cntOf(unlimited) > 100, cntOf(unlimited));
+  check('limit=40 时规模被压到 40 以内', cntOf(capped) > 0 && cntOf(capped) <= 40, cntOf(capped));
+  check('limit=40 不会退化成「只裁 1 个」', cntOf(capped) >= 30, cntOf(capped));
+
+  // 端点必须落在「切点平衡 + 可替换」位置，否则宿主会拒绝
+  const balancedAt = (r: typeof unlimited): boolean => {
+    if (r === null) return false;
+    let running = 0;
+    const cut = [true];
+    for (let i = 0; i < realNodes.length; i += 1) {
+      const ev = realEvents[i] as { type?: string; data?: { message?: { content?: unknown } } };
+      if (ev.type === 'assistant/message') {
+        const content = ev.data?.message?.content;
+        running += Array.isArray(content)
+          ? content.filter((b) => (b as { type?: string })?.type === 'tool-call').length
+          : 0;
+      } else if (ev.type === 'tool/result') running -= 1;
+      cut.push(running === 0);
+    }
+    return cut[r.startIdx] === true && cut[r.endIdx + 1] === true;
+  };
+  check('limit=40 端点切点平衡', balancedAt(capped), capped);
+  check('不限制端点切点平衡', balancedAt(unlimited), unlimited);
+
+  // ★第二次独立审查 P1-3：`positiveInt` 对 (0,1) 返回 0，被下游重新解释为
+  // 「不限制」⇒ 一次裁光。在真实 145 节点 surface 上验证才能区分「归一为 1」
+  // 与「退化成不限制」（后者会裁 130+）。
+  for (const v of [0.3, 0.5, 0.9]) {
+    const r = selectTrimRange(realNodes, realEvents, 8, v);
+    const c = cntOf(r);
+    check(`小数 ${v} 归一为 1，不得退化成不限制`, r !== null && c <= 1, { v, c });
+  }
+
+  // ★第三次独立审查 P1-1：上一版把 `'40'` 断言成「视为不限制」，
+  // 等于把事故根因（限制失效 ⇒ 一次裁 92%）固化成回归锁。
+  // 在真实 surface 上，非法值必须退化到安全侧（40），绝不能变成不限制（134）。
+  const unsafeCases: Array<[string, unknown]> = [
     ['字符串 "40"', '40'],
     ['NaN', Number.NaN],
     ['Infinity', Number.POSITIVE_INFINITY],
     ['负数', -5],
     ['0', 0],
   ];
-  for (const [label, value] of badCases) {
-    const r = selectTrimRange(nodes, events, 2, value as number);
-    const c = r === null ? 0 : r.endIdx - r.startIdx + 1;
-    check(`${label} 视为不限制且不返回 null`, r !== null && c === unlimitedCount, { c, want: unlimitedCount });
+  for (const [label, value] of unsafeCases) {
+    const r = selectTrimRange(realNodes, realEvents, 8, value as unknown as number);
+    const c = cntOf(r);
+    check(`真实 surface：${label} 退化到安全侧（≤40），不得变成不限制`, r !== null && c <= 40, {
+      c,
+      unlimited: cntOf(unlimited),
+    });
   }
-  // 小数应向下取整，而不是参与非法算术
-  const frac = selectTrimRange(nodes, events, 2, 3.7);
-  check('小数 3.7 向下取整为 3', frac !== null && frac.endIdx - frac.startIdx + 1 <= 3, frac);
+
+  // ★第二次独立审查 P1-5：keepRecentNodes 非法值必须被收口，不得算出 NaN 区间
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, '8' as unknown as number]) {
+    const r = selectTrimRange(realNodes, realEvents, bad);
+    const valid =
+      r !== null &&
+      Number.isInteger(r.startIdx) &&
+      Number.isInteger(r.endIdx) &&
+      Number.isFinite(r.start) &&
+      Number.isFinite(r.end);
+    check(`keepRecent=${String(bad)} 不产生 NaN 区间`, valid, r);
+  }
+
+  // ★第五次审查 P1-2：`keepRecentNodes` 的小数不能被归一成 0/1 ——
+  // 那等价「几乎全裁」（实测 192 节点裁 188 = 97.9%，比事故更激进）。
+  // 正确处置是「当作没配」，用默认 8，因此结果应与显式传 8 完全一致。
+  for (const frac of [0.3, 0.5, 0.9]) {
+    const r = selectTrimRange(realNodes, realEvents, frac);
+    const c = cntOf(r);
+    const same = selectTrimRange(realNodes, realEvents, 8);
+    check(`keepRecent=${frac} 视同默认 8（不近全裁）`, r !== null && c === cntOf(same), {
+      c,
+      wantDefault8: cntOf(same),
+    });
+  }
 }
 
 const okEngine = makeEngine(100000);
@@ -603,6 +764,63 @@ check('成功裁剪', ok.ok === true && ok.reason === 'ok', ok);
 check('摘要字符数已记录', (ok.summaryChars ?? 0) > 0, ok);
 check('summarize 已恢复', okEngine.summarize === originalSummarize);
 check('写了裁剪日志', logs.some((l) => l.includes('[lrc][trim]')), logs);
+
+// ────────────────────────────────────────────────────────────
+// 3b) ★第四次独立审查的 P0：token 触发路径也必须限流
+//
+// 上一版只在 `force` 时传 `maxNodesPerRun`，token 触发时传 `undefined`。
+// 真实事故的窗口下（contextWindow=1M ⇒ trimMin≈10.5 万），141 节点时刻
+// force 先触发，所以「看起来修好了」；但窗口换到 800K 时 trimMin 降到 8 万，
+// 节点数 114 就触发 token 路径 ⇒ 一次裁 104（91%），**同一事故原样复发**。
+//
+// 所以这里断言：**不传 force**（纯 token 触发）时，若给了
+// `maxNodesPerRun`，单次规模也必须受限。
+// ────────────────────────────────────────────────────────────
+console.log('=== 3b) token 路径同样限流 ===');
+{
+  const tokenEngine = (): { engine: ReturnType<typeof makeEngine>; ranges: Array<{ start: number; end: number }> } => {
+    const ranges: Array<{ start: number; end: number }> = [];
+    const engine = makeEngine(100);
+    engine.compactRegion = async (start: number, end: number) => {
+      ranges.push({ start, end });
+      await engine.summarize({ messages: [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(200) }] }] });
+      return { start, end };
+    };
+    return { engine, ranges };
+  };
+
+  const tokenOnly = tokenEngine();
+  const tokenOutcome = await trimContext({
+    ctx: { get: (n: string) => (n === 'agentPresets' ? { serviceFor: () => tokenOnly.engine } : undefined) },
+    agent,
+    // force 缺省 = false ⇒ 走 token 判定路径（meter 返回 100 tokens/节点，远超 minTokens）
+    options: { minTokens: 100, keepRecentNodes: 2, maxSummaryChars: 2000, maxNodesPerRun: 3 },
+    log: () => {},
+  });
+  const count = (r: Array<{ start: number; end: number }>): number => {
+    if (r.length === 0) return 0;
+    const si = nodes.indexOf(r[0].start);
+    const ei = nodes.indexOf(r[0].end);
+    return si >= 0 && ei >= 0 ? ei - si + 1 : 0;
+  };
+  check('token 路径触发裁剪', tokenOutcome.ok === true, tokenOutcome);
+  check('token 路径单次规模受限（≤3）', count(tokenOnly.ranges) > 0 && count(tokenOnly.ranges) <= 3, count(tokenOnly.ranges));
+
+  // ★第五次审查 P1-1：限流阀的默认值必须下沉到 `trimContext` 内部，
+  // 不能依赖「唯一装配点恰好传了」。漏传时也必须受限，而不是退化成不限制。
+  const noOpt = tokenEngine();
+  const noOptOutcome = await trimContext({
+    ctx: { get: (n: string) => (n === 'agentPresets' ? { serviceFor: () => noOpt.engine } : undefined) },
+    agent,
+    // 刻意**不传** maxNodesPerRun
+    options: { minTokens: 100, keepRecentNodes: 2, maxSummaryChars: 2000 },
+    log: () => {},
+  });
+  check('漏传 maxNodesPerRun 时仍然限流（不退化）', noOptOutcome.ok === true && count(noOpt.ranges) > 0 && count(noOpt.ranges) <= 40, {
+    ok: noOptOutcome.ok,
+    count: count(noOpt.ranges),
+  });
+}
 
 // 回归：cordis 的服务属性访问要求 inject，直接读 engine.ctx.tokenMeter 会抛
 // `cannot get property "tokenMeter" without inject`。必须走 ctx.get()。

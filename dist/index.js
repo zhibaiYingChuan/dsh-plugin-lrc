@@ -1144,35 +1144,88 @@ function hardFilter(text) {
   }
   return kept.join("\n");
 }
-var DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|定为|选型|就用/;
+var DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用/;
 var PROSE_NARRATION = /^(?:我(?:先|来|去|再|正在|会先)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:检查|查看|读取|尝试|运行)(?:一下|下)/;
 var PAST_OR_PLANNING = (
-  // 过去时：动词 + 过（且后面是句读/空白，不是「滤/程/度」等构词）
-  /(?:试|用|碰|去|做|改|见|跑|查|看|读|写|装|删|加|调|测|验)过(?:[，。；\s]|$)|(?:正在|刚刚|刚才|已经|接着|然后)/
+  // 仅「动词 + 过」且后接句读（排除 过滤/过程/过度 等构词）
+  /(?:试|用|碰|去|做|改|见|跑|查|看|读|写|装|删|加|调|测|验)过(?:[，。；\s]|$)|(?:刚刚|刚才)(?:试|装|跑|执行|验证|看了?)|(?:正在)|(?:目前|已经)(?:完成|安装|验证|确认|试过)/
 );
-var STRONG_CONSTRAINT = /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:不要|不会|不用|别|不能|禁止)(?:用|走|把|在|连|写|加|改|删|碰|跳|绕|省|忽)/;
+var STRONG_CONSTRAINT = /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:请勿|勿)(?:使用|用|走|通过|点击|下载)|(?:不要|不会|不用|别|不能|禁止)(?:再|再次|再一次|重复|继续)?(?:直接)?(?:使用|使|去|用|走|通过|把|在|连|写|加|改|删|碰|跳|绕|省|忽|下载|调用|点)/;
 function constraintsFromProse(text, maxLines = 4) {
   const out = [];
   const seen = /* @__PURE__ */ new Set();
   const body = stripMemoryTag(stripCodeFences(text));
   for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
     const line = raw.trim().replace(/^[-*+\d.)\s]+/, "").trim();
-    if (line.length < 8 || line.length > 200) continue;
+    if (line.length > 200) continue;
     if (isSmallTalk(line) || isOptionLabel(line) || looksLikeNormalLog(line)) continue;
     if (/^\s{4,}|^(?:const|let|var|function|class|import|export|def|fn)\s/.test(line)) continue;
     if (PROSE_NARRATION.test(line)) continue;
     const masked = maskPaths(line);
+    const strongHit = STRONG_CONSTRAINT.test(masked);
+    if (line.length < (strongHit ? 4 : 8)) continue;
     const isDecision = DECISION_MARKERS.test(masked);
     const isConstraint = STRONG_CONSTRAINT.test(masked);
     if (!isDecision && !isConstraint) continue;
-    if (!isDecision && PAST_OR_PLANNING.test(masked)) continue;
-    const kind = isDecision ? "决策" : "约束";
+    if (!isConstraint && PAST_OR_PLANNING.test(masked)) continue;
+    const kind = isDecision && !isConstraint ? "决策" : "约束";
     const body2 = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, "").trim();
-    if (body2.length < 6) continue;
+    if (body2.length < (strongHit ? 4 : 6)) continue;
     const key = body2.replace(/\s+/g, "");
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(`${kind}：${body2}`);
+    if (out.length >= maxLines) break;
+  }
+  return out;
+}
+var USER_CORRECTION = (
+  // 必须**有第二人称指向 + 完成态**（你）或「说过 N 次」的明确重申。
+  //
+  // ## 收得多紧，为什么
+  //
+  // `index.ts` 里这条路径直接 migrate 进长期记忆，**无法撤回**，
+  // 且 `recall` 会把它当「用户约束」反复召回。而用户消息量远大于
+  // assistant 正文，误收代价不对称。
+  //
+  // 两次收紧的实测依据：
+  // 1. 裸 `不是说` → 「不是 X，是 Y」解释句 4/4 误收（见 `NEGATION_EXPLANATION`）。
+  // 2. 裸 `我跟你说` → 寒暄/开场白 4/4 误收：
+  //    「我跟你说一下，这个视频还要改」「我跟你说，这个音频就在桌面」
+  //    「你再说一次刚才那个命令」「我说过两次了，你怎么还这样」
+  //    因此 `我跟你说` 必须带**完成/指向**后缀（说过 / 的是），
+  //    `再说一次` 必须后接否定或更正，不能是「请再说一遍」。
+  /(?:不是(?:已经)?(?:告诉|跟|给|对)(?:过)?你)|(?:我(?:已经|早就)?(?:跟你说过|告诉过你|讲过|强调过|说的是|要的是))|(?:说(?:过|了)(?:两|三|好几|\d+)次)|(?:强调|重申)(?:过|一?次)/
+);
+function isBehaviorCorrection(text) {
+  if (!/你/.test(text)) return false;
+  const hasHarm = /(?:就会|会(?:调起|调取|触发|下载|覆盖|删)|不知(?:道|会)|别再|不要|不能|禁止|必须|改用)/.test(text);
+  return hasHarm;
+}
+var NEGATION_EXPLANATION = /不是[^。！？；\n]{0,30}(?:，|,)?\s*(?:而是|是)[^。！？；\n]*/;
+function constraintsFromUser(text, maxLines = 3) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const sentences = stripCodeFences(text).split(/[。！？；\n]+/).map((s) => s.trim().replace(/^[-*+\d.)\s]+/, "").trim()).filter((s) => s.length >= 6 && s.length <= 200);
+  for (let i = 0; i < sentences.length; i += 1) {
+    const line = sentences[i];
+    if (isSmallTalk(line) || looksLikeNormalLog(line)) continue;
+    const masked = maskPaths(line);
+    if (!USER_CORRECTION.test(masked)) continue;
+    const next = sentences[i + 1];
+    const nextUsable = next !== void 0 && next.length >= 6 && next.length <= 120 && !isSmallTalk(next);
+    const window = nextUsable ? `${line}；${next}` : line;
+    const maskedWindow = maskPaths(window);
+    if (NEGATION_EXPLANATION.test(maskedWindow) && !STRONG_CONSTRAINT.test(maskedWindow)) continue;
+    if (!isBehaviorCorrection(maskedWindow)) continue;
+    const body = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, "").trim();
+    const merged = nextUsable ? `${body}；${next}` : body;
+    const cleaned = merged.replace(/[？?]+$/, "").trim();
+    if (cleaned.length < 6) continue;
+    const key = cleaned.replace(/\s+/g, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(`约束：${cleaned}`);
     if (out.length >= maxLines) break;
   }
   return out;
@@ -1233,11 +1286,50 @@ function jaccard(a, b) {
   const union = setA.size + setB.size - inter;
   return union === 0 ? 0 : inter / union;
 }
+function valueTokens(text) {
+  const out = [];
+  for (const m of text.matchAll(/[A-Za-z][A-Za-z0-9_.\-/\\]*|\d+/g)) {
+    const t = m[0].toLowerCase();
+    if (t.length >= 1) out.push(t);
+  }
+  return out;
+}
+var ANTONYM_PAIRS = [
+  ["之外", "之内"],
+  ["以外", "以内"],
+  ["中文", "英文"],
+  ["启用", "禁用"],
+  ["保留", "删除"],
+  ["删除", "保留"],
+  ["开头", "结尾"],
+  ["前面", "后面"],
+  ["之前", "之后"],
+  ["同步", "异步"],
+  ["包含", "排除"]
+];
+function antonymConflict(a, b) {
+  for (const [x, y] of ANTONYM_PAIRS) {
+    if (a.includes(x) && b.includes(y) || a.includes(y) && b.includes(x)) return [x, y];
+  }
+  return null;
+}
+function areNearDuplicate(a, b, threshold) {
+  const va = valueTokens(a);
+  const vb = valueTokens(b);
+  if (va.length > 0 && vb.length > 0) {
+    const sa = new Set(va);
+    const sb = new Set(vb);
+    const same = va.every((x) => sb.has(x)) && vb.every((x) => sa.has(x));
+    if (!same) return false;
+  }
+  if (antonymConflict(a, b) !== null) return false;
+  return jaccard(a, b) >= threshold;
+}
 var DEFAULT_DEDUP_THRESHOLD = 0.85;
 function isDuplicate(text, recent, threshold = DEFAULT_DEDUP_THRESHOLD) {
   const t = text.trim();
   if (t.length === 0) return true;
-  return recent.some((r) => jaccard(r, t) >= threshold);
+  return recent.some((r) => areNearDuplicate(r, t, threshold));
 }
 
 // src/offloader.ts
@@ -1290,7 +1382,7 @@ function pickDiverseSnapshot(items, maxItems) {
       while (i < list.length) {
         const body = bodyOf(list[i]);
         const key = keyOf(body);
-        const dup = pickedKeys.some((p) => jaccard(p, key) >= 0.75);
+        const dup = pickedKeys.some((p) => areNearDuplicate(p, key, 0.75));
         i += 1;
         if (key.length > 0 && !dup) {
           picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
@@ -1311,7 +1403,7 @@ function pickDiverseSnapshot(items, maxItems) {
       const key = keyOf(body);
       i += 1;
       if (key.length === 0) continue;
-      if (pickedKeys.some((p) => jaccard(p, key) >= 0.75)) continue;
+      if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
       picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
       pickedKeys.push(key);
     }
@@ -1410,6 +1502,19 @@ var Offloader = class {
   snapshotPool = [];
   /** 快照池上限：够覆盖「跨轮有效的约束」，又不至于让注入文本无限增长 */
   snapshotPoolMax = 20;
+  /**
+   * 池代次：会话切换时递增，用于丢弃**在飞**的旧会话沉淀结果。
+   *
+   * ## 为什么光有 `snapshotGeneration` 不够
+   *
+   * 那个闸门在 `index.ts` 的 `.then` 回调里，只拦住 `saveSnapshot`。
+   * 但 `offloadItems()` **内部**就已经 `snapshotPool.push(...)` 了 ——
+   * 等闸门返回时池子早被改脏，无法撤销。
+   *
+   * 实测：A 发起 prose（migrate 200ms）→ 50ms 后切到 B 并 reset 池 →
+   * B 攒自己的约束 → A 的请求返回 ⇒ **B 的快照里混入 A 的私有约束**。
+   */
+  poolEpoch = 0;
   /** 累计统计（`lrc_status` 用） */
   flushCount = 0;
   totalWritten = 0;
@@ -1428,6 +1533,14 @@ var Offloader = class {
   /** 连接是否已就绪。 */
   get connected() {
     return this.client !== null;
+  }
+  /**
+   * 当前池代次（发起异步请求时先取一份，返回时比对）。
+   *
+   * 调用方必须在 `await` **之前**读它，否则读到的已是新代次，闸门形同虚设。
+   */
+  get epoch() {
+    return this.poolEpoch;
   }
   /**
    * 注入 / 替换客户端。
@@ -1489,14 +1602,20 @@ var Offloader = class {
    */
   resetSnapshotPool() {
     this.snapshotPool = [];
+    this.poolEpoch += 1;
   }
   /**
    * 把新条目并入池子，再用**整个池子**生成快照。
    *
    * 为什么不能只对新条目排序：真实调用每次只传 1~2 条，
    * 此时排序退化为原序，约束照样被下一批过程记录顶掉（见 `snapshotPool`）。
+   *
+   * @param items - 本批新条目
+   * @param epoch - 发起请求时的池代次；与当前不一致说明会话已切换，
+   *                这批结果属于旧会话，**不得写入池子**（见 `poolEpoch`）
    */
-  buildPooledSnapshot(items) {
+  buildPooledSnapshot(items, epoch = this.poolEpoch) {
+    if (epoch !== this.poolEpoch) return "";
     const seen = new Set(this.snapshotPool.map((i) => i.content.replace(/\s+/g, "")));
     for (const item of items) {
       const key = item.content.replace(/\s+/g, "");
@@ -1505,9 +1624,14 @@ var Offloader = class {
       this.snapshotPool.push(item);
     }
     if (this.snapshotPool.length > this.snapshotPoolMax) {
-      this.snapshotPool = this.snapshotPool.slice(-this.snapshotPoolMax);
+      const isHigh = (i) => i.memory_type === "preference" || i.memory_type === "decision" || i.tags?.includes("constraint") === true || i.tags?.includes("decision") === true;
+      const high = this.snapshotPool.filter(isHigh);
+      const low = this.snapshotPool.filter((i) => !isHigh(i));
+      const highKept = high.slice(-this.snapshotPoolMax);
+      const room = Math.max(0, this.snapshotPoolMax - highKept.length);
+      this.snapshotPool = room > 0 ? [...highKept, ...low.slice(-room)] : highKept;
     }
-    return buildSnapshot(this.snapshotPool, this.config.snapshotItems);
+    return buildSnapshot([...this.snapshotPool].reverse(), this.config.snapshotItems);
   }
   /** 累计沉淀统计（`lrc_status` 用）。 */
   stats() {
@@ -1541,6 +1665,7 @@ var Offloader = class {
    * @returns 卸载结果；没有新增内容时返回 null
    */
   async offload(sessionId, lines) {
+    const epoch = this.poolEpoch;
     const state = this.cursors.get(sessionId);
     const slice = sliceByCursor(lines, state);
     if (slice.text.trim().length === 0) {
@@ -1621,7 +1746,7 @@ var Offloader = class {
       written,
       merged,
       deduped,
-      snapshot: this.buildPooledSnapshot(items),
+      snapshot: this.buildPooledSnapshot(items, epoch),
       reset: slice.reset
     };
     this.record(result);
@@ -1634,9 +1759,15 @@ var Offloader = class {
    * 无法用行号游标追踪，只能按内容查重。查重窗口与主路径共用。
    *
    * @param items 已分类的记忆条目
+   * @param options.intoPool - 是否把条目并入快照池。
+   *   **补写旧会话时必须传 `false`**：补写发生在切会话之后，
+   *   此时池子已经属于新会话，把旧会话的私有约束 push 进去会让
+   *   新会话下一次注入出现「B 的约束；A 会话私有：不要用 IDM」。
+   *   记忆本身仍要写进 LRC（`migrate`），只是不参与当前会话的快照。
    * @returns 卸载结果；全部被查重拦下时返回零值结果
    */
-  async offloadItems(items) {
+  async offloadItems(items, options = {}) {
+    const epoch = this.poolEpoch;
     const fresh = [];
     let deduped = 0;
     for (const item of items) {
@@ -1671,7 +1802,7 @@ var Offloader = class {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
-      snapshot: this.buildPooledSnapshot(fresh),
+      snapshot: options.intoPool === false ? "" : this.buildPooledSnapshot(fresh, epoch),
       reset: false
     };
     this.record(result);
@@ -1756,6 +1887,19 @@ function isRealUserMessage(event) {
 function hasUserConstraint(text) {
   return hasConstraintMarker(text);
 }
+function carriesResourceLocation(text) {
+  const withoutUrls = text.replace(/\bhttps?:\/\/\S+/gi, " ");
+  if (/(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(withoutUrls)) return true;
+  if (/[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp|svg|pdf|docx?|xlsx?|pptx?)\b/i.test(
+    text
+  )) {
+    return true;
+  }
+  if (/(?:桌面|downloads?|下载目录|文档目录|视频目录)/i.test(text) && /(?:音频|视频|文件|素材|图片|脚本)/.test(text)) {
+    return true;
+  }
+  return false;
+}
 function linesFromSession(session) {
   const log = session?.log;
   if (!Array.isArray(log)) return [];
@@ -1770,7 +1914,7 @@ function linesFromSession(session) {
       if (!isRealUserMessage(event)) continue;
       const text = textBlocksOnly(event.data?.content);
       if (text.length === 0) continue;
-      if (!hasUserConstraint(text)) continue;
+      if (!hasUserConstraint(text) && !carriesResourceLocation(text)) continue;
       lines.push(text);
     }
   }
@@ -1779,6 +1923,8 @@ function linesFromSession(session) {
 
 // src/context-trim.ts
 import { randomUUID } from "node:crypto";
+var DEFAULT_KEEP_RECENT = 8;
+var DEFAULT_MAX_NODES_PER_RUN = 40;
 function safeGet(ctx, name2) {
   try {
     return ctx?.get?.(name2);
@@ -1838,10 +1984,24 @@ function toolDelta(event) {
   if (e?.type === "tool/result") return -1;
   return 0;
 }
+function normalizeCount(value, fallback, min = 0) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  if (value < 0) return fallback;
+  const floored = Math.floor(value);
+  if (floored === 0 && value !== 0) return fallback;
+  return Math.max(min, floored);
+}
+function normalizeMaxNodes(value) {
+  if (value === void 0) return void 0;
+  const asNumber = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(asNumber) || asNumber <= 0) return DEFAULT_MAX_NODES_PER_RUN;
+  return Math.max(1, Math.floor(asNumber));
+}
 function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {
-  const limit = typeof maxNodes === "number" && Number.isFinite(maxNodes) && maxNodes > 0 ? Math.floor(maxNodes) : void 0;
+  const keep = normalizeCount(keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
+  const limit = normalizeMaxNodes(maxNodes);
   const n = nodes.length;
-  if (n <= keepRecentNodes + 1) return null;
+  if (n <= keep + 1) return null;
   const cut = new Array(n + 1).fill(false);
   let running = 0;
   cut[0] = true;
@@ -1849,7 +2009,7 @@ function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {
     running += toolDelta(events[nodes[i]]);
     cut[i + 1] = running === 0;
   }
-  const hardEnd = n - keepRecentNodes - 1;
+  const hardEnd = n - keep - 1;
   let endIdx = hardEnd;
   while (endIdx >= 0 && (cut[endIdx + 1] !== true || !isTrimBoundaryEligible(events[nodes[endIdx]]))) {
     endIdx -= 1;
@@ -1861,17 +2021,22 @@ function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {
   }
   if (startIdx > endIdx) return null;
   if (limit !== void 0 && endIdx - startIdx + 1 > limit) {
-    let taken = 0;
-    let lastEligible = -1;
-    for (let cursor = startIdx; cursor <= endIdx; cursor += 1) {
-      if (cut[cursor + 1] !== true || !isTrimBoundaryEligible(events[nodes[cursor]])) {
-        break;
-      }
-      lastEligible = cursor;
-      taken += 1;
-      if (taken >= limit) break;
+    let want = Math.min(endIdx, startIdx + limit - 1);
+    let e = want;
+    while (e >= startIdx && (cut[e + 1] !== true || !isTrimBoundaryEligible(events[nodes[e]]))) {
+      e -= 1;
     }
-    if (lastEligible >= startIdx) endIdx = lastEligible;
+    if (e >= startIdx) {
+      endIdx = e;
+    } else {
+      const hardCap = Math.min(endIdx, startIdx + limit * 2 - 1);
+      let up = Math.max(want, startIdx);
+      while (up <= hardCap && (cut[up + 1] !== true || !isTrimBoundaryEligible(events[nodes[up]]))) {
+        up += 1;
+      }
+      if (up > hardCap) return null;
+      endIdx = up;
+    }
   }
   return {
     start: nodes[startIdx],
@@ -2165,7 +2330,7 @@ function pruneToolCallArguments(deps) {
   const { agent, log } = deps;
   const thresholdChars = deps.options?.thresholdChars ?? 4e3;
   const headChars = deps.options?.headChars ?? 2e3;
-  const keepRecentNodes = deps.options?.keepRecentNodes ?? 8;
+  const keepRecentNodes = normalizeCount(deps.options?.keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
   const session = agent?.session;
   if (session === void 0) return { ok: false, reason: "no-session" };
   const nodes = session?.surface?.nodes;
@@ -2178,7 +2343,7 @@ function pruneToolCallArguments(deps) {
 }
 function pruneReasoning(deps) {
   const { agent, log } = deps;
-  const keepRecentNodes = deps.options?.keepRecentNodes ?? 8;
+  const keepRecentNodes = normalizeCount(deps.options?.keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
   const session = agent?.session;
   if (session === void 0) return { ok: false, reason: "no-session" };
   const nodes = session?.surface?.nodes;
@@ -2257,9 +2422,26 @@ async function trimContext(deps) {
     nodes,
     events,
     options.keepRecentNodes,
-    // 只在 force（节点数超限）时限制单次规模：token 超阈值是「真的太大了」，
-    // 该一次裁够；而节点数超限是常态兜底，必须摊开裁，否则每次重写整段前缀。
-    options.force ? options.maxNodesPerRun : void 0
+    // **两条触发路径都必须限流**。
+    //
+    // 上一版写 `force ? maxNodesPerRun : undefined`，理由是「token 超阈值
+    // 说明真的太大了，该一次裁够」。这个判断是错的：
+    //
+    // - 事故的伤害不来自「裁得不够」，而来自「一次重写整段前缀」——
+    //   KV 缓存按前缀复用，整段作废的代价与裁多少成正比。
+    // - 真实日志里同一个窗口（contextWindow=1M ⇒ trimMin≈10.5 万）下，
+    //   141 节点时刻 force 先触发；但窗口降到 800K 时 trimMin=8 万，
+    //   节点数 114 就触发 token 路径 ⇒ 一次裁 104（91%），事故原样复发。
+    // - 「一次裁够」并不会更快收敛：每步都有新节点进来，摊开裁同样能
+    //   把规模压下去，且缓存损失小得多。
+    //
+    // ## 默认值必须下沉到函数内部
+    //
+    // 可以写成 `options.maxNodesPerRun`，也可以让 `selectTrimRange` 的
+    // `undefined` 表示不限制 —— 但后者意味着**任何漏传的调用方都会精确
+    // 复现事故**（实测 141 节点 → 裁 129，91.5%）。限流阀的默认值不能
+    // 依赖「唯一装配点恰好传了」，所以这里自己补默认。
+    options.maxNodesPerRun ?? DEFAULT_MAX_NODES_PER_RUN
   );
   if (range === null) {
     return {
@@ -3009,11 +3191,7 @@ function apply(ctx, config) {
   }
   const capabilityRecheckSteps = recheckInterval(config.capabilityRecheckSteps);
   const budgetRecheckSteps = recheckInterval(config.budgetRecheckSteps);
-  function positiveInt(value, fallback) {
-    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
-    return Math.floor(value);
-  }
-  const trimMaxNodesPerRun = positiveInt(config.trimMaxNodesPerRun, 40);
+  const trimMaxNodesPerRun = normalizeMaxNodes(config.trimMaxNodesPerRun) ?? DEFAULT_MAX_NODES_PER_RUN;
   function loadSnapshot() {
     const empty = { text: "", sessionId: "" };
     try {
@@ -3098,8 +3276,26 @@ function apply(ctx, config) {
   let turnHits = 0;
   let turnMisses = 0;
   let proseTurns = 0;
-  let proseBacklog = [];
+  const proseBacklog = /* @__PURE__ */ new Map();
   const PROSE_BACKLOG_MAX = 30;
+  function proseBacklogSize() {
+    let total = 0;
+    for (const list of proseBacklog.values()) total += list.length;
+    return total;
+  }
+  function pushProseBacklog(owner, items) {
+    const list = proseBacklog.get(owner) ?? [];
+    list.push(...items);
+    proseBacklog.set(owner, list);
+    while (proseBacklogSize() > PROSE_BACKLOG_MAX) {
+      const first = proseBacklog.keys().next();
+      if (first.done === true) break;
+      const head = proseBacklog.get(first.value) ?? [];
+      const over = proseBacklogSize() - PROSE_BACKLOG_MAX;
+      if (head.length <= over) proseBacklog.delete(first.value);
+      else proseBacklog.set(first.value, head.slice(over));
+    }
+  }
   let snapshotGeneration = 0;
   let turnNoText = 0;
   let turnHadText = false;
@@ -3125,7 +3321,6 @@ function apply(ctx, config) {
       recallGeneration += 1;
     }
     offloader.resetSnapshotPool();
-    proseBacklog = [];
     snapshotGeneration += 1;
     if (snapshotOwner !== sessionId) {
       if (storedSnapshot.text.length > 0) {
@@ -3194,6 +3389,58 @@ ${latestSnapshot}`;
   );
   function attachOffloader(client) {
     offloader?.bind(client);
+    drainProseBacklog();
+  }
+  function drainProseBacklog() {
+    for (const [owner, list] of [...proseBacklog.entries()]) {
+      if (list.length === 0) continue;
+      proseBacklog.delete(owner);
+      const pending = list;
+      const ownerSessionId = owner.length > 0 ? owner : currentSessionId;
+      void offloader.offloadItems(pending, { intoPool: owner === currentSessionId }).then((result) => {
+        if (result.distilled > 0) {
+          if (result.snapshot.length > 0 && ownerSessionId.length > 0) {
+            saveSnapshot(result.snapshot, ownerSessionId);
+          }
+          ctx.logger.info(
+            `[lrc] 补写未连接期间的 ${result.distilled} 条约束/决策（写入 ${result.written}）`
+          );
+        }
+      }).catch((error) => {
+        if (isConnectionError(error)) {
+          pushProseBacklog(owner, pending);
+          ctx.logger.warn(
+            `[lrc] 补写暂存约束失败（已放回队列重试）：${error instanceof Error ? error.message : String(error)}`
+          );
+          return;
+        }
+        ctx.logger.warn(
+          `[lrc] 补写暂存约束被 LRC 拒绝，已丢弃 ${pending.length} 条（不重试）：${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+    }
+  }
+  function offloadExtracted(items, ownerSessionId, label) {
+    if (!offloader.connected) {
+      pushProseBacklog(ownerSessionId, items);
+      void connection.get();
+      return;
+    }
+    proseTurns += 1;
+    const gen = ++snapshotGeneration;
+    void offloader.offloadItems(items).then((result) => {
+      if (gen !== snapshotGeneration) return;
+      if (result.distilled > 0) {
+        if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+          saveSnapshot(result.snapshot, ownerSessionId);
+        }
+        ctx.logger.info(`[lrc] ${label} ${result.distilled} 条约束/决策（写入 ${result.written}）`);
+      }
+    }).catch((error) => {
+      ctx.logger.warn(
+        `[lrc] ${label}沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+      );
+    });
   }
   void (async () => {
     const client = await connection.get();
@@ -3206,22 +3453,7 @@ ${latestSnapshot}`;
     }
     ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
     void bootstrapSnapshot();
-    if (proseBacklog.length > 0) {
-      const pending = proseBacklog;
-      proseBacklog = [];
-      void offloader.offloadItems(pending).then((result) => {
-        if (result.distilled > 0) {
-          if (result.snapshot.length > 0) saveSnapshot(result.snapshot, currentSessionId);
-          ctx.logger.info(
-            `[lrc] 补写未连接期间的 ${result.distilled} 条约束/决策（写入 ${result.written}）`
-          );
-        }
-      }).catch((error) => {
-        ctx.logger.warn(
-          `[lrc] 补写暂存约束失败：${error instanceof Error ? error.message : String(error)}`
-        );
-      });
-    }
+    drainProseBacklog();
   })();
   async function bootstrapSnapshot() {
     const client = connection.peek();
@@ -3411,7 +3643,12 @@ ${latestSnapshot}`;
       return;
     }
     if (type === "user/message" && isRealUserMessage(event)) {
-      void refreshRecallInjection(userMessageText(event));
+      const userText = userMessageText(event);
+      void refreshRecallInjection(userText);
+      const corrections = constraintsFromUser(userText);
+      if (corrections.length > 0) {
+        offloadExtracted(itemsFromTag(corrections.join("\n")), sessionId, "用户纠正");
+      }
       return;
     }
     if (type !== "assistant/message") return;
@@ -3424,33 +3661,7 @@ ${latestSnapshot}`;
       offloader.observe(text);
       const prose = constraintsFromProse(text);
       if (prose.length > 0) {
-        const proseSessionId = sessionId;
-        const items = itemsFromTag(prose.join("\n"));
-        if (!offloader.connected) {
-          proseBacklog.push(...items);
-          if (proseBacklog.length > PROSE_BACKLOG_MAX) {
-            proseBacklog = proseBacklog.slice(-PROSE_BACKLOG_MAX);
-          }
-          void connection.get();
-          return;
-        }
-        proseTurns += 1;
-        const gen = ++snapshotGeneration;
-        void offloader.offloadItems(items).then((result) => {
-          if (gen !== snapshotGeneration) return;
-          if (result.distilled > 0) {
-            if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-              saveSnapshot(result.snapshot, proseSessionId);
-            }
-            ctx.logger.info(
-              `[lrc] 正文抽取 ${result.distilled} 条约束/决策（写入 ${result.written}）`
-            );
-          }
-        }).catch((error) => {
-          ctx.logger.warn(
-            `[lrc] 正文抽取沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
-          );
-        });
+        offloadExtracted(itemsFromTag(prose.join("\n")), sessionId, "正文抽取");
       }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       warnedShape = true;
@@ -3592,8 +3803,17 @@ ${latestSnapshot}`;
               keepRecentNodes: config.keepRecentNodes,
               maxSummaryChars: config.trimMaxSummaryChars,
               force,
-              // 用归一化后的值：宿主 patch 通常不含该字段，直接用会退化为旧行为
-              maxNodesPerRun: force ? trimMaxNodesPerRun : void 0
+              // **两条路径都必须限流，不只 force**。
+              //
+              // 事故形态（141 节点裁 131 / 137 裁 127）在真实日志里正是
+              // 「节点数 >120 ⇒ force」触发的，所以上一版只给 force 加限制，
+              // 看起来修好了。但 token 触发路径（窗口 300K~800K 时
+              // trimMin 降到 8 万，节点数 114 就触发）传的是 `undefined`
+              // ⇒ 一次裁 104（91%），**同一事故原样复发**。
+              //
+              // 节点数硬上限只是个「兜底触发器」；真正决定「一次裁多少」的
+              // 是这里。所以两条路径统一用一个上限：见 `trimMaxNodesPerRun`。
+              maxNodesPerRun: trimMaxNodesPerRun
             },
             log: (message) => ctx.logger.info(message)
           });

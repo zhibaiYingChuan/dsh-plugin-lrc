@@ -7,7 +7,8 @@
  * 实测模型只有 1.8% 的轮次输出 <lrc_memory>，所以约束抽取几乎全靠它。
  * 它抽错 = 沉淀垃圾；抽漏 = 约束丢失，下一轮模型重犯同样的错。
  */
-import { constraintsFromProse } from '../src/memory-filter.ts';
+import { areNearDuplicate, constraintsFromProse, constraintsFromUser } from '../src/memory-filter.ts';
+import { carriesResourceLocation } from '../src/session-text.ts';
 import { Offloader, buildSnapshot } from '../src/offloader.ts';
 import { CursorStore } from '../src/cursor.ts';
 import { tmpdir } from 'node:os';
@@ -119,6 +120,29 @@ console.log('=== 4) 路径词不误判 ===');
   check('路径里的「禁止」不算约束', got.length === 0, got);
 }
 
+// ── 4b) 「目前 / 刚刚」不得误杀真实决策 ──
+//
+// ★独立审查发现的 P2-1：`PAST_OR_PLANNING` 里含裸 `目前`/`刚刚`，
+// 而「目前改用 X」是最典型的决策句（`DECISION_MARKERS` 的 `改用` 专为此设计）。
+// 实测 4/6 真实决策被时态词杀掉。
+console.log('=== 4b) 目前/刚刚 不误杀决策 ===');
+{
+  const decisions = [
+    '目前改用 --stdin 传入，不再写临时文件',
+    '目前采用 pnpm 作为包管理器',
+    '刚刚决定改用 --file 传入音频',
+    '目前定为 3113 端口',
+  ];
+  for (const d of decisions) {
+    check(`保留决策「${d.slice(0, 14)}…」`, constraintsFromProse(d).length > 0, constraintsFromProse(d));
+  }
+  // 真正的状态陈述（「目前已完成」）仍须排除
+  const states = ['目前已完成迁移', '刚刚安装完成', '现在正在验证'];
+  for (const s of states) {
+    check(`排除状态「${s}」`, constraintsFromProse(s).length === 0, constraintsFromProse(s));
+  }
+}
+
 // ── 5) 数量上限 ──
 console.log('=== 5) 数量上限 ===');
 {
@@ -211,6 +235,191 @@ console.log('=== 7c) 跨类轮转 ===');
   check('决策能进前两位', snap.includes('--stdin'), snap);
 }
 
+// ── 7d) 池代次：在飞的旧会话结果不得污染新会话 ──
+//
+// ★独立审查发现的 P1-2：`snapshotGeneration` 只拦了 `saveSnapshot`，
+// 而 `offloadItems()` 内部已经 push 进池子 —— 闸门返回时池子早已被改脏。
+// 修法是 `poolEpoch`：请求发起时取代次，写池前比对。
+console.log('=== 7d) 池代次闸门 ===');
+{
+  const off = new Offloader(null, new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-e.json`)), {
+    snapshotItems: 3,
+  });
+  const pool = off as unknown as {
+    buildPooledSnapshot: (i: DistilledItem[], epoch?: number) => string;
+  };
+  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  });
+
+  // 会话 A 发起请求时记下代次
+  const epochA = off.epoch;
+  off.resetSnapshotPool(); // 期间切到会话 B 并清池
+  const epochB = off.epoch;
+  check('reset 后代次递增', epochB > epochA, { epochA, epochB });
+
+  // A 的迟到结果：必须被丢弃，且不得写进池子
+  const stale = pool.buildPooledSnapshot([mk('[约束] A 的私有约束', 'preference', ['constraint'])], epochA);
+  check('旧代次结果返回空串', stale === '', stale);
+  const after = pool.buildPooledSnapshot([mk('[结论] B 的结论', 'fact', ['conclusion'])]);
+  check('A 的约束未混入 B 的快照', !after.includes('A 的私有约束'), after);
+  check('B 自己的内容正常产出', after.includes('B 的结论'), after);
+
+  // 当前代次的结果必须正常写入（闸门不能误伤正常路径）
+  const live = pool.buildPooledSnapshot([mk('[约束] B 的约束', 'preference', ['constraint'])], off.epoch);
+  check('当前代次结果正常写入', live.includes('B 的约束'), live);
+}
+
+// ── 1e) 用户纠正型约束必须入库 ──
+//
+// ★独立审查发现的 P0-3：`linesFromSession` 的门槛是 `hasConstraintMarker`
+// （必须/不要/禁止），而用户最关键的约束常用反问句表达。
+//
+// ★★第二次独立审查指出：上一版的 fixture 是**改写自证** ——
+// 注释称「取自 session-e1419190 的真实正文」，但逐句在真实日志里搜索 0 次命中。
+// 现在改成**从 session.v4.jsonl.zstd 解码出来的逐字原文**（seq 已标注）。
+console.log('=== 1e) 用户纠正型约束 ===');
+{
+  // ↓↓↓ 以下三条是从 session-e1419190 解码的逐字原文，未做任何改写 ↓↓↓
+  //     seq=1682 len=50（用户唯一提到 IDM 的消息）
+  const REAL_IDM =
+    '不是告诉你音频在的位置了吗？你一点击下载，就会调取桌面的IDM的下载软件，然后你就不知道下载到哪了。';
+  //     seq=1761 len=23
+  const REAL_NO_DUB = '你这个视频不用你配音了，直接执执行其他的任务。';
+  //     seq=1539 len=42
+  const REAL_AUDIO = 'D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频。继续任务';
+
+  check('真实 IDM 消息能被抽到', constraintsFromUser(REAL_IDM).length > 0, constraintsFromUser(REAL_IDM));
+  check('抽出内容含 IDM', constraintsFromUser(REAL_IDM).some((g) => g.includes('IDM')), constraintsFromUser(REAL_IDM));
+  check(
+    '抽出内容含「下载到哪」的风险说明',
+    constraintsFromUser(REAL_IDM).some((g) => g.includes('下载到哪')),
+    constraintsFromUser(REAL_IDM),
+  );
+  check('普通任务消息不被误收', constraintsFromUser(REAL_NO_DUB).length === 0, constraintsFromUser(REAL_NO_DUB));
+  check('含路径的指令不被误收', constraintsFromUser(REAL_AUDIO).length === 0, constraintsFromUser(REAL_AUDIO));
+
+  // ★独立审查 P0-2：「不是 X，是 Y」解释句被 4/4 误收，现必须全部排除
+  const explanations = [
+    '这个不是说明书的写法，你去看一下第三章。',
+    '这两个文件不是说明关系，是引用关系。',
+    '不是说这个方案不行，是成本太高。',
+    '我不是说我不同意，是说要先确认。',
+  ];
+  for (const e of explanations) {
+    check(`解释句不误收「${e.slice(0, 12)}…」`, constraintsFromUser(e).length === 0, constraintsFromUser(e));
+  }
+
+  // ★第三次独立审查 P1-4：`我跟你说` 类开场白 4/4 误收，现必须排除
+  const plainTalk = [
+    '我跟你说一下，这个视频还要改。',
+    '我跟你说，这个音频就在桌面。',
+    '你再说一次刚才那个命令。',
+    '我说过两次了，你怎么还这样。',
+  ];
+  for (const p of plainTalk) {
+    check(`开场白不误收「${p.slice(0, 12)}…」`, constraintsFromUser(p).length === 0, constraintsFromUser(p));
+  }
+
+  // 带强情态词的纠正句仍是约束（不能因为「不是…是…」就一刀切掉）
+  const real = constraintsFromUser('不是告诉过你不要用 IDM 吗，必须改用 --file 传入。');
+  check('含「必须」的纠正句仍被收录', real.length > 0, real);
+
+  check('每条都带约束前缀', constraintsFromUser(REAL_IDM).every((g) => g.startsWith('约束：')), constraintsFromUser(REAL_IDM));
+  check('空串返回空数组', constraintsFromUser('').length === 0);
+}
+
+// ── 1f) 「不要再 / 别再」与短约束不得被漏抽 ──
+//
+// ★第三次独立审查 P1-3：`STRONG_CONSTRAINT` 的第二组要求「不要」紧跟单字动词，
+// 于是「不要**再**走下载链接」整类漏抽；而 `length < 8` 门槛把
+// 「不要走 IDM」（7 字）、「不要跳过校验」（6 字）这些**最典型的短约束**直接吞掉。
+console.log('=== 1f) 不要再/别再 + 短约束 ===');
+{
+  const cases = [
+    '不要再走下载链接了，直接用桌面上的音频文件',
+    '别再去点那个下载按钮，会调起 IDM',
+    '不要再使用 IDM 下载音频，直接用 --file 传入',
+    '不要再次下载这个文件，源文件在桌面',
+    '不要用 IDM',
+    '不要走 IDM',
+    '不要跳过校验',
+    // ★第四次审查：词表遗漏的同义形态
+    '不要通过 IDM 下载音频',
+    '请勿使用 IDM 下载',
+    '不要直接用下载链接',
+  ];
+  for (const c of cases) {
+    check(`保留「${c.slice(0, 16)}」`, constraintsFromProse(c).length > 0, constraintsFromProse(c));
+  }
+}
+
+// ── 1g) 「音频在桌面」这类资源位置必须进沉淀源 ──
+//
+// ★第四次独立审查：事故的另一半从未修复 —— 用户交代音频位置的那条消息
+// （seq=1539）既没有约束词也不是纠正句式，两条门槛双双漏过，
+// 「音频在桌面」从未入库，模型只能去点下载链接。
+console.log('=== 1g) 资源位置进沉淀源 ===');
+{
+  const REAL_AUDIO_LOC = 'D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频。继续任务';
+  check('真实音频位置消息能进沉淀源', carriesResourceLocation(REAL_AUDIO_LOC), REAL_AUDIO_LOC);
+  check('口语「音频在桌面」能进', carriesResourceLocation('音频就在桌面，你自己去找'), '音频就在桌面');
+  check('普通任务描述不进（无资源）', !carriesResourceLocation('帮我做个一分钟的视频'), '帮我做个一分钟的视频');
+  check('纯代码路径不算资源位置', !carriesResourceLocation('检查 src/index.ts 里的逻辑'), 'src/index.ts');
+  check('文档任务不算资源位置', !carriesResourceLocation('帮我排版 docs/禁止事项.md'), 'docs/禁止事项.md');
+  // ★第五次审查 P2-1：URL 里的 `s:/` 曾被误判成盘符路径
+  check(
+    'URL 不算资源位置',
+    !carriesResourceLocation('https://github.com/zhibaiYingChuan/LRC 为这个仓库的产品做一个一分钟以内的视频。'),
+    'https://github.com/...',
+  );
+}
+
+// ── 7e) 池上限：高价值超额时不得无界增长 ──
+//
+// ★独立审查发现的 P0-1：上一版 `room = max(0, 20 - min(high.length, 20))`，
+// 当 `high.length >= 20` 时 room=0，而 `low.slice(-0)` 返回**整个数组**
+// （JS 规范：`arr.slice(-0) === arr`），低价值条目一条都没被删。
+// 实测 25 条高价值后每轮 +10 条低价值，池 30→40→…→80 无界增长。
+console.log('=== 7e) 池上限与淘汰端 ===');
+{
+  const off = new Offloader(null, new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-f.json`)), {
+    snapshotItems: 3,
+  });
+  const pool = off as unknown as {
+    buildPooledSnapshot: (i: DistilledItem[]) => string;
+    snapshotPool: DistilledItem[];
+  };
+  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  });
+
+  // 先灌 25 条高价值（超过池上限 20）
+  const many: DistilledItem[] = [];
+  for (let i = 0; i < 25; i += 1) {
+    many.push(mk(`[约束] 约束${i}`, 'preference', ['constraint']));
+  }
+  pool.buildPooledSnapshot(many);
+  check('高价值超额后池被裁到上限', pool.snapshotPool.length <= 20, pool.snapshotPool.length);
+
+  // 再连灌多轮低价值，池必须始终不超上限
+  let maxSeen = pool.snapshotPool.length;
+  for (let round = 0; round < 6; round += 1) {
+    const lows: DistilledItem[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      lows.push(mk(`[结论] 过程${round}-${i}`, 'fact', ['conclusion']));
+    }
+    pool.buildPooledSnapshot(lows);
+    maxSeen = Math.max(maxSeen, pool.snapshotPool.length);
+  }
+  check('多轮灌低价值后池仍不超上限', maxSeen <= 20, maxSeen);
+
+  // 保留端：追加式池子应保留**最新**的高价值，而不是最旧的
+  const kept = pool.snapshotPool.map((i) => i.content).join('|');
+  check('保留的是最新约束（约束24）', kept.includes('约束24'), kept.slice(0, 200));
+  check('最旧约束（约束0）被淘汰', !kept.includes('约束0'), kept.slice(0, 200));
+}
+
 // ── 8) 快照：只有结论时仍能输出 ──
 console.log('=== 8) 快照退化情形 ===');
 {
@@ -220,6 +429,23 @@ console.log('=== 8) 快照退化情形 ===');
   const snap = buildSnapshot(onlyConclusions, 3);
   check('只有结论时仍产出快照', snap.includes('某结论'), snap);
   check('空数组返回空串', buildSnapshot([], 3) === '');
+}
+
+console.log('\n=== P1-5 中文对立词不得判重复 ===');
+{
+  const pairs: Array<[string, string, boolean]> = [
+    ['必须放在工作区之外的目录，不能放在 AppData 里', '必须放在工作区之内的目录，不能放在 AppData 里', false],
+    ['必须用中文回答所有问题并写中文注释', '必须用英文回答所有问题并写英文注释', false],
+  ];
+  for (const [a, b, wantDup] of pairs) {
+    const got = areNearDuplicate(a, b, 0.85);
+    check(`对立词「${a.slice(0, 12)}…」判为不重复`, got === wantDup, { got, want: wantDup });
+  }
+  // 同一侧的改写仍应判重（不能因为加了反义表就放过真复述）
+  check(
+    '「工作区外」vs「工作区之外」仍判重复',
+    areNearDuplicate('缓存必须放在工作区外', '缓存必须放在工作区之外', 0.85),
+  );
 }
 
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);

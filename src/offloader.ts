@@ -22,6 +22,7 @@
 import type { DistilledItem, LrcClient } from './lrc-client.ts';
 import { advanceCursor, sliceByCursor, type CursorStore, type RecentStore } from './cursor.ts';
 import {
+  areNearDuplicate,
   DEFAULT_DEDUP_THRESHOLD,
   extractMemoryTag,
   hardFilter,
@@ -217,7 +218,7 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
       while (i < list.length) {
         const body = bodyOf(list[i]);
         const key = keyOf(body);
-        const dup = pickedKeys.some((p) => jaccard(p, key) >= 0.75);
+        const dup = pickedKeys.some((p) => areNearDuplicate(p, key, 0.75));
         i += 1;
         if (key.length > 0 && !dup) {
           picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
@@ -240,7 +241,7 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
       const key = keyOf(body);
       i += 1;
       if (key.length === 0) continue;
-      if (pickedKeys.some((p) => jaccard(p, key) >= 0.75)) continue;
+      if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
       picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
       pickedKeys.push(key);
     }
@@ -376,6 +377,19 @@ export class Offloader {
   private snapshotPool: DistilledItem[] = [];
   /** 快照池上限：够覆盖「跨轮有效的约束」，又不至于让注入文本无限增长 */
   private readonly snapshotPoolMax = 20;
+  /**
+   * 池代次：会话切换时递增，用于丢弃**在飞**的旧会话沉淀结果。
+   *
+   * ## 为什么光有 `snapshotGeneration` 不够
+   *
+   * 那个闸门在 `index.ts` 的 `.then` 回调里，只拦住 `saveSnapshot`。
+   * 但 `offloadItems()` **内部**就已经 `snapshotPool.push(...)` 了 ——
+   * 等闸门返回时池子早被改脏，无法撤销。
+   *
+   * 实测：A 发起 prose（migrate 200ms）→ 50ms 后切到 B 并 reset 池 →
+   * B 攒自己的约束 → A 的请求返回 ⇒ **B 的快照里混入 A 的私有约束**。
+   */
+  private poolEpoch = 0;
   /** 累计统计（`lrc_status` 用） */
   private flushCount = 0;
   private totalWritten = 0;
@@ -402,6 +416,15 @@ export class Offloader {
   /** 连接是否已就绪。 */
   get connected(): boolean {
     return this.client !== null;
+  }
+
+  /**
+   * 当前池代次（发起异步请求时先取一份，返回时比对）。
+   *
+   * 调用方必须在 `await` **之前**读它，否则读到的已是新代次，闸门形同虚设。
+   */
+  get epoch(): number {
+    return this.poolEpoch;
   }
 
   /**
@@ -475,6 +498,8 @@ export class Offloader {
    */
   resetSnapshotPool(): void {
     this.snapshotPool = [];
+    // 递增代次：在飞的旧会话沉淀结果回来时会被丢弃（见 `poolEpoch`）
+    this.poolEpoch += 1;
   }
 
   /**
@@ -482,9 +507,16 @@ export class Offloader {
    *
    * 为什么不能只对新条目排序：真实调用每次只传 1~2 条，
    * 此时排序退化为原序，约束照样被下一批过程记录顶掉（见 `snapshotPool`）。
+   *
+   * @param items - 本批新条目
+   * @param epoch - 发起请求时的池代次；与当前不一致说明会话已切换，
+   *                这批结果属于旧会话，**不得写入池子**（见 `poolEpoch`）
    */
-  private buildPooledSnapshot(items: DistilledItem[]): string {
-    // 按内容去重（同一约束可能被多轮重复提到），保持「新的在前」
+  private buildPooledSnapshot(items: DistilledItem[], epoch: number = this.poolEpoch): string {
+    // 代次不符：请求在飞期间已切会话并清空池子。
+    // 此时返回空串（不注入），也绝不 push —— 否则 B 会话的快照会混入 A 的私有约束。
+    if (epoch !== this.poolEpoch) return '';
+    // 按内容去重（同一约束可能被多轮重复提到）
     const seen = new Set(this.snapshotPool.map((i) => i.content.replace(/\s+/g, '')));
     for (const item of items) {
       const key = item.content.replace(/\s+/g, '');
@@ -492,11 +524,40 @@ export class Offloader {
       seen.add(key);
       this.snapshotPool.push(item);
     }
-    // 超限时丢最旧的（数组前端），保证池子不会无限涨
+    // 超限时**优先淘汰结论/事实**，保留约束/决策。
+    //
+    // 原来直接 `slice(-max)` 按入池顺序丢最旧的 —— 而高价值约束往往是
+    // 最早确立的，恰好最先被淘汰。实测：先攒 3 条关键约束，再一次
+    // distill 返回 25 条过程结论（常见量级），3 条约束**全部被挤出**。
     if (this.snapshotPool.length > this.snapshotPoolMax) {
-      this.snapshotPool = this.snapshotPool.slice(-this.snapshotPoolMax);
+      const isHigh = (i: DistilledItem): boolean =>
+        i.memory_type === 'preference' ||
+        i.memory_type === 'decision' ||
+        i.tags?.includes('constraint') === true ||
+        i.tags?.includes('decision') === true;
+      const high = this.snapshotPool.filter(isHigh);
+      const low = this.snapshotPool.filter((i) => !isHigh(i));
+
+      // ## 两个必须避开的坑
+      //
+      // 1. **`slice(-0)` 返回整个数组**（JS 规范），不是空数组。
+      //    上一版写 `low.slice(-room)`，当 `high.length >= 上限`（room=0）时
+      //    低价值条目一条都没被删 ⇒ 池子无界增长。
+      //    实测：25 条高价值之后每轮 +10 条低价值，池 30→40→…→80。
+      // 2. **保留哪一端**。池子是**追加**的，`slice(0, max)` 留的是**最旧的**
+      //    高价值条目，最新确立的约束反而被丢掉 —— 与「约束跨轮有效、
+      //    越新越相关」的设计意图相反。
+      //
+      // 所以：高价值按**新到旧**保留，剩余槽位才用低价值从新到旧补。
+      const highKept = high.slice(-this.snapshotPoolMax);
+      const room = Math.max(0, this.snapshotPoolMax - highKept.length);
+      this.snapshotPool = room > 0 ? [...highKept, ...low.slice(-room)] : highKept;
     }
-    return buildSnapshot(this.snapshotPool, this.config.snapshotItems);
+    // 池子是**追加**的（旧 → 新）。注入时要从**新到旧**取：
+    // 淘汰端保留的是最新 20 条（见上），如果取词仍从旧的一端开始，
+    // 注入的就是这批里排第 1~3 的旧条目 —— 与「越新越相关」正好相反。
+    // 实测：30 轮约束后池为 C10…C29，注入的却是 C10/C11/C12。
+    return buildSnapshot([...this.snapshotPool].reverse(), this.config.snapshotItems);
   }
 
   /** 累计沉淀统计（`lrc_status` 用）。 */
@@ -533,6 +594,8 @@ export class Offloader {
    * @returns 卸载结果；没有新增内容时返回 null
    */
   async offload(sessionId: string, lines: string[]): Promise<OffloadResult | null> {
+    // 同 `offloadItems`：在 await 之前捕获代次，避免在飞结果污染新会话的池子
+    const epoch = this.poolEpoch;
     const state = this.cursors.get(sessionId);
     const slice = sliceByCursor(lines, state);
 
@@ -637,7 +700,7 @@ export class Offloader {
       written,
       merged,
       deduped,
-      snapshot: this.buildPooledSnapshot(items),
+      snapshot: this.buildPooledSnapshot(items, epoch),
       reset: slice.reset,
     };
     this.record(result);
@@ -651,9 +714,20 @@ export class Offloader {
    * 无法用行号游标追踪，只能按内容查重。查重窗口与主路径共用。
    *
    * @param items 已分类的记忆条目
+   * @param options.intoPool - 是否把条目并入快照池。
+   *   **补写旧会话时必须传 `false`**：补写发生在切会话之后，
+   *   此时池子已经属于新会话，把旧会话的私有约束 push 进去会让
+   *   新会话下一次注入出现「B 的约束；A 会话私有：不要用 IDM」。
+   *   记忆本身仍要写进 LRC（`migrate`），只是不参与当前会话的快照。
    * @returns 卸载结果；全部被查重拦下时返回零值结果
    */
-  async offloadItems(items: DistilledItem[]): Promise<OffloadResult> {
+  async offloadItems(
+    items: DistilledItem[],
+    options: { intoPool?: boolean } = {},
+  ): Promise<OffloadResult> {
+    // **在 await 之前**取代次：之后可能切会话并 reset 池子，
+    // 那时 `this.poolEpoch` 已变，只有提前捕获的这份才是「本批归属」。
+    const epoch = this.poolEpoch;
     const fresh: DistilledItem[] = [];
     let deduped = 0;
     for (const item of items) {
@@ -690,7 +764,7 @@ export class Offloader {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
-      snapshot: this.buildPooledSnapshot(fresh),
+      snapshot: options.intoPool === false ? '' : this.buildPooledSnapshot(fresh, epoch),
       reset: false,
     };
     this.record(result);

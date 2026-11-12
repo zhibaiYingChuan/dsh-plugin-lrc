@@ -42,6 +42,17 @@
 import { randomUUID } from 'node:crypto';
 import { isConversationNode } from './event-classify.ts';
 
+/** 保留尾部节点数的默认值（配置非法时用它）。 */
+export const DEFAULT_KEEP_RECENT = 8;
+
+/**
+ * 单次裁剪节点数的默认上限（`maxNodes` 传了非法值时用它）。
+ *
+ * **必须取「安全侧」**：非法值退化成「不限制」会让一次裁掉 92%，
+ * 那正是本次事故的形态；退化成「40」最坏只是少裁一点。
+ */
+export const DEFAULT_MAX_NODES_PER_RUN = 40;
+
 /** 裁剪参数。 */
 export interface TrimOptions {
   /** 上下文低于这个 token 数就不裁（避免无意义抖动） */
@@ -59,11 +70,11 @@ export interface TrimOptions {
    */
   force?: boolean;
   /**
-   * 本次最多裁掉多少个节点（`force` 时生效）。
+   * 本次最多裁掉多少个节点。
    *
    * ## 为什么必须有上限
    *
-   * 原实现 force 时把 `[startIdx, endIdx]` 整段一次替换掉。实测
+   * 原实现把 `[startIdx, endIdx]` 整段一次替换掉。实测
    * （session-e1419190）：
    *
    * ```
@@ -74,8 +85,16 @@ export interface TrimOptions {
    * 每次都是「一次性重写整段前缀」—— KV 缓存按前缀复用，这等于把
    * 缓存全部作废。而且裁完只剩 8 个保留节点，模型立刻丢失最近的工作脉络。
    *
-   * 改为每次只裁一部分（默认保留约 1/4 的待裁区间），代价分摊到多次：
-   * 单次缓存损失更小，且上下文始终保有较近的历史。
+   * 改为每次只裁一部分，代价分摊到多次。
+   *
+   * ## 两条触发路径都生效（不只是 force）
+   *
+   * 早期版本写「`force` 时生效」，理由是「token 超阈值说明真的太大」。
+   * 实测反驳：窗口 800K 时 trimMin 降到 8 万，节点数 114 就走 token 路径，
+   * 一次裁 104（91%），事故原样复发。所以现在无条件生效。
+   *
+   * 缺省（`undefined`）时由 `trimContext` 补 `DEFAULT_MAX_NODES_PER_RUN`，
+   * **不会退化成「不限制」** —— 那是事故形态本身。
    */
   maxNodesPerRun?: number;
 }
@@ -232,6 +251,77 @@ function toolDelta(event: unknown): number {
 }
 
 /**
+ * 归一化「节点数 / 保留数」这类配置。
+ *
+ * ## 为什么必须在函数入口做，而不是在调用方
+ *
+ * 这些值来自宿主 `cordis.patch.yml`，**不会**随插件升级自动补齐新字段，
+ * 且可能被写成字符串 / 小数 / `NaN`。两种失效形态已在真实事故里各出现过一次：
+ *
+ * ```
+ * '40'   → 隐式转数参与算术，限制完全失效
+ * NaN    → 比较恒 false，`n <= NaN+1` 漏过守卫，区间算出 seq=undefined
+ * 0.3    → 先 floor 成 0，再被判为非法 ⇒ 退化成「不限制」，一次裁光
+ * ```
+ *
+ * 上一版只在 `index.ts` 的调用方做收口，漏掉了同函数里的 `keepRecentNodes`
+ * —— 而 `trimContext` / `selectTrimRange` 都是导出函数，任何调用方都会继承这个洞。
+ * 收口放在入口才不会再漏。
+ *
+ * @param value - 原始值
+ * @param fallback - 非法时用的默认值
+ * @param min - 允许的最小值（含）
+ */
+export function normalizeCount(value: unknown, fallback: number, min = 0): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  if (value < 0) return fallback;
+  const floored = Math.floor(value);
+  // (0,1) 区间：配置写错（如 `0.3`）。**取 fallback，不要升到 1**。
+  //
+  // 上一版 `Math.max(min, floored)` 在 `min=0` 时给出 0，于是
+  // `keepRecentNodes=0.3` ⇒ 保留 0 个节点 ⇒ 192 节点裁 188（97.9%），
+  // 比事故的 92% 更激进。改成 `max(1, min)` 也只是「保留 1 个」，
+  // 仍是近乎全裁。
+  //
+  // 小数几乎只可能来自「单位换算写错」，正确处置是**当作没配**，
+  // 用默认值（keepRecent 默认 8），而不是猜一个极限值。
+  if (floored === 0 && value !== 0) return fallback;
+  return Math.max(min, floored);
+}
+
+/**
+ * 归一化「单次最多裁多少节点」。
+ *
+ * ## 与 `normalizeCount` 的区别：非法值必须退化到**安全侧**
+ *
+ * `maxNodes` 是**防事故的限流阀**（事故：一次裁 92%）。所以：
+ *
+ * | 输入 | 结果 | 理由 |
+ * |---|---|---|
+ * | `undefined` | `undefined`（不限制） | 正常缺省，token 触发路径就该整段裁 |
+ * | `40` / `'40'` | `40` | 字符串是宿主 patch 的真实形态，转数后接受 |
+ * | `0.3` / `0.5` | `1` | 不能 `floor` 成 0 后被当成「不限制」 |
+ * | `3.7` | `3` | 向下取整 |
+ * | `0` / `-5` / `NaN` / `Infinity` / `true` / `{}` | **40** | 非法 ⇒ 用默认上限 |
+ *
+ * **非法值绝不能退化成「不限制」** —— 那正是事故形态本身。
+ * 上一版在 `selectTrimRange` 里写 `normalizeCount(...) || undefined`，
+ * 于是 `'40'` 走 fallback=0、再被 `||` 变成 `undefined` ⇒ 真实 145 节点
+ * surface 上裁 135（等于不限制）。而 e2e 还把「视为不限制」写成了期望值，
+ * 等于把事故根因固化成回归锁。
+ *
+ * @param value - 宿主传来的原始值
+ * @returns 归一化后的上限；`undefined` 表示不限制
+ */
+export function normalizeMaxNodes(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const asNumber =
+    typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
+  if (!Number.isFinite(asNumber) || asNumber <= 0) return DEFAULT_MAX_NODES_PER_RUN;
+  return Math.max(1, Math.floor(asNumber));
+}
+
+/**
  * 选一段可安全裁剪的旧历史。
  *
  * `cut[i]` 表示「第 i 个节点之前的切点是否平衡」，`cut[n]` 是尾部切点。
@@ -249,22 +339,12 @@ export function selectTrimRange(
   keepRecentNodes: number,
   maxNodes?: number,
 ): TrimRange | null {
-  // **规范化 maxNodes**：这是本轮新增、且宿主 patch 里通常没有的字段。
-  //
-  // 实测三种失效形态（与本项目历史 `baseMs * 2**n` 得 NaN 同类）：
-  // ```
-  // maxNodes='40'    → 裁 139（限制完全失效，隐式转数后越界）
-  // maxNodes=40.5    → null（完全裁不动）
-  // maxNodes=NaN     → 裁 191（限制完全失效）
-  // ```
-  // 故在入口收口，任何非正整数一律视为「不限制」，绝不参与算术。
-  const limit =
-    typeof maxNodes === 'number' && Number.isFinite(maxNodes) && maxNodes > 0
-      ? Math.floor(maxNodes)
-      : undefined;
+  // 两个入参都在这里收口（理由见 `normalizeCount` / `normalizeMaxNodes`）。
+  const keep = normalizeCount(keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
+  const limit = normalizeMaxNodes(maxNodes);
 
   const n = nodes.length;
-  if (n <= keepRecentNodes + 1) return null;
+  if (n <= keep + 1) return null;
 
   const cut: boolean[] = new Array(n + 1).fill(false);
   let running = 0;
@@ -279,7 +359,7 @@ export function selectTrimRange(
   // 顺序与原来一致：先确定一个**可用的**尾部边界，再据此限定起点。
   // 不能先定起点：若边界处节点不可替换（大量 injected 消息），
   // 先算起点会一路加到边界之外直接返回 null，而实际上往回收一步就能裁。
-  const hardEnd = n - keepRecentNodes - 1;
+  const hardEnd = n - keep - 1;
   let endIdx = hardEnd;
   while (
     endIdx >= 0 &&
@@ -304,35 +384,62 @@ export function selectTrimRange(
   // 裁掉的节点数 = endIdx - startIdx + 1。渐进裁剪把单次规模压到
   // maxNodes 以内，避免「一次重写整段前缀」把 KV 缓存全部作废。
   if (limit !== undefined && endIdx - startIdx + 1 > limit) {
-    // 收缩终点：从 startIdx 起，取**连续**的第 limit 个可替换节点。
+    // ## 单位是「节点数」，不是「可替换节点数」
     //
-    // ## 为什么必须连续
+    // `compactRegion(start, end)` 替换的是**整个连续区间**，
+    // 区间里夹着的 tool/call、step/start、job 等节点都会被一并折进摘要。
+    // 所以预算就是区间长度 `endIdx - startIdx + 1`。
     //
-    // `compactRegion(start, end)` 会把 [start, end] 整个区间换掉。
-    // 区间里若夹着 injected / system 节点，宿主的 surface 校验会拒绝
-    // （那些节点不允许被替换）。所以收缩后的终点不能跨过不可替换节点。
+    // 我上一版把它误解成「数够 limit 个可替换节点」，在真实 surface 上
+    // （session-e1419190，145 节点里约 127~135 个可替换）导致数不到 limit，
+    // 直接退化成整段裁剪（裁 126 个）—— 等于 40 的限制完全失效。
     //
-    // ## 为什么不能简单 `startIdx + limit - 1`
+    // 也不能要求「连续可替换」（再上一版）：节点 [0] 是 compact-checkpoint，
+    // [1] 是 compaction/end（不可替换），首轮 break ⇒ 只裁 1 个，
+    // `force` 每 10 步减 1 而每步新增 2.8，上下文持续膨胀。
     //
-    // 实测（182 节点，中间夹 60 个 injected）：那样会退到只剩 2 个节点，
-    // 把 40 的预算浪费成 2，渐进裁剪形同停摆。
-    // 这里改为「数到 limit 个可替换就停」，遇到不可替换则就地结束。
-    let taken = 0;
-    let lastEligible = -1;
-    for (let cursor = startIdx; cursor <= endIdx; cursor += 1) {
-      if (cut[cursor + 1] !== true || !isTrimBoundaryEligible(events[nodes[cursor] as number])) {
-        break; // 遇到不可替换/不平衡：区间到此为止，不能跨过
-      }
-      lastEligible = cursor;
-      taken += 1;
-      if (taken >= limit) break;
+    // 正确做法：**直接按区间长度切**，再回退到最近的平衡切点。
+    let want = Math.min(endIdx, startIdx + limit - 1);
+
+    // 回退到最近的「切点平衡 + 端点可替换」位置
+    let e = want;
+    while (
+      e >= startIdx &&
+      (cut[e + 1] !== true || !isTrimBoundaryEligible(events[nodes[e] as number]))
+    ) {
+      e -= 1;
     }
-    // 收缩窗口内一个可用边界都没有 ⇒ 保持原 endIdx（退化为整段裁剪）。
-    //
-    // **不要 return null**：那会让 `trimContext` 返回 no-range，
-    // 而 `trimReasonsLogged` 每种原因只记一次 ⇒ 整场会话静默不再裁剪、
-    // 上下文无限增长且日志看着正常。这是本项目最典型的静默失效形态。
-    if (lastEligible >= startIdx) endIdx = lastEligible;
+
+    if (e >= startIdx) {
+      endIdx = e;
+    } else {
+      // 回退失败：向前找最近的可用切点（宁可多裁一点，
+      // 也不要退化为整段裁剪 —— 那会复现 92% 的老问题）。
+      //
+      // ## 但必须有硬上界
+      //
+      // 起点自身是**并行 tool-call**（一条 assistant 消息带 N 个 tool-call）时，
+      // `cut[startIdx+1..startIdx+N]` 全为 false，`[startIdx, want]` 内一个
+      // 合法位置都没有 —— 只能跳到并行段结束后。而「并行度 ≤ limit-2」是个
+      // **未经任何断言的隐式前提**：实测 40 并行时 limit=40 会裁 41，
+      // 100 并行时裁 101（2.5 倍）。
+      //
+      // 真实日志里最大并行度是 2（两份会话 tool-call 分布 {1:224,2:9}/{1:171,2:8}），
+      // 所以线上不可达；但 DSH 支持并行调用，模型行为一变就会引爆。
+      //
+      // 因此把越界限制在 2 倍预算内：超过就**不裁**（返回 null）。
+      // 让 `trimContext` 记 `no-range` 而不是静默多裁 —— 可观测优先于勉强完成任务。
+      const hardCap = Math.min(endIdx, startIdx + limit * 2 - 1);
+      let up = Math.max(want, startIdx);
+      while (
+        up <= hardCap &&
+        (cut[up + 1] !== true || !isTrimBoundaryEligible(events[nodes[up] as number]))
+      ) {
+        up += 1;
+      }
+      if (up > hardCap) return null;
+      endIdx = up;
+    }
   }
 
   return {
@@ -960,7 +1067,7 @@ export function pruneToolCallArguments(deps: {
   const { agent, log } = deps;
   const thresholdChars = deps.options?.thresholdChars ?? 4000;
   const headChars = deps.options?.headChars ?? 2000;
-  const keepRecentNodes = deps.options?.keepRecentNodes ?? 8;
+  const keepRecentNodes = normalizeCount(deps.options?.keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
 
   const session = (agent as { session?: unknown })?.session;
   if (session === undefined) return { ok: false, reason: 'no-session' };
@@ -1003,7 +1110,7 @@ export function pruneReasoning(deps: {
   options?: Partial<PruneReasoningOptions>;
 }): PruneOutcome {
   const { agent, log } = deps;
-  const keepRecentNodes = deps.options?.keepRecentNodes ?? 8;
+  const keepRecentNodes = normalizeCount(deps.options?.keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
 
   const session = (agent as { session?: unknown })?.session;
   if (session === undefined) return { ok: false, reason: 'no-session' };
@@ -1113,9 +1220,26 @@ export async function trimContext(deps: {
     nodes,
     events,
     options.keepRecentNodes,
-    // 只在 force（节点数超限）时限制单次规模：token 超阈值是「真的太大了」，
-    // 该一次裁够；而节点数超限是常态兜底，必须摊开裁，否则每次重写整段前缀。
-    options.force ? options.maxNodesPerRun : undefined,
+    // **两条触发路径都必须限流**。
+    //
+    // 上一版写 `force ? maxNodesPerRun : undefined`，理由是「token 超阈值
+    // 说明真的太大了，该一次裁够」。这个判断是错的：
+    //
+    // - 事故的伤害不来自「裁得不够」，而来自「一次重写整段前缀」——
+    //   KV 缓存按前缀复用，整段作废的代价与裁多少成正比。
+    // - 真实日志里同一个窗口（contextWindow=1M ⇒ trimMin≈10.5 万）下，
+    //   141 节点时刻 force 先触发；但窗口降到 800K 时 trimMin=8 万，
+    //   节点数 114 就触发 token 路径 ⇒ 一次裁 104（91%），事故原样复发。
+    // - 「一次裁够」并不会更快收敛：每步都有新节点进来，摊开裁同样能
+    //   把规模压下去，且缓存损失小得多。
+    //
+    // ## 默认值必须下沉到函数内部
+    //
+    // 可以写成 `options.maxNodesPerRun`，也可以让 `selectTrimRange` 的
+    // `undefined` 表示不限制 —— 但后者意味着**任何漏传的调用方都会精确
+    // 复现事故**（实测 141 节点 → 裁 129，91.5%）。限流阀的默认值不能
+    // 依赖「唯一装配点恰好传了」，所以这里自己补默认。
+    options.maxNodesPerRun ?? DEFAULT_MAX_NODES_PER_RUN,
   );
   if (range === null) {
     return {

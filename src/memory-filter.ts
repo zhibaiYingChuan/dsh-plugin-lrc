@@ -387,7 +387,8 @@ export function hardFilter(text: string): string {
 }
 
 /** 决策类词：从正文里识别「已经定下来的做法」。 */
-const DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|定为|选型|就用/;
+const DECISION_MARKERS =
+  /决定|决策|采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用/;
 
 /**
  * 正文里的**过程叙述**：第一人称正在做事，不是结论也不是约束。
@@ -410,19 +411,24 @@ const PROSE_NARRATION =
  *
  * 这类句子的共同点：描述**已发生**或**即将做**，而不是**必须遵守**。
  *
- * ## ⚠️ 不能用裸字 `过`
+ * ## 不能用裸字，也不能用常见连接词
  *
- * 首版写成 `/(?:过|正在|...)/`，结果把「必须**通过** --stdin 传入」
- * 「禁止**通过** IDM 下载」「不要**跳过**校验」「必须**经过** 3111」
- * 全部当成过去时误杀 —— 6/6 真实约束被丢弃。这些都是最常见的
- * 执行方式约束，恰好是最高价值的一类。
+ * 两轮都栽在这里：
  *
- * 所以「过去时」只能用**动词后置的时态标记**表达：`试过`、`用过`、
- * `已经…过`，而不是「过」这个字出现在任何位置。
+ * 1. **裸字 `过`**：把「必须**通过** --stdin」「禁止**通过** IDM」
+ *    「不要**跳过**校验」全部当过去时误杀（6/6）。
+ * 2. **裸词 `然后/接着/已经`**：把「必须先把音频放到 assets，**然后**用
+ *    --file 传入」「必须用 --stdin，**然后**再验证」「不要走 IDM，**已经**
+ *    说过两次」全部误杀（6/6）。而「先做 A 再做 B」正是执行方式约束的
+ *    最常见形态。
+ *
+ * 判定原则：**有情态词的句子就是约束**，时态词不应覆盖情态词。
+ * 所以这里只保留真正表示「过去时/进行中」的标记，且必须紧跟在动词后
+ * 或作为句首状语。
  */
 const PAST_OR_PLANNING =
-  // 过去时：动词 + 过（且后面是句读/空白，不是「滤/程/度」等构词）
-  /(?:试|用|碰|去|做|改|见|跑|查|看|读|写|装|删|加|调|测|验)过(?:[，。；\s]|$)|(?:正在|刚刚|刚才|已经|接着|然后)/;
+  // 仅「动词 + 过」且后接句读（排除 过滤/过程/过度 等构词）
+  /(?:试|用|碰|去|做|改|见|跑|查|看|读|写|装|删|加|调|测|验)过(?:[，。；\s]|$)|(?:刚刚|刚才)(?:试|装|跑|执行|验证|看了?)|(?:正在)|(?:目前|已经)(?:完成|安装|验证|确认|试过)/;
 
 /**
  * 真正的「约束」形态：情态/祈使/禁止。
@@ -432,7 +438,7 @@ const PAST_OR_PLANNING =
  * 这里只认**强制性**表述，用来区分「约束」与「状态」。
  */
 const STRONG_CONSTRAINT =
-  /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:不要|不会|不用|别|不能|禁止)(?:用|走|把|在|连|写|加|改|删|碰|跳|绕|省|忽)/;
+  /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:请勿|勿)(?:使用|用|走|通过|点击|下载)|(?:不要|不会|不用|别|不能|禁止)(?:再|再次|再一次|重复|继续)?(?:直接)?(?:使用|使|去|用|走|通过|把|在|连|写|加|改|删|碰|跳|绕|省|忽|下载|调用|点)/;
 
 /**
  * 从**正文**里抽取「约束 / 决策」（不依赖 `<lrc_memory>` 标签）。
@@ -483,7 +489,7 @@ export function constraintsFromProse(text: string, maxLines = 4): string[] {
   // 按句切（含中英文句读），逐句判定
   for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
     const line = raw.trim().replace(/^[-*+\d.)\s]+/, '').trim();
-    if (line.length < 8 || line.length > 200) continue;
+    if (line.length > 200) continue;
     if (isSmallTalk(line) || isOptionLabel(line) || looksLikeNormalLog(line)) continue;
     // 兜底：整段剥完围栏后仍以代码特征开头的行（如缩进 4 空格以上的代码）
     if (/^\s{4,}|^(?:const|let|var|function|class|import|export|def|fn)\s/.test(line)) continue;
@@ -493,28 +499,189 @@ export function constraintsFromProse(text: string, maxLines = 4): string[] {
     // 路径先挖掉再匹配，避免 `docs/禁止.md` 骗过判定
     const masked = maskPaths(line);
 
+    // ## 长度门槛分层：短约束不能被一刀切掉
+    //
+    // 原来统一要求 `length >= 8`，于是「不要跳过校验」（6 字）、
+    // 「不要走 IDM」（7 字）这类**最典型的短约束**整条被丢 ——
+    // 而它们正是用户最常说的形态（越短越像命令，越长越像叙述）。
+    //
+    // 现在：普通句子仍需 8 字；**命中强情态词的放宽到 4 字**
+    // （「别用 IDM」= 5 字也要能进）。
+    const strongHit = STRONG_CONSTRAINT.test(masked);
+    if (line.length < (strongHit ? 4 : 8)) continue;
+
     // 判定顺序有讲究：先认「决策」（改用/换成），再认「强约束」（必须/禁止）。
     //
-    // 不用宽泛的 `CONSTRAINT_WORDS`：实测那样会把「现在改用无 BOM 方式」
-    // 「缓存必须放在工作区外」之外的大量**状态陈述**也捞进来
+    // 不用宽泛的 `CONSTRAINT_WORDS`：实测那样会把大量**状态陈述**也捞进来
     // （"这个 CLI 现在能启动了"、"刚刚安装完成"），
-    // 覆盖率 25% 看似变好，实际一半是噪声。
+    // 覆盖率看似变好，实际一半是噪声。
     const isDecision = DECISION_MARKERS.test(masked);
     const isConstraint = STRONG_CONSTRAINT.test(masked);
     if (!isDecision && !isConstraint) continue;
 
-    // 决策句即使带「了/现在」也要留（"已改用 --stdin" 是有价值的决策）；
-    // 约束句若含过去/计划语气，多半是状态描述，丢掉。
-    if (!isDecision && PAST_OR_PLANNING.test(masked)) continue;
+    // **情态词优先于时态词**：带「必须/禁止/不要」的句子就是约束，
+    // 即使句中有「然后/已经/现在」。
+    //
+    // 实测误杀（两轮各一批）：
+    // 「必须先把音频放到 assets，然后用 --file 传入」← 被「然后」杀掉
+    // 「不要走 IDM 下载，已经说过两次了」        ← 被「已经」杀掉
+    // 「必须用 --stdin 传入，然后再验证一次」      ← 被「然后」杀掉
+    // 而「先做 A 再做 B」正是执行方式约束最常见的形态。
+    //
+    // 时态排除只对**纯状态陈述**生效：不含强情态词、只靠 DECISION_MARKERS
+    // 里的弱词（如「就用」）命中的句子。
+    if (!isConstraint && PAST_OR_PLANNING.test(masked)) continue;
 
-    const kind = isDecision ? '决策' : '约束';
+    const kind = isDecision && !isConstraint ? '决策' : '约束';
     const body = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, '').trim();
-    if (body.length < 6) continue;
+    // 同样的分层：「不要走 IDM」去掉标点后只有 9 字符，强约束不该被再砍一刀
+    if (body.length < (strongHit ? 4 : 6)) continue;
 
     const key = body.replace(/\s+/g, '');
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(`${kind}：${body}`);
+    if (out.length >= maxLines) break;
+  }
+  return out;
+}
+
+/**
+ * 用户**纠正 / 重申**的句式标记。
+ *
+ * ## 为什么单列这一类
+ *
+ * `hasConstraintMarker` 只认「必须/禁止/不要」这类命令式词。而真实会话里，
+ * 用户最关键的约束往往是用**反问句**表达的纠正 —— 实测（session-e1419190）：
+ *
+ * ```
+ * seq=1682 「不是告诉你音频在的位置了吗？你一点击下载，就会调取桌面的
+ *            IDM 的下载软件…」
+ * ```
+ *
+ * 这一条三重落空：`hasConstraintMarker=false`（没有命令式词）、
+ * `linesFromSession` 收不到、模型也从未在正文复述 ⇒ 约束从未入库，
+ * 下一轮模型照旧去点下载链接。
+ *
+ * 反问句是**最强的纠正信号**：它在指出「我已经说过了」。这类句子必须入库。
+ */
+const USER_CORRECTION =
+  // 必须**有第二人称指向 + 完成态**（你）或「说过 N 次」的明确重申。
+  //
+  // ## 收得多紧，为什么
+  //
+  // `index.ts` 里这条路径直接 migrate 进长期记忆，**无法撤回**，
+  // 且 `recall` 会把它当「用户约束」反复召回。而用户消息量远大于
+  // assistant 正文，误收代价不对称。
+  //
+  // 两次收紧的实测依据：
+  // 1. 裸 `不是说` → 「不是 X，是 Y」解释句 4/4 误收（见 `NEGATION_EXPLANATION`）。
+  // 2. 裸 `我跟你说` → 寒暄/开场白 4/4 误收：
+  //    「我跟你说一下，这个视频还要改」「我跟你说，这个音频就在桌面」
+  //    「你再说一次刚才那个命令」「我说过两次了，你怎么还这样」
+  //    因此 `我跟你说` 必须带**完成/指向**后缀（说过 / 的是），
+  //    `再说一次` 必须后接否定或更正，不能是「请再说一遍」。
+  /(?:不是(?:已经)?(?:告诉|跟|给|对)(?:过)?你)|(?:我(?:已经|早就)?(?:跟你说过|告诉过你|讲过|强调过|说的是|要的是))|(?:说(?:过|了)(?:两|三|好几|\d+)次)|(?:强调|重申)(?:过|一?次)/;
+
+/**
+ * 用户消息是否在「质疑模型的具体行为」。
+ *
+ * ## 为什么需要这道闸门
+ *
+ * 纠正句的共性不是句式，而是**指向模型的错误动作**：
+ * 「你一点击下载，就会调取 IDM」—— 有第二人称 + 动作动词 + 否定/危害。
+ * 单纯「我跟你说…」只是开场白。
+ *
+ * 判据：同句含 `你`，且含「动作动词 + 否定/危害」或明确禁令。
+ * 这一条把「你再说一次刚才那个命令」这类也挡掉（提问，不是纠正）。
+ */
+function isBehaviorCorrection(text: string): boolean {
+  if (!/你/.test(text)) return false;
+  // 否定/危害信号：会调起、就会、会下载、不知道…哪、别再、不要、不能
+  const hasHarm =
+    /(?:就会|会(?:调起|调取|触发|下载|覆盖|删)|不知(?:道|会)|别再|不要|不能|禁止|必须|改用)/.test(text);
+  return hasHarm;
+}
+
+/**
+ * 「否定 + 转折解释」句式：`不是 X，是 Y` / `不是 X 而是 Y`。
+ *
+ * ## 为什么要排除
+ *
+ * `不是说` 这类片段在中文里**大量出现在解释句**中，与「纠正」无关：
+ * ```
+ * 这个不是说明书的写法，你去看一下第三章
+ * 这两个文件不是说明关系，是引用关系
+ * 不是说这个方案不行，是成本太高
+ * 我不是说我不同意，是说要先确认
+ * ```
+ * 实测 4/4 全部被误收成 `约束：…` 并 migrate 进长期记忆。
+ * 用户消息量远大于 assistant 正文，这条新通路一旦误收就无法撤回
+ * （`recall` 会把它当用户约束反复召回）。
+ *
+ * 判据：`不是` 之后出现 `，是` / `而是` / `是` 引导的转折，且**同句不含**
+ * 强情态词 —— 那是在解释，不是在立规矩。
+ */
+const NEGATION_EXPLANATION = /不是[^。！？；\n]{0,30}(?:，|,)?\s*(?:而是|是)[^。！？；\n]*/;
+
+/**
+ * 从**用户消息**里抽取约束（不依赖命令式词表）。
+ *
+ * ## 为什么不能复用 `constraintsFromProse`
+ *
+ * 那个函数是给 assistant 正文用的，它的判定核心是「强情态词」
+ * （必须/禁止/不要）。用户消息里最关键的约束常常没有这些词，
+ * 而是「不是告诉你…了吗」这种纠正句式 —— 实测唯一提到 IDM 的那条
+ * 用户消息因此完全没进沉淀源。
+ *
+ * ## 判定
+ *
+ * 按句切分，命中「纠正/重申」句式即入选；纠正句的**下一句**一并带上 ——
+ * 用户纠正后通常紧接着说正确做法（「你一点击下载就会调起 IDM」），
+ * 那才是可执行的信息。
+ *
+ * @param text - 用户消息正文
+ * @param maxLines - 最多返回几条
+ * @returns 形如 `约束：…` 的行（可直接喂 `itemsFromTag`）
+ */
+export function constraintsFromUser(text: string, maxLines = 3): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  const sentences = stripCodeFences(text)
+    .split(/[。！？；\n]+/)
+    .map((s) => s.trim().replace(/^[-*+\d.)\s]+/, '').trim())
+    .filter((s) => s.length >= 6 && s.length <= 200);
+
+  for (let i = 0; i < sentences.length; i += 1) {
+    const line = sentences[i] as string;
+    if (isSmallTalk(line) || looksLikeNormalLog(line)) continue;
+    const masked = maskPaths(line);
+    // 命令式约束已在 `hasConstraintMarker` 那条路上处理；这里只补纠正句式
+    if (!USER_CORRECTION.test(masked)) continue;
+
+    // 纠正句后面那句通常是「正确做法」（「你一点击下载就会调起 IDM」），
+    // 判定与入库都必须把它算进来：真实那条 IDM 消息被 `？` 切成两句，
+    // 纠正句式在前句、危害描述在后句，只看单句会把行为闸门判错。
+    const next = sentences[i + 1];
+    const nextUsable = next !== undefined && next.length >= 6 && next.length <= 120 && !isSmallTalk(next);
+    const window = nextUsable ? `${line}；${next}` : line;
+    const maskedWindow = maskPaths(window);
+
+    // 「不是 X，是 Y」是解释句，不是纠正 —— 除非同句另有强情态词
+    if (NEGATION_EXPLANATION.test(maskedWindow) && !STRONG_CONSTRAINT.test(maskedWindow)) continue;
+    // 必须指向模型的**具体行为**，否则只是开场白/提问（见 `isBehaviorCorrection`）
+    if (!isBehaviorCorrection(maskedWindow)) continue;
+
+    const body = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, '').trim();
+    const merged = nextUsable ? `${body}；${next}` : body;
+    // 句尾问号对入库无意义，去掉
+    const cleaned = merged.replace(/[？?]+$/, '').trim();
+    if (cleaned.length < 6) continue;
+    const key = cleaned.replace(/\s+/g, '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(`约束：${cleaned}`);
     if (out.length >= maxLines) break;
   }
   return out;
@@ -624,6 +791,103 @@ export function jaccard(a: string, b: string): number {
   return union === 0 ? 0 : inter / union;
 }
 
+/**
+ * 提取「取值型 token」：包名、端口、路径、文件名、参数等。
+ *
+ * 这些才是约束之间**真正的差异所在**：
+ * `必须用 pnpm` 与 `必须用 npm`、`必须用 3111` 与 `必须用 3113`。
+ */
+function valueTokens(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/[A-Za-z][A-Za-z0-9_.\-/\\]*|\d+/g)) {
+    const t = m[0].toLowerCase();
+    if (t.length >= 1) out.push(t);
+  }
+  return out;
+}
+
+/**
+ * 中文里「一个字的差别就翻转语义」的对立词对。
+ *
+ * ## 为什么需要单独一张表
+ *
+ * `valueTokens` 只抓 ASCII（包名/端口/路径），对**纯中文的取值差异**完全无感。
+ * 实测误判：
+ * ```
+ * j=0.917  「必须放在工作区之外…」 vs 「必须放在工作区之内…」   ← 语义相反
+ * j=0.875  「必须用中文回答」      vs 「必须用英文回答」        ← 语义相反
+ * ```
+ * 后果与 pnpm/npm 完全相同：`isDuplicate` 在**入库前**判重，
+ * 用户的更正直接不发 HTTP ⇒ LRC 里永远留着旧的那条，recall 反复召回错值。
+ *
+ * ## 判据
+ *
+ * 两条文本**各自包含对立词对中的不同一端** ⇒ 一定是不同约束。
+ * 只做二元对立，不做通用中文分词（那会显著抬高误判面）。
+ */
+const ANTONYM_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['之外', '之内'],
+  ['以外', '以内'],
+  ['中文', '英文'],
+  ['启用', '禁用'],
+  ['保留', '删除'],
+  ['删除', '保留'],
+  ['开头', '结尾'],
+  ['前面', '后面'],
+  ['之前', '之后'],
+  ['同步', '异步'],
+  ['包含', '排除'],
+];
+
+/**
+ * 两条文本是否在某个对立词对上取了**相反**的值。
+ *
+ * @returns 存在对立差异时返回该词对；否则 null
+ */
+function antonymConflict(a: string, b: string): [string, string] | null {
+  for (const [x, y] of ANTONYM_PAIRS) {
+    if ((a.includes(x) && b.includes(y)) || (a.includes(y) && b.includes(x))) return [x, y];
+  }
+  return null;
+}
+
+/**
+ * 判断两条内容是否「近似重复」。
+ *
+ * ## 为什么不能只用字符集 Jaccard
+ *
+ * 字符集对「同句式、差一两个取值」完全不敏感 —— 而这恰是约束最关键的
+ * 差异。实测误判（9/13）：
+ * ```
+ * 1.000  「必须用 pnpm」 vs 「必须用 npm」       ← 字符集合完全相同
+ * 1.000  「必须用 3111」 vs 「必须用 3113」
+ * 0.875  「缓存放 mh 目录」 vs 「缓存放 mh2 目录」
+ * ```
+ * 后果不只是快照去重，而是 `isDuplicate` 在**入库前**就丢掉：
+ * 用户说「改用 npm」，被判为复述直接不发 HTTP ⇒ LRC 里永远是旧值，
+ * 后续 recall 一直召回过期约束。
+ *
+ * ## 三层判据
+ *
+ * 1. **ASCII 取值 token 不同** ⇒ 不同（pnpm/npm、3111/3113）
+ * 2. **中文对立词取了相反端** ⇒ 不同（之外/之内、中文/英文）
+ * 3. 否则才用字符集 Jaccard 判近似（处理「工作区外」/「工作区之外」这类改写）
+ */
+export function areNearDuplicate(a: string, b: string, threshold: number): boolean {
+  const va = valueTokens(a);
+  const vb = valueTokens(b);
+  if (va.length > 0 && vb.length > 0) {
+    const sa = new Set(va);
+    const sb = new Set(vb);
+    const same = va.every((x) => sb.has(x)) && vb.every((x) => sa.has(x));
+    // 取值不同就是不同约束（pnpm vs npm、3111 vs 3113）
+    if (!same) return false;
+  }
+  // 中文对立词：语义翻转，绝不是「换措辞复述」
+  if (antonymConflict(a, b) !== null) return false;
+  return jaccard(a, b) >= threshold;
+}
+
 /** 默认查重阈值：与 LRC 的相似合并阈值一致。 */
 export const DEFAULT_DEDUP_THRESHOLD = 0.85;
 
@@ -640,5 +904,5 @@ export function isDuplicate(
 ): boolean {
   const t = text.trim();
   if (t.length === 0) return true;
-  return recent.some((r) => jaccard(r, t) >= threshold);
+  return recent.some((r) => areNearDuplicate(r, t, threshold));
 }
