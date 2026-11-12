@@ -249,6 +249,20 @@ export function selectTrimRange(
   keepRecentNodes: number,
   maxNodes?: number,
 ): TrimRange | null {
+  // **规范化 maxNodes**：这是本轮新增、且宿主 patch 里通常没有的字段。
+  //
+  // 实测三种失效形态（与本项目历史 `baseMs * 2**n` 得 NaN 同类）：
+  // ```
+  // maxNodes='40'    → 裁 139（限制完全失效，隐式转数后越界）
+  // maxNodes=40.5    → null（完全裁不动）
+  // maxNodes=NaN     → 裁 191（限制完全失效）
+  // ```
+  // 故在入口收口，任何非正整数一律视为「不限制」，绝不参与算术。
+  const limit =
+    typeof maxNodes === 'number' && Number.isFinite(maxNodes) && maxNodes > 0
+      ? Math.floor(maxNodes)
+      : undefined;
+
   const n = nodes.length;
   if (n <= keepRecentNodes + 1) return null;
 
@@ -289,17 +303,36 @@ export function selectTrimRange(
   //
   // 裁掉的节点数 = endIdx - startIdx + 1。渐进裁剪把单次规模压到
   // maxNodes 以内，避免「一次重写整段前缀」把 KV 缓存全部作废。
-  if (maxNodes !== undefined && maxNodes > 0 && endIdx - startIdx + 1 > maxNodes) {
-    // 收缩后终点仍需满足「切点平衡 + 可替换」，故继续往回收
-    let shrunk = startIdx + maxNodes - 1;
-    while (
-      shrunk >= startIdx &&
-      (cut[shrunk + 1] !== true || !isTrimBoundaryEligible(events[nodes[shrunk] as number]))
-    ) {
-      shrunk -= 1;
+  if (limit !== undefined && endIdx - startIdx + 1 > limit) {
+    // 收缩终点：从 startIdx 起，取**连续**的第 limit 个可替换节点。
+    //
+    // ## 为什么必须连续
+    //
+    // `compactRegion(start, end)` 会把 [start, end] 整个区间换掉。
+    // 区间里若夹着 injected / system 节点，宿主的 surface 校验会拒绝
+    // （那些节点不允许被替换）。所以收缩后的终点不能跨过不可替换节点。
+    //
+    // ## 为什么不能简单 `startIdx + limit - 1`
+    //
+    // 实测（182 节点，中间夹 60 个 injected）：那样会退到只剩 2 个节点，
+    // 把 40 的预算浪费成 2，渐进裁剪形同停摆。
+    // 这里改为「数到 limit 个可替换就停」，遇到不可替换则就地结束。
+    let taken = 0;
+    let lastEligible = -1;
+    for (let cursor = startIdx; cursor <= endIdx; cursor += 1) {
+      if (cut[cursor + 1] !== true || !isTrimBoundaryEligible(events[nodes[cursor] as number])) {
+        break; // 遇到不可替换/不平衡：区间到此为止，不能跨过
+      }
+      lastEligible = cursor;
+      taken += 1;
+      if (taken >= limit) break;
     }
-    if (shrunk < startIdx) return null;
-    endIdx = shrunk;
+    // 收缩窗口内一个可用边界都没有 ⇒ 保持原 endIdx（退化为整段裁剪）。
+    //
+    // **不要 return null**：那会让 `trimContext` 返回 no-range，
+    // 而 `trimReasonsLogged` 每种原因只记一次 ⇒ 整场会话静默不再裁剪、
+    // 上下文无限增长且日志看着正常。这是本项目最典型的静默失效形态。
+    if (lastEligible >= startIdx) endIdx = lastEligible;
   }
 
   return {

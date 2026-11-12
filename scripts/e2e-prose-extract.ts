@@ -8,7 +8,10 @@
  * 它抽错 = 沉淀垃圾；抽漏 = 约束丢失，下一轮模型重犯同样的错。
  */
 import { constraintsFromProse } from '../src/memory-filter.ts';
-import { buildSnapshot } from '../src/offloader.ts';
+import { Offloader, buildSnapshot } from '../src/offloader.ts';
+import { CursorStore } from '../src/cursor.ts';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { DistilledItem } from '../src/lrc-client.ts';
 
 let failed = 0;
@@ -51,6 +54,34 @@ console.log('=== 1b) 状态陈述应被排除 ===');
   ].join('\n');
   const got = constraintsFromProse(states);
   check('状态陈述全部被排除', got.length === 0, got);
+}
+
+// ── 1c) 「通过/经过/跳过」类约束不得被误杀 ──
+//
+// ★独立审查发现的 P0：首版把 `过` 当裸字过去时标记，
+// 结果「必须通过 --stdin」「禁止通过 IDM」「不要跳过校验」全部被丢掉（6/6）。
+// 这类「执行方式约束」恰是最高价值的一类。
+console.log('=== 1c) 通过/经过/跳过 类约束必须保留 ===');
+{
+  const cases = [
+    '必须通过 --stdin 传入 JSON',
+    '禁止通过 IDM 下载音频',
+    '所有请求必须经过 3111 端口',
+    '不要跳过 MD5 校验',
+    '只能通过 serviceFor 拿引擎',
+    '不要把缓存写到工作区，所以必须用外部目录',
+  ];
+  for (const c of cases) {
+    check(`保留「${c.slice(0, 20)}」`, constraintsFromProse(c).length > 0, constraintsFromProse(c));
+  }
+}
+
+// ── 1d) 标签内容不得被 prose 二次抽取 ──
+console.log('=== 1d) 标签不被二次抽取 ===');
+{
+  const withTag = '已完成。\n<lrc_memory>\n- 决策：最终交付 55 秒无声 mp4\n</lrc_memory>';
+  const got = constraintsFromProse(withTag);
+  check('标签内决策不被 prose 重复抽', !got.some((g) => g.includes('55 秒')), got);
 }
 
 // ── 2) 过程叙述不得被当成约束 ──
@@ -116,6 +147,68 @@ console.log('=== 7) 快照优先级 ===');
   check('约束排在第一条', snap.includes('不要用 IDM'), snap);
   check('决策排在第二条', snap.includes('改用 --stdin'), snap);
   check('结论被挤掉（优先级最低）', !snap.includes('CLI 已安装'), snap);
+}
+
+// ── 7b) 跨批累积：约束不得被下一条过程记录顶掉 ──
+//
+// ★独立审查发现的 P0-3：`buildSnapshot` 只对**传入的那一批**排序，
+// 而真实调用每次只传 1~2 条 —— 排序退化为原序，约束被逐条覆盖。
+// 回放整场会话，5 条关键约束在最终注入里全部丢失。
+// 修法是 `Offloader.snapshotPool` 跨批累积。
+console.log('=== 7b) 跨批累积 ===');
+{
+  const off = new Offloader(null, new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}.json`)), {
+    snapshotItems: 3,
+  });
+  // buildPooledSnapshot 是私有方法，测试里按结构访问
+  const pool = off as unknown as { buildPooledSnapshot: (i: DistilledItem[]) => string };
+  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  });
+
+  const a = pool.buildPooledSnapshot([mk('[约束] 缓存必须放在工作区之外', 'preference', ['constraint'])]);
+  const b = pool.buildPooledSnapshot([mk('[决策] 改用 --stdin', 'decision', ['decision'])]);
+  const c2 = pool.buildPooledSnapshot([mk('[结论] MD5 一致', 'fact', ['conclusion'])]);
+  console.log(`    批1: ${a}`);
+  console.log(`    批2: ${b}`);
+  console.log(`    批3: ${c2}`);
+  check('第 2 批仍保留第 1 批的约束', b.includes('工作区'), b);
+  check('第 3 批仍保留最早的约束', c2.includes('工作区'), c2);
+  check('第 3 批仍保留决策', c2.includes('--stdin'), c2);
+
+  // 再来一条约束：跨类轮转下**不会**把结论挤掉（那是刻意保留多样性），
+  // 但约束本身必须进得去
+  const d = pool.buildPooledSnapshot([mk('[约束] 不要走下载链接', 'preference', ['constraint'])]);
+  console.log(`    批4: ${d}`);
+  check('新约束能进快照', d.includes('下载链接'), d);
+
+  // ★真实回放问题：同质约束会占满所有槽位，把不同类的决策挤掉
+  // （三条都在说「缓存放工作区外」，而 --stdin 进不来）
+  check('不同类别的决策仍能露脸', d.includes('--stdin') || d.includes('改用'), d);
+
+  // 会话切换清空
+  off.resetSnapshotPool();
+  const e = pool.buildPooledSnapshot([mk('[结论] 新会话', 'fact', ['conclusion'])]);
+  check('resetSnapshotPool 后不含旧约束', !e.includes('工作区'), e);
+}
+
+// ── 7c) 跨类轮转：同质条目不得占满槽位 ──
+console.log('=== 7c) 跨类轮转 ===');
+{
+  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  });
+  // 三条同义约束（都在说「缓存放工作区外」）+ 一条决策
+  const items: DistilledItem[] = [
+    mk('[约束] 缓存必须放在工作区之外', 'preference', ['constraint']),
+    mk('[约束] 所以缓存必须放在工作区外', 'preference', ['constraint']),
+    mk('[约束] 缓存必须在工作区之外', 'preference', ['constraint']),
+    mk('[决策] 改用 --stdin 传入', 'decision', ['decision']),
+  ];
+  const snap = buildSnapshot(items, 2);
+  console.log(`    快照: ${snap}`);
+  check('同义约束只保留一条', (snap.match(/工作区/g) ?? []).length === 1, snap);
+  check('决策能进前两位', snap.includes('--stdin'), snap);
 }
 
 // ── 8) 快照：只有结论时仍能输出 ──

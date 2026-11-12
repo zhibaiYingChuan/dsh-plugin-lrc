@@ -570,6 +570,24 @@ check('force 跳过 token 阈值', forced.ok === true && forced.reason === 'ok',
   check('maxNodesPerRun 真的限制了单次规模', limitedCount > 0 && limitedCount <= 3, limitedCount);
   check('不限制时裁得更多', unlimitedCount > limitedCount, { limitedCount, unlimitedCount });
   check('渐进裁剪不是一次砍光', limitedCount < unlimitedCount, { limitedCount, unlimitedCount });
+
+  // ★独立审查发现：`maxNodesPerRun` 非正整数时三种失效形态
+  // （'40' → 限制失效裁 139；40.5 → 返回 null 完全裁不动；NaN → 限制失效）
+  const badCases: Array<[string, unknown]> = [
+    ['字符串 "40"', '40'],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['负数', -5],
+    ['0', 0],
+  ];
+  for (const [label, value] of badCases) {
+    const r = selectTrimRange(nodes, events, 2, value as number);
+    const c = r === null ? 0 : r.endIdx - r.startIdx + 1;
+    check(`${label} 视为不限制且不返回 null`, r !== null && c === unlimitedCount, { c, want: unlimitedCount });
+  }
+  // 小数应向下取整，而不是参与非法算术
+  const frac = selectTrimRange(nodes, events, 2, 3.7);
+  check('小数 3.7 向下取整为 3', frac !== null && frac.endIdx - frac.startIdx + 1 <= 3, frac);
 }
 
 const okEngine = makeEngine(100000);

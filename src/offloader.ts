@@ -27,6 +27,7 @@ import {
   hardFilter,
   isDuplicate,
   isNoUpdate,
+  jaccard,
   maskPaths,
 } from './memory-filter.ts';
 
@@ -129,28 +130,123 @@ export interface OffloadStats {
  */
 export function buildSnapshot(items: DistilledItem[], maxItems: number): string {
   if (items.length === 0) return '';
+  // 跨类轮转 + 同类去近似重复：单纯「按类别排序后取前 N 条」会让
+  // 同质条目（三条都在说「缓存放工作区外」）占满全部槽位，
+  // 把不同类的有效决策全挤掉。实测见 `pickDiverseSnapshot` 注释。
+  const picked = pickDiverseSnapshot(items, maxItems);
+  if (picked.length === 0) return '';
+  return `[LRC 状态] ${picked.join('；')}。细节在 LRC，需要时 recall。`;
+}
 
-  // 按「约束(0) → 决策(1) → 结论(2) → 事实(3)」稳定排序，
-  // 同优先级保持原顺序（即新到旧）。
+/**
+ * 快照取词时**跨类轮转**，避免同类同质条目占满所有槽位。
+ *
+ * ## 实测问题
+ *
+ * 真实会话回放（session-e1419190）的最终快照：
+ * ```
+ * [LRC 状态] 所以缓存必须放在工作区外；只有普通主体（SYSTEM、Administrators…）
+ *           的目录才会被接受…；缓存必须在工作区之外。
+ * ```
+ *
+ * 三条全是「缓存要放工作区外」的**同一件事的不同说法**，而
+ * `改用 --stdin`、`改用 --file`、`无 BOM 写入` 这些**不同**的有效决策
+ * 全被挤掉 —— 快照的信息密度和没排序时一样差。
+ *
+ * 根因：排序只按「类别优先级」，同类别内部完全按加入顺序，
+ * 于是同质条目会连号占满。
+ *
+ * ## 做法
+ *
+ * 先按类别优先级分组，再**轮转取**（约束取 1 条 → 决策取 1 条 → 结论 1 条
+ * → 约束再取 1 条…），保证不同类别都有机会露脸。
+ * 同类别内部再用字符级相似度去掉近似重复（「缓存必须放在工作区外」
+ * 与「缓存必须在工作区之外」只保留一条）。
+ *
+ * @param items - 候选池
+ * @param maxItems - 最多输出几条
+ */
+export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): string[] {
+  if (items.length === 0 || maxItems <= 0) return [];
+
   const rank = (item: DistilledItem): number => {
     if (item.memory_type === 'preference' || item.tags?.includes('constraint')) return 0;
     if (item.memory_type === 'decision' || item.tags?.includes('decision')) return 1;
     if (item.tags?.includes('conclusion')) return 2;
     return 3;
   };
-  const ordered = items
-    .map((item, index) => ({ item, index, rank: rank(item) }))
-    .sort((a, b) => (a.rank !== b.rank ? a.rank - b.rank : a.index - b.index))
-    .map((x) => x.item);
 
-  const picked = ordered.slice(0, maxItems).map((item) => {
-    // 去掉 `[决策] ` 这类前缀，快照里用更短的标签
-    const body = item.content.replace(/^\[[^\]]+\]\s*/, '');
-    // 40 字符会把中文结论截成半句（实测快照读起来像噪声），放宽到 120。
-    const short = body.length > 120 ? `${body.slice(0, 120)}…` : body;
-    return short;
-  });
-  return `[LRC 状态] ${picked.join('；')}。细节在 LRC，需要时 recall。`;
+  // 分组（保持各组内原顺序 = 新到旧）
+  const groups = new Map<number, DistilledItem[]>();
+  for (const item of items) {
+    const r = rank(item);
+    const list = groups.get(r) ?? [];
+    list.push(item);
+    groups.set(r, list);
+  }
+
+  const bodyOf = (item: DistilledItem): string =>
+    item.content.replace(/^\[[^\]]+\]\s*/, '').trim();
+  const keyOf = (s: string): string => s.replace(/[\s，。；：、！？（）()"'`*]/g, '');
+
+  const picked: string[] = [];
+  const pickedKeys: string[] = [];
+  const cursor = new Map<number, number>();
+
+  // 轮转取词：**只在前两类（约束、决策）之间轮转**，结论/事实仅用于填空位。
+  //
+  // ## 为什么不能对所有类别都轮转
+  //
+  // 实测：`maxItems=3` 时若让「约束/决策/结论」各占一条，新加入的高价值
+  // 约束（「不要走下载链接」）就进不来 —— 因为结论虽然优先级最低，
+  // 却在第一轮就锁定了第三个槽位。
+  // 约束和决策是**跨轮有效**的，结论/事实多半**当轮有效**，
+  // 让后者挤掉前者是本末倒置。
+  const order = [...groups.keys()].sort((a, b) => a - b);
+  const HIGH = order.filter((r) => r <= 1);
+  const LOW = order.filter((r) => r > 1);
+
+  let progress = true;
+  while (picked.length < maxItems && progress) {
+    progress = false;
+    for (const r of HIGH) {
+      if (picked.length >= maxItems) break;
+      const list = groups.get(r) ?? [];
+      let i = cursor.get(r) ?? 0;
+      // 跳过与已选内容近似重复的（同义改写）
+      while (i < list.length) {
+        const body = bodyOf(list[i]);
+        const key = keyOf(body);
+        const dup = pickedKeys.some((p) => jaccard(p, key) >= 0.75);
+        i += 1;
+        if (key.length > 0 && !dup) {
+          picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+          pickedKeys.push(key);
+          progress = true;
+          break;
+        }
+      }
+      cursor.set(r, i);
+    }
+  }
+
+  // 高价值类别取完仍有空位 ⇒ 用结论/事实补满
+  for (const r of [...LOW, ...HIGH]) {
+    if (picked.length >= maxItems) break;
+    const list = groups.get(r) ?? [];
+    let i = cursor.get(r) ?? 0;
+    while (i < list.length && picked.length < maxItems) {
+      const body = bodyOf(list[i]);
+      const key = keyOf(body);
+      i += 1;
+      if (key.length === 0) continue;
+      if (pickedKeys.some((p) => jaccard(p, key) >= 0.75)) continue;
+      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+      pickedKeys.push(key);
+    }
+    cursor.set(r, i);
+  }
+  return picked;
 }
 
 /**
@@ -256,6 +352,30 @@ export class Offloader {
   private pendingSteps = 0;
   /** 最近已发送的块，用于本地查重（跨会话共享，避免重复入库） */
   private recent: string[] = [];
+  /**
+   * 快照候选池（**跨批累积**，上限 20）。
+   *
+   * ## 为什么必须跨批累积
+   *
+   * 实测（session-e1419190 回放，完全按真实调用时序）：
+   * ```
+   * 第 1 批 items=1 → [LRC 状态] 缓存必须放在工作区之外
+   * 第 2 批 items=1 → [LRC 状态] 网络直连失败，改用搜索      ← 第 1 批被覆盖
+   * 第 3 批 items=1 → [LRC 状态] 改用 --stdin 传入          ← 第 2 批被覆盖
+   * 第 4 批 items=1 → [LRC 状态] 改用 --file 传入
+   * ```
+   *
+   * `buildSnapshot` 只对**传入的那一批**排序。而真实调用每次都只传
+   * 当前这一条消息抽出的 1~2 条 —— 此时「按约束优先排序」在数学上
+   * 等于「原序」，与修复前的 `slice(0, maxItems)` 完全等价。
+   * 整场会话结束时，5 条关键约束全部丢失，只剩最后一条当轮内容。
+   *
+   * 累积后排序才真正有意义：约束能长期占据快照槽位，而不是被
+   * 下一条无关的过程记录顶掉。
+   */
+  private snapshotPool: DistilledItem[] = [];
+  /** 快照池上限：够覆盖「跨轮有效的约束」，又不至于让注入文本无限增长 */
+  private readonly snapshotPoolMax = 20;
   /** 累计统计（`lrc_status` 用） */
   private flushCount = 0;
   private totalWritten = 0;
@@ -345,6 +465,38 @@ export class Offloader {
     this.pendingTurns = 0;
     this.pendingChars = 0;
     this.pendingSteps = 0;
+  }
+
+  /**
+   * 清空快照池（**会话切换时必须调用**）。
+   *
+   * 池子里装的是本会话的约束/决策，换会话后不能继续注入 ——
+   * 那与 `bindSnapshotToSession` 防的跨会话泄漏是同一类问题。
+   */
+  resetSnapshotPool(): void {
+    this.snapshotPool = [];
+  }
+
+  /**
+   * 把新条目并入池子，再用**整个池子**生成快照。
+   *
+   * 为什么不能只对新条目排序：真实调用每次只传 1~2 条，
+   * 此时排序退化为原序，约束照样被下一批过程记录顶掉（见 `snapshotPool`）。
+   */
+  private buildPooledSnapshot(items: DistilledItem[]): string {
+    // 按内容去重（同一约束可能被多轮重复提到），保持「新的在前」
+    const seen = new Set(this.snapshotPool.map((i) => i.content.replace(/\s+/g, '')));
+    for (const item of items) {
+      const key = item.content.replace(/\s+/g, '');
+      if (key.length === 0 || seen.has(key)) continue;
+      seen.add(key);
+      this.snapshotPool.push(item);
+    }
+    // 超限时丢最旧的（数组前端），保证池子不会无限涨
+    if (this.snapshotPool.length > this.snapshotPoolMax) {
+      this.snapshotPool = this.snapshotPool.slice(-this.snapshotPoolMax);
+    }
+    return buildSnapshot(this.snapshotPool, this.config.snapshotItems);
   }
 
   /** 累计沉淀统计（`lrc_status` 用）。 */
@@ -485,7 +637,7 @@ export class Offloader {
       written,
       merged,
       deduped,
-      snapshot: buildSnapshot(items, this.config.snapshotItems),
+      snapshot: this.buildPooledSnapshot(items),
       reset: slice.reset,
     };
     this.record(result);
@@ -538,7 +690,7 @@ export class Offloader {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
-      snapshot: buildSnapshot(fresh, this.config.snapshotItems),
+      snapshot: this.buildPooledSnapshot(fresh),
       reset: false,
     };
     this.record(result);

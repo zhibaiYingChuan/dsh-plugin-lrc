@@ -171,8 +171,12 @@ export async function runGovernor(deps: {
       const outcome = state.lastOutcome[name];
       if (outcome === undefined) return name;
       if (outcome.ok) return name;
-      // 未生效的原因压成短标签，避免日志过长
-      const short = outcome.reason.split(':')[0] ?? outcome.reason;
+      // `error:` 保留完整内容：`error:node 0 holds the system prompt`
+      // 与 `error` 对排障是天壤之别（前者直接指出根因）。
+      // 其余（below-threshold / no-range / engine-unavailable）压成短标签。
+      const short = outcome.reason.startsWith('error')
+        ? outcome.reason
+        : (outcome.reason.split(':')[0] ?? outcome.reason);
       return `${name}(${short})`;
     });
     log(`[lrc][governor] 第 ${state.steps} 步执行：${annotated.join(' → ')}`);

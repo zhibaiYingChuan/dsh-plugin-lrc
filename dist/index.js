@@ -1146,12 +1146,15 @@ function hardFilter(text) {
 }
 var DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|定为|选型|就用/;
 var PROSE_NARRATION = /^(?:我(?:先|来|去|再|正在|会先)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:检查|查看|读取|尝试|运行)(?:一下|下)/;
-var PAST_OR_PLANNING = /(?:过|正在|刚刚|刚才|目前|已经|接着|然后|所以|因此|但是|不过|可是)|(?:了[，。；\s]|了$)/;
-var STRONG_CONSTRAINT = /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:不要|不会|不用|别|不能)(?:用|走|把|在|连|写|加|改|删|碰|连)/;
+var PAST_OR_PLANNING = (
+  // 过去时：动词 + 过（且后面是句读/空白，不是「滤/程/度」等构词）
+  /(?:试|用|碰|去|做|改|见|跑|查|看|读|写|装|删|加|调|测|验)过(?:[，。；\s]|$)|(?:正在|刚刚|刚才|已经|接着|然后)/
+);
+var STRONG_CONSTRAINT = /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:不要|不会|不用|别|不能|禁止)(?:用|走|把|在|连|写|加|改|删|碰|跳|绕|省|忽)/;
 function constraintsFromProse(text, maxLines = 4) {
   const out = [];
   const seen = /* @__PURE__ */ new Set();
-  const body = stripCodeFences(text);
+  const body = stripMemoryTag(stripCodeFences(text));
   for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
     const line = raw.trim().replace(/^[-*+\d.)\s]+/, "").trim();
     if (line.length < 8 || line.length > 200) continue;
@@ -1250,19 +1253,71 @@ var DEFAULT_OFFLOAD_CONFIG = {
 };
 function buildSnapshot(items, maxItems) {
   if (items.length === 0) return "";
+  const picked = pickDiverseSnapshot(items, maxItems);
+  if (picked.length === 0) return "";
+  return `[LRC 状态] ${picked.join("；")}。细节在 LRC，需要时 recall。`;
+}
+function pickDiverseSnapshot(items, maxItems) {
+  if (items.length === 0 || maxItems <= 0) return [];
   const rank = (item) => {
     if (item.memory_type === "preference" || item.tags?.includes("constraint")) return 0;
     if (item.memory_type === "decision" || item.tags?.includes("decision")) return 1;
     if (item.tags?.includes("conclusion")) return 2;
     return 3;
   };
-  const ordered = items.map((item, index) => ({ item, index, rank: rank(item) })).sort((a, b) => a.rank !== b.rank ? a.rank - b.rank : a.index - b.index).map((x) => x.item);
-  const picked = ordered.slice(0, maxItems).map((item) => {
-    const body = item.content.replace(/^\[[^\]]+\]\s*/, "");
-    const short = body.length > 120 ? `${body.slice(0, 120)}…` : body;
-    return short;
-  });
-  return `[LRC 状态] ${picked.join("；")}。细节在 LRC，需要时 recall。`;
+  const groups = /* @__PURE__ */ new Map();
+  for (const item of items) {
+    const r = rank(item);
+    const list = groups.get(r) ?? [];
+    list.push(item);
+    groups.set(r, list);
+  }
+  const bodyOf = (item) => item.content.replace(/^\[[^\]]+\]\s*/, "").trim();
+  const keyOf = (s) => s.replace(/[\s，。；：、！？（）()"'`*]/g, "");
+  const picked = [];
+  const pickedKeys = [];
+  const cursor = /* @__PURE__ */ new Map();
+  const order = [...groups.keys()].sort((a, b) => a - b);
+  const HIGH = order.filter((r) => r <= 1);
+  const LOW = order.filter((r) => r > 1);
+  let progress = true;
+  while (picked.length < maxItems && progress) {
+    progress = false;
+    for (const r of HIGH) {
+      if (picked.length >= maxItems) break;
+      const list = groups.get(r) ?? [];
+      let i = cursor.get(r) ?? 0;
+      while (i < list.length) {
+        const body = bodyOf(list[i]);
+        const key = keyOf(body);
+        const dup = pickedKeys.some((p) => jaccard(p, key) >= 0.75);
+        i += 1;
+        if (key.length > 0 && !dup) {
+          picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+          pickedKeys.push(key);
+          progress = true;
+          break;
+        }
+      }
+      cursor.set(r, i);
+    }
+  }
+  for (const r of [...LOW, ...HIGH]) {
+    if (picked.length >= maxItems) break;
+    const list = groups.get(r) ?? [];
+    let i = cursor.get(r) ?? 0;
+    while (i < list.length && picked.length < maxItems) {
+      const body = bodyOf(list[i]);
+      const key = keyOf(body);
+      i += 1;
+      if (key.length === 0) continue;
+      if (pickedKeys.some((p) => jaccard(p, key) >= 0.75)) continue;
+      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+      pickedKeys.push(key);
+    }
+    cursor.set(r, i);
+  }
+  return picked;
 }
 var PROCESS_NARRATION2 = /接下来|下一步|我要|待确认|待验证|还需要|准备|打算|将要/;
 var COMPLETION_WORDS = /已完成|已确认|已验证|已修复|结论是|因此|所以|说明|表明/;
@@ -1331,6 +1386,30 @@ var Offloader = class {
   pendingSteps = 0;
   /** 最近已发送的块，用于本地查重（跨会话共享，避免重复入库） */
   recent = [];
+  /**
+   * 快照候选池（**跨批累积**，上限 20）。
+   *
+   * ## 为什么必须跨批累积
+   *
+   * 实测（session-e1419190 回放，完全按真实调用时序）：
+   * ```
+   * 第 1 批 items=1 → [LRC 状态] 缓存必须放在工作区之外
+   * 第 2 批 items=1 → [LRC 状态] 网络直连失败，改用搜索      ← 第 1 批被覆盖
+   * 第 3 批 items=1 → [LRC 状态] 改用 --stdin 传入          ← 第 2 批被覆盖
+   * 第 4 批 items=1 → [LRC 状态] 改用 --file 传入
+   * ```
+   *
+   * `buildSnapshot` 只对**传入的那一批**排序。而真实调用每次都只传
+   * 当前这一条消息抽出的 1~2 条 —— 此时「按约束优先排序」在数学上
+   * 等于「原序」，与修复前的 `slice(0, maxItems)` 完全等价。
+   * 整场会话结束时，5 条关键约束全部丢失，只剩最后一条当轮内容。
+   *
+   * 累积后排序才真正有意义：约束能长期占据快照槽位，而不是被
+   * 下一条无关的过程记录顶掉。
+   */
+  snapshotPool = [];
+  /** 快照池上限：够覆盖「跨轮有效的约束」，又不至于让注入文本无限增长 */
+  snapshotPoolMax = 20;
   /** 累计统计（`lrc_status` 用） */
   flushCount = 0;
   totalWritten = 0;
@@ -1401,6 +1480,34 @@ var Offloader = class {
     this.pendingTurns = 0;
     this.pendingChars = 0;
     this.pendingSteps = 0;
+  }
+  /**
+   * 清空快照池（**会话切换时必须调用**）。
+   *
+   * 池子里装的是本会话的约束/决策，换会话后不能继续注入 ——
+   * 那与 `bindSnapshotToSession` 防的跨会话泄漏是同一类问题。
+   */
+  resetSnapshotPool() {
+    this.snapshotPool = [];
+  }
+  /**
+   * 把新条目并入池子，再用**整个池子**生成快照。
+   *
+   * 为什么不能只对新条目排序：真实调用每次只传 1~2 条，
+   * 此时排序退化为原序，约束照样被下一批过程记录顶掉（见 `snapshotPool`）。
+   */
+  buildPooledSnapshot(items) {
+    const seen = new Set(this.snapshotPool.map((i) => i.content.replace(/\s+/g, "")));
+    for (const item of items) {
+      const key = item.content.replace(/\s+/g, "");
+      if (key.length === 0 || seen.has(key)) continue;
+      seen.add(key);
+      this.snapshotPool.push(item);
+    }
+    if (this.snapshotPool.length > this.snapshotPoolMax) {
+      this.snapshotPool = this.snapshotPool.slice(-this.snapshotPoolMax);
+    }
+    return buildSnapshot(this.snapshotPool, this.config.snapshotItems);
   }
   /** 累计沉淀统计（`lrc_status` 用）。 */
   stats() {
@@ -1514,7 +1621,7 @@ var Offloader = class {
       written,
       merged,
       deduped,
-      snapshot: buildSnapshot(items, this.config.snapshotItems),
+      snapshot: this.buildPooledSnapshot(items),
       reset: slice.reset
     };
     this.record(result);
@@ -1564,7 +1671,7 @@ var Offloader = class {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
-      snapshot: buildSnapshot(fresh, this.config.snapshotItems),
+      snapshot: this.buildPooledSnapshot(fresh),
       reset: false
     };
     this.record(result);
@@ -1732,6 +1839,7 @@ function toolDelta(event) {
   return 0;
 }
 function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {
+  const limit = typeof maxNodes === "number" && Number.isFinite(maxNodes) && maxNodes > 0 ? Math.floor(maxNodes) : void 0;
   const n = nodes.length;
   if (n <= keepRecentNodes + 1) return null;
   const cut = new Array(n + 1).fill(false);
@@ -1752,13 +1860,18 @@ function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {
     startIdx += 1;
   }
   if (startIdx > endIdx) return null;
-  if (maxNodes !== void 0 && maxNodes > 0 && endIdx - startIdx + 1 > maxNodes) {
-    let shrunk = startIdx + maxNodes - 1;
-    while (shrunk >= startIdx && (cut[shrunk + 1] !== true || !isTrimBoundaryEligible(events[nodes[shrunk]]))) {
-      shrunk -= 1;
+  if (limit !== void 0 && endIdx - startIdx + 1 > limit) {
+    let taken = 0;
+    let lastEligible = -1;
+    for (let cursor = startIdx; cursor <= endIdx; cursor += 1) {
+      if (cut[cursor + 1] !== true || !isTrimBoundaryEligible(events[nodes[cursor]])) {
+        break;
+      }
+      lastEligible = cursor;
+      taken += 1;
+      if (taken >= limit) break;
     }
-    if (shrunk < startIdx) return null;
-    endIdx = shrunk;
+    if (lastEligible >= startIdx) endIdx = lastEligible;
   }
   return {
     start: nodes[startIdx],
@@ -2741,7 +2854,7 @@ async function runGovernor(deps) {
       const outcome = state.lastOutcome[name2];
       if (outcome === void 0) return name2;
       if (outcome.ok) return name2;
-      const short = outcome.reason.split(":")[0] ?? outcome.reason;
+      const short = outcome.reason.startsWith("error") ? outcome.reason : outcome.reason.split(":")[0] ?? outcome.reason;
       return `${name2}(${short})`;
     });
     log(`[lrc][governor] 第 ${state.steps} 步执行：${annotated.join(" → ")}`);
@@ -2896,6 +3009,11 @@ function apply(ctx, config) {
   }
   const capabilityRecheckSteps = recheckInterval(config.capabilityRecheckSteps);
   const budgetRecheckSteps = recheckInterval(config.budgetRecheckSteps);
+  function positiveInt(value, fallback) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+    return Math.floor(value);
+  }
+  const trimMaxNodesPerRun = positiveInt(config.trimMaxNodesPerRun, 40);
   function loadSnapshot() {
     const empty = { text: "", sessionId: "" };
     try {
@@ -2980,6 +3098,9 @@ function apply(ctx, config) {
   let turnHits = 0;
   let turnMisses = 0;
   let proseTurns = 0;
+  let proseBacklog = [];
+  const PROSE_BACKLOG_MAX = 30;
+  let snapshotGeneration = 0;
   let turnNoText = 0;
   let turnHadText = false;
   let turnTagSeen = false;
@@ -3003,6 +3124,9 @@ function apply(ctx, config) {
       recallFingerprint = "";
       recallGeneration += 1;
     }
+    offloader.resetSnapshotPool();
+    proseBacklog = [];
+    snapshotGeneration += 1;
     if (snapshotOwner !== sessionId) {
       if (storedSnapshot.text.length > 0) {
         ctx.logger.info(
@@ -3082,6 +3206,22 @@ ${latestSnapshot}`;
     }
     ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
     void bootstrapSnapshot();
+    if (proseBacklog.length > 0) {
+      const pending = proseBacklog;
+      proseBacklog = [];
+      void offloader.offloadItems(pending).then((result) => {
+        if (result.distilled > 0) {
+          if (result.snapshot.length > 0) saveSnapshot(result.snapshot, currentSessionId);
+          ctx.logger.info(
+            `[lrc] 补写未连接期间的 ${result.distilled} 条约束/决策（写入 ${result.written}）`
+          );
+        }
+      }).catch((error) => {
+        ctx.logger.warn(
+          `[lrc] 补写暂存约束失败：${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+    }
   })();
   async function bootstrapSnapshot() {
     const client = connection.peek();
@@ -3228,7 +3368,7 @@ ${latestSnapshot}`;
       const seen = turnHits + turnMisses;
       if (seen % 20 === 0) {
         ctx.logger.info(
-          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取 ${proseTurns} 轮（另有 ${turnNoText} 轮无正文）`
+          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取命中 ${proseTurns} 条消息（另有 ${turnNoText} 轮无正文）`
         );
       }
     } else {
@@ -3285,8 +3425,19 @@ ${latestSnapshot}`;
       const prose = constraintsFromProse(text);
       if (prose.length > 0) {
         const proseSessionId = sessionId;
+        const items = itemsFromTag(prose.join("\n"));
+        if (!offloader.connected) {
+          proseBacklog.push(...items);
+          if (proseBacklog.length > PROSE_BACKLOG_MAX) {
+            proseBacklog = proseBacklog.slice(-PROSE_BACKLOG_MAX);
+          }
+          void connection.get();
+          return;
+        }
         proseTurns += 1;
-        void offloader.offloadItems(itemsFromTag(prose.join("\n"))).then((result) => {
+        const gen = ++snapshotGeneration;
+        void offloader.offloadItems(items).then((result) => {
+          if (gen !== snapshotGeneration) return;
           if (result.distilled > 0) {
             if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
               saveSnapshot(result.snapshot, proseSessionId);
@@ -3441,7 +3592,8 @@ ${latestSnapshot}`;
               keepRecentNodes: config.keepRecentNodes,
               maxSummaryChars: config.trimMaxSummaryChars,
               force,
-              maxNodesPerRun: force ? config.trimMaxNodesPerRun : void 0
+              // 用归一化后的值：宿主 patch 通常不含该字段，直接用会退化为旧行为
+              maxNodesPerRun: force ? trimMaxNodesPerRun : void 0
             },
             log: (message) => ctx.logger.info(message)
           });

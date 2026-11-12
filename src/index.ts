@@ -27,7 +27,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { LrcRuntime } from './runtime.ts';
-import { LrcClient } from './lrc-client.ts';
+import { LrcClient, type DistilledItem } from './lrc-client.ts';
 import { Recoverable, isConnectionError } from './recoverable.ts';
 import { normalizeRecallOptions, formatRecallInjection, topicFingerprint } from './recall-injection.ts';
 import { CursorStore, RecentStore, snapshotChanged } from './cursor.ts';
@@ -292,6 +292,20 @@ export function apply(ctx: Context, config: Config): void {
   const budgetRecheckSteps = recheckInterval(config.budgetRecheckSteps);
 
   /**
+   * 正整数配置归一化（带兜底默认值）。
+   *
+   * 与 `recheckInterval` 同一类防护：宿主 patch 里**不会**包含新字段，
+   * 传进来就是 `undefined`。而 `undefined` 参与算术会静默变形 ——
+   * 实测 `trimMaxNodesPerRun` 缺失时单次裁 132 个（旧行为），
+   * 传 `'40'` 时限制完全失效（裁 139），传 `40.5` 时完全裁不动（null）。
+   */
+  function positiveInt(value: unknown, fallback: number): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
+    return Math.floor(value);
+  }
+  const trimMaxNodesPerRun = positiveInt(config.trimMaxNodesPerRun, 40);
+
+  /**
    * 从磁盘恢复上次的快照。
    *
    * 不持久化的话，插件进程一重启 `latestSnapshot` 就变空串，
@@ -486,6 +500,23 @@ export function apply(ctx: Context, config: Config): void {
    * 「标签命中率」会长期 0%，被误读成插件失效。这个计数才是真实来源。
    */
   let proseTurns = 0;
+  /**
+   * 未连接时暂存的正文档约束（上限 30）。
+   *
+   * 为什么需要：`assistant/message` 事件**不会被回放**。LRC 桌面端比 DSH
+   * 晚起 20 分钟是已发生过的真实事故，那段时间里抽到的约束若直接丢弃，
+   * 就永久消失了（`flush()` 为此保留了 pending 计数，prose 路径同理）。
+   */
+  let proseBacklog: DistilledItem[] = [];
+  const PROSE_BACKLOG_MAX = 30;
+  /**
+   * 快照写入代次（防乱序覆盖）。
+   *
+   * 多条 prose 的 migrate 往返可能乱序完成，晚完成的那条会用更早的内容
+   * 覆盖快照 —— 症状是 `[LRC 状态]` 内容「倒退」。每发起一次就递增，
+   * 回调里代次不符即丢弃。
+   */
+  let snapshotGeneration = 0;
   /** 整轮没有正文的轮次数（标签根本没地方出现，不该计入分母） */
   let turnNoText = 0;
   /** 当前轮状态 */
@@ -582,6 +613,12 @@ export function apply(ctx: Context, config: Config): void {
       recallFingerprint = '';
       recallGeneration += 1;
     }
+
+    // 快照候选池同样是会话级状态：换会话后不能继续用上一场的约束拼快照，
+    // 与 `latestSnapshot` 归属判定同源（`bindSnapshotToSession` 的目的）。
+    offloader.resetSnapshotPool();
+    proseBacklog = [];
+    snapshotGeneration += 1;
 
     // 归属不符：磁盘里那份是别人的，不能带进本会话
     if (snapshotOwner !== sessionId) {
@@ -731,6 +768,27 @@ export function apply(ctx: Context, config: Config): void {
     ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
     // 快照与写入解耦：上次进程没来得及沉淀时，从 LRC 索引重建
     void bootstrapSnapshot();
+    // 回灌「未连接期间」暂存的正文约束。
+    // `assistant/message` 不会被回放，错过就永久丢（见 proseBacklog）。
+    if (proseBacklog.length > 0) {
+      const pending = proseBacklog;
+      proseBacklog = [];
+      void offloader
+        .offloadItems(pending)
+        .then((result) => {
+          if (result.distilled > 0) {
+            if (result.snapshot.length > 0) saveSnapshot(result.snapshot, currentSessionId);
+            ctx.logger.info(
+              `[lrc] 补写未连接期间的 ${result.distilled} 条约束/决策（写入 ${result.written}）`,
+            );
+          }
+        })
+        .catch((error: unknown) => {
+          ctx.logger.warn(
+            `[lrc] 补写暂存约束失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+    }
   })();
 
   /**
@@ -1020,7 +1078,7 @@ export function apply(ctx: Context, config: Config): void {
       const seen = turnHits + turnMisses;
       if (seen % 20 === 0) {
         ctx.logger.info(
-          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取 ${proseTurns} 轮` +
+          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取命中 ${proseTurns} 条消息` +
             `（另有 ${turnNoText} 轮无正文）`,
         );
       }
@@ -1132,10 +1190,28 @@ export function apply(ctx: Context, config: Config): void {
         // `currentSessionId`，会把 A 的约束写成 B 的归属 —— 正是上一轮
         // 在 `flush()` 里修过的同一个坑，不能在新路径上重犯。
         const proseSessionId = sessionId;
+        const items = itemsFromTag(prose.join('\n'));
+
+        // **未连接时不直接丢**：`assistant/message` 事件不会被回放，
+        // 而 LRC 桌面端比 DSH 晚起 20 分钟是已发生过的真实事故。
+        // 那 20 分钟里若直接 catch 掉，这批约束就永久丢了。
+        if (!offloader.connected) {
+          proseBacklog.push(...items);
+          if (proseBacklog.length > PROSE_BACKLOG_MAX) {
+            proseBacklog = proseBacklog.slice(-PROSE_BACKLOG_MAX);
+          }
+          void connection.get();
+          return;
+        }
+
         proseTurns += 1;
+        // 代次闸门：多条 prose 的 HTTP 往返可能乱序（migrate 超时 20s），
+        // 晚完成的那条会用更早的内容覆盖快照 —— 症状是注入内容「倒退」。
+        const gen = ++snapshotGeneration;
         void offloader
-          .offloadItems(itemsFromTag(prose.join('\n')))
+          .offloadItems(items)
           .then((result) => {
+            if (gen !== snapshotGeneration) return; // 有更新的一次在飞，丢弃
             if (result.distilled > 0) {
               if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
                 saveSnapshot(result.snapshot, proseSessionId);
@@ -1343,7 +1419,8 @@ export function apply(ctx: Context, config: Config): void {
               keepRecentNodes: config.keepRecentNodes,
               maxSummaryChars: config.trimMaxSummaryChars,
               force,
-              maxNodesPerRun: force ? config.trimMaxNodesPerRun : undefined,
+              // 用归一化后的值：宿主 patch 通常不含该字段，直接用会退化为旧行为
+              maxNodesPerRun: force ? trimMaxNodesPerRun : undefined,
             },
             log: (message) => ctx.logger.info(message),
           });
