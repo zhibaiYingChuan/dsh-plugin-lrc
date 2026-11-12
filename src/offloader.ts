@@ -23,6 +23,7 @@ import type { DistilledItem, LrcClient } from './lrc-client.ts';
 import { advanceCursor, sliceByCursor, type CursorStore, type RecentStore } from './cursor.ts';
 import {
   areNearDuplicate,
+  carriesResourceLocation,
   DEFAULT_DEDUP_THRESHOLD,
   extractMemoryTag,
   hardFilter,
@@ -170,8 +171,23 @@ export function buildSnapshot(items: DistilledItem[], maxItems: number): string 
 export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): string[] {
   if (items.length === 0 || maxItems <= 0) return [];
 
+  /**
+   * 类别优先级。
+   *
+   * ## 「资源位置」必须与约束同级（rank 0）
+   *
+   * 事故的另一半：用户说「音频在桌面」（seq=1539）终于进了库，
+   * 但 LRC 的 distill 把它归成 `code_context`，落进默认的 rank 3，
+   * 而真实池里 rank 0/1 有 15 条 —— `snapshotItems=3` 时它**永远进不了注入**。
+   * 「进了库但注入不到」等于没进。
+   *
+   * 判据不猜语义，只看内容里有没有具体路径/媒体文件名（与
+   * `carriesResourceLocation` 同源）。这类条目在池里极少，占一个槽位
+   * 换来的是「模型知道源文件在哪」，性价比远高于多一条同义约束。
+   */
   const rank = (item: DistilledItem): number => {
     if (item.memory_type === 'preference' || item.tags?.includes('constraint')) return 0;
+    if (carriesResourceLocation(item.content)) return 0;
     if (item.memory_type === 'decision' || item.tags?.includes('decision')) return 1;
     if (item.tags?.includes('conclusion')) return 2;
     return 3;
@@ -194,6 +210,44 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
   const pickedKeys: string[] = [];
   const cursor = new Map<number, number>();
 
+  /**
+   * 取一条候选（跳过与已选近似重复的）。返回是否取到。
+   */
+  const takeNext = (r: number): boolean => {
+    const list = groups.get(r) ?? [];
+    let i = cursor.get(r) ?? 0;
+    while (i < list.length) {
+      const body = bodyOf(list[i]);
+      const key = keyOf(body);
+      i += 1;
+      if (key.length === 0) continue;
+      if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
+      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+      pickedKeys.push(key);
+      cursor.set(r, i);
+      return true;
+    }
+    cursor.set(r, i);
+    return false;
+  };
+
+  // ── 第一步：给「资源位置」预留一个槽位 ──
+  //
+  // 它和约束同为 rank 0，但触发的判据完全不同（结构特征 vs 情态词）。
+  // 若只靠轮转，池里一旦有多条同义约束排在前面，资源位置仍可能被挤掉。
+  // 所以先单独取一条，保证它一定露脸。
+  if (maxItems >= 2) {
+    const resItem = (groups.get(0) ?? []).find((i) => carriesResourceLocation(i.content));
+    if (resItem !== undefined) {
+      const idx = (groups.get(0) ?? []).indexOf(resItem);
+      const body = bodyOf(resItem);
+      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+      pickedKeys.push(keyOf(body));
+      // 游标跳过它，避免下一轮重复取
+      cursor.set(0, idx + 1);
+    }
+  }
+
   // 轮转取词：**只在前两类（约束、决策）之间轮转**，结论/事实仅用于填空位。
   //
   // ## 为什么不能对所有类别都轮转
@@ -212,40 +266,16 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
     progress = false;
     for (const r of HIGH) {
       if (picked.length >= maxItems) break;
-      const list = groups.get(r) ?? [];
-      let i = cursor.get(r) ?? 0;
-      // 跳过与已选内容近似重复的（同义改写）
-      while (i < list.length) {
-        const body = bodyOf(list[i]);
-        const key = keyOf(body);
-        const dup = pickedKeys.some((p) => areNearDuplicate(p, key, 0.75));
-        i += 1;
-        if (key.length > 0 && !dup) {
-          picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-          pickedKeys.push(key);
-          progress = true;
-          break;
-        }
-      }
-      cursor.set(r, i);
+      if (takeNext(r)) progress = true;
     }
   }
 
   // 高价值类别取完仍有空位 ⇒ 用结论/事实补满
   for (const r of [...LOW, ...HIGH]) {
     if (picked.length >= maxItems) break;
-    const list = groups.get(r) ?? [];
-    let i = cursor.get(r) ?? 0;
-    while (i < list.length && picked.length < maxItems) {
-      const body = bodyOf(list[i]);
-      const key = keyOf(body);
-      i += 1;
-      if (key.length === 0) continue;
-      if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
-      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-      pickedKeys.push(key);
+    while (picked.length < maxItems && takeNext(r)) {
+      // 继续填这个类别
     }
-    cursor.set(r, i);
   }
   return picked;
 }
@@ -631,14 +661,19 @@ export class Offloader {
     const freshBlocks: string[] = [];
     let deduped = 0;
     for (const item of taggedItems) {
-      if (isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+      // 同批查重：与 `offloadItems` 同因（模型常一轮内重复同一条约束）
+      const sameInBatch = freshTagged.some((f) =>
+        areNearDuplicate(f.content, item.content, this.config.dedupThreshold),
+      );
+      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
       freshTagged.push(item);
     }
     for (const block of untagged) {
-      if (isDuplicate(block, this.recent, this.config.dedupThreshold)) {
+      const sameInBatch = freshBlocks.some((f) => areNearDuplicate(f, block, this.config.dedupThreshold));
+      if (sameInBatch || isDuplicate(block, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
@@ -731,7 +766,13 @@ export class Offloader {
     const fresh: DistilledItem[] = [];
     let deduped = 0;
     for (const item of items) {
-      if (isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+      // **同批也要查重**：模型在同一轮里常把同一条约束说三遍，
+      // 上一版只跟历史窗口 `this.recent` 比，于是三条全部进 `migrate`。
+      // 实测 `offloadItems([同一内容 ×3])` → `distilled=3, deduped=0`。
+      // 后果：`written` 统计虚高，每次补写多发一次 HTTP；
+      // 一旦 LRC 的相似合并阈值调高，就会真的写入重复记忆、被 recall 反复召回。
+      const sameInBatch = fresh.some((f) => areNearDuplicate(f.content, item.content, this.config.dedupThreshold));
+      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }

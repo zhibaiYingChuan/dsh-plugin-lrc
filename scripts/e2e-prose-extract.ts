@@ -7,8 +7,7 @@
  * 实测模型只有 1.8% 的轮次输出 <lrc_memory>，所以约束抽取几乎全靠它。
  * 它抽错 = 沉淀垃圾；抽漏 = 约束丢失，下一轮模型重犯同样的错。
  */
-import { areNearDuplicate, constraintsFromProse, constraintsFromUser } from '../src/memory-filter.ts';
-import { carriesResourceLocation } from '../src/session-text.ts';
+import { areNearDuplicate, carriesResourceLocation, constraintsFromProse, constraintsFromUser } from '../src/memory-filter.ts';
 import { Offloader, buildSnapshot } from '../src/offloader.ts';
 import { CursorStore } from '../src/cursor.ts';
 import { tmpdir } from 'node:os';
@@ -418,6 +417,99 @@ console.log('=== 7e) 池上限与淘汰端 ===');
   const kept = pool.snapshotPool.map((i) => i.content).join('|');
   check('保留的是最新约束（约束24）', kept.includes('约束24'), kept.slice(0, 200));
   check('最旧约束（约束0）被淘汰', !kept.includes('约束0'), kept.slice(0, 200));
+}
+
+// ── 7f) 资源位置必须真的出现在注入内容里 ──
+//
+// ★第六次独立审查的 P0：用户说「音频在桌面」（seq=1539）终于进了库，
+// 但 LRC distill 把它归成 `code_context` ⇒ 快照 rank 最后。
+// 真实池里 rank 0/1 有 15 条，`snapshotItems=3` 时它**永远进不了注入**。
+// 「进了库但注入不到」等于没进 —— 用户原始诉求的另一半仍未修好。
+console.log('=== 7f) 资源位置必须被注入 ===');
+{
+  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  });
+  // 模拟真实池：15 条高价值约束/决策 + 1 条资源位置（LRC 归类为 code_context）
+  const pool: DistilledItem[] = [];
+  for (let i = 0; i < 8; i += 1) {
+    pool.push(mk(`[约束] 约束${i}：必须遵守第 ${i} 条规范`, 'preference', ['constraint']));
+  }
+  for (let i = 0; i < 7; i += 1) {
+    pool.push(mk(`[决策] 决策${i}：改用方案${i}`, 'decision', ['decision']));
+  }
+  pool.push({
+    content: '[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频',
+    memory_type: 'code_context',
+    tags: ['code'],
+    importance: 5,
+    source_turns: [0, 0],
+  });
+
+  const snap3 = buildSnapshot(pool, 3);
+  console.log(`    snapshotItems=3 → ${snap3}`);
+  check('资源位置出现在注入内容里（snapshotItems=3）', snap3.includes('score-Dtle1HAU'), snap3);
+
+  const snap2 = buildSnapshot(pool, 2);
+  console.log(`    snapshotItems=2 → ${snap2}`);
+  check('资源位置出现在注入内容里（snapshotItems=2）', snap2.includes('score-Dtle1HAU'), snap2);
+
+  // 池里没有资源位置时，行为不得改变（不能因为它而少注入约束）
+  const noRes = pool.filter((i) => !i.content.includes('score-Dtle1HAU'));
+  const snapNoRes = buildSnapshot(noRes, 3);
+  check('无资源位置时仍注入约束', snapNoRes.includes('约束') || snapNoRes.includes('决策'), snapNoRes);
+}
+
+// ── 7g) 表格行 / 计数句不得冒充决策 ──
+//
+// ★第六次审查 P1-1：`决策：| 0–8s | 一次对话…` 与 `决策：这次有 3 条关键决策`
+// 都因裸词「决策」命中而进了注入，挤掉真正有用的条目。
+console.log('=== 7g) 表格行/名词化决策不冒充 ===');
+{
+  const noise = [
+    '| 0–8s | 一次对话，光点起势，再以"40 轮对话 / 上下文 100%"展示 |',
+    '这次有 3 条关键决策。',
+    '| 8–16s | 第二次对话，展示上下文压缩 |',
+  ];
+  for (const n of noise) {
+    const got = constraintsFromProse(n);
+    check(`不抽「${n.slice(0, 16)}…」`, got.length === 0, got);
+  }
+  // 真正的决策句仍要抽到
+  for (const d of ['决定采用 --stdin 传入', '决策是改用 --file', '改用 --file 传入音频']) {
+    check(`仍抽「${d}」`, constraintsFromProse(d).length > 0, constraintsFromProse(d));
+  }
+}
+
+// ── 7h) 同批重复不得全部发给 LRC ──
+//
+// ★第六次审查 P1-3：`offloadItems([同一内容 ×3])` → `distilled=3, deduped=0`。
+console.log('=== 7h) 同批去重 ===');
+{
+  // 需要一个能连上的假 client，否则会在 requireClient 处抛错、拿不到 deduped 计数
+  let migrateCalls = 0;
+  let lastBatchSize = 0;
+  const fakeClient = {
+    baseUrl: 'http://127.0.0.1:0',
+    distill: async () => ({ items: [], count: 0, indexLine: '' }),
+    migrate: async (items: DistilledItem[]) => {
+      migrateCalls += 1;
+      lastBatchSize = items.length;
+      return { written: items.length, merged: 0 };
+    },
+  } as unknown as Parameters<typeof Offloader.prototype.bind>[0];
+
+  const off = new Offloader(fakeClient, new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-g.json`)), {
+    snapshotItems: 3,
+  });
+  const dup: DistilledItem = {
+    content: '[约束] 不要用 IDM 下载', memory_type: 'preference', tags: ['constraint'],
+    importance: 7, source_turns: [0, 0],
+  };
+  const r = await off.offloadItems([dup, { ...dup }, { ...dup }]);
+  console.log(`    结果: distilled=${r.distilled} deduped=${r.deduped} migrate 收到 ${lastBatchSize} 条`);
+  check('同批三条重复被压成 1 条（deduped=2）', r.deduped === 2, r.deduped);
+  check('只有 1 条进入 migrate', lastBatchSize === 1 && migrateCalls === 1, { lastBatchSize, migrateCalls });
 }
 
 // ── 8) 快照：只有结论时仍能输出 ──

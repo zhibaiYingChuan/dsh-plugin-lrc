@@ -16,7 +16,7 @@
  * 注意 `Session` **没有 `lines` 字段** —— 早期实现读 `agent.session.lines`
  * 恒为 `[]`，导致自动沉淀静默空转。
  */
-import { hasConstraintMarker } from './memory-filter.ts';
+import { carriesResourceLocation, hasConstraintMarker } from './memory-filter.ts';
 import { classifyEvent, isRealUserEvent } from './event-classify.ts';
 
 /** 取 assistant 消息的 content（兼容 `data.message` 与旧版 `message`）。 */
@@ -170,51 +170,6 @@ export function isRealUserMessage(event: unknown): boolean {
  */
 export function hasUserConstraint(text: string): boolean {
   return hasConstraintMarker(text);
-}
-
-/**
- * 用户消息是否携带**具体资源位置**（路径 / 文件名 / 盘符目录）。
- *
- * ## 为什么单列这一条
- *
- * 真实事故里最关键的一条用户消息是：
- * ```
- * D:\Desktop，score-Dtle1HAU.wav，这是你要打音频。继续任务
- * ```
- * 它既没有约束词，也不是纠正句式 —— `hasConstraintMarker` 与
- * `constraintsFromUser` 双双漏过，于是「音频在桌面」从未入库。
- * 而模型缺的正是这个事实，只能去点下载链接，最终引出用户的第二次纠正。
- *
- * 判据只看**结构特征**，不猜语义：出现盘符绝对路径，或带扩展名的文件名，
- * 就认为这条消息在交代资源位置。这类消息在真实会话里极少（5 条里 1 条），
- * 误收代价低，而漏收的代价是整个任务方向跑偏。
- */
-export function carriesResourceLocation(text: string): boolean {
-  // 盘符绝对路径（D:\Desktop、C:/Users/xxx）。
-  //
-  // 必须先在**去掉 URL** 的文本上判断：`https://` 里的 `s:/` 会被
-  // `[A-Za-z]:[\\/]` 命中，于是「https://github.com/… 做个视频」这类
-  // 纯任务描述会被误判成资源位置（实测真实 seq=620 就中招）。
-  const withoutUrls = text.replace(/\bhttps?:\/\/\S+/gi, ' ');
-  if (/(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(withoutUrls)) return true;
-  // 带**媒体/素材**类扩展名的文件名（score-Dtle1HAU.wav）。
-  //
-  // 刻意**不收**代码/文档扩展名（.ts/.md/.json…）：用户说
-  // 「帮我排版 docs/禁止事项.md」是在交代任务对象，不是「资源在哪」；
-  // 放进来会把大量普通任务描述灌进沉淀源（实测该门槛被 `docs/禁止事项.md`
-  // 直接骗过，把整条普通指令当成约束入库）。
-  if (
-    /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp|svg|pdf|docx?|xlsx?|pptx?)\b/i.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-  // 用户口语里常见的「在桌面 / 在下载目录」+ 资源名词
-  if (/(?:桌面|downloads?|下载目录|文档目录|视频目录)/i.test(text) && /(?:音频|视频|文件|素材|图片|脚本)/.test(text)) {
-    return true;
-  }
-  return false;
 }
 
 /**

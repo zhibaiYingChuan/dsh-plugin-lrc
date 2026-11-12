@@ -177,6 +177,11 @@ export function isOptionLabel(line: string): boolean {
   const t = line.trim();
   if (/^[-*+]\s*\*\*[A-Za-z0-9]{1,3}\*\*\s*[：:]/.test(t)) return true;
   if (/^[-*+]\s*[A-Za-z0-9]{1,3}[.、)]\s/.test(t)) return true;
+  // markdown 表格行：`| 0–8s | 一次对话，光点起势… |`
+  //
+  // 实测这条会以 `[决策] | 0–8s | 一次对话…` 的形式进库并**真的被注入**
+  // —— 因为它含「决策」二字命中了词表。表格行永远是片段，不是结论。
+  if (/^\|.*\|/.test(t)) return true;
   return false;
 }
 
@@ -386,9 +391,25 @@ export function hardFilter(text: string): string {
   return kept.join('\n');
 }
 
-/** 决策类词：从正文里识别「已经定下来的做法」。 */
+/**
+ * 决策类词：从正文里识别「已经定下来的做法」。
+ *
+ * ## 为什么「决策 / 决定 / 采用」必须带后接成分
+ *
+ * 裸 `includes` 会把**名词化用法**全捞进来，实测污染注入：
+ * ```
+ * 决策：这次有 3 条关键决策          ← 计数句，不是决策
+ * 决策：我需要决定采用哪个方案        ← 待办意图，不是已定结论
+ * 决策：| 0–8s | 一次对话，光点起势…  ← 表格行碎片
+ * ```
+ * 这些条目 memory_type=`decision` ⇒ 快照 rank 1，直接抢高价值槽位。
+ * 注入总共只有 1~3 条，一条噪声等于砍掉 1/3 信息量。
+ *
+ * 所以「决策/决定」要求后接**已定的动作或取值**（决定用 / 决策是 …），
+ * 其余动词形（改用/换成/改到/设为…）本身就隐含完成态，可以直接匹配。
+ */
 const DECISION_MARKERS =
-  /决定|决策|采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用/;
+  /(?:决定|决策)(?:用|采用|走|把|先|是|为|定|改)|(?:采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用)/;
 
 /**
  * 正文里的**过程叙述**：第一人称正在做事，不是结论也不是约束。
@@ -474,6 +495,11 @@ export function constraintsFromProse(text: string, maxLines = 4): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
 
+  // 硬排除 markdown 表格行 / 标题行：它们永远是片段，不是可复用结论。
+  //   `| 0–8s | 一次对话，光点起势… |` 因为含「决策」二字被抽成
+  //   `[决策] | 0–8s | …` 并**真的进了注入内容**（实测）。
+  const source = text.replace(/^\s*\|.*\|\s*$/gm, ' ').replace(/^\s*#{1,6}\s.*$/gm, ' ');
+
   // **必须先整段剥掉代码围栏**。
   //
   // 逐句判定时 `stripCodeFences(line) !== line` 是无效的：那时围栏标记
@@ -484,7 +510,7 @@ export function constraintsFromProse(text: string, maxLines = 4): string[] {
   // 高价值路径（绕过 distill）。若不剥，标签里的 `- 决策：…` 会被这里
   // 再抽一次，两条路径内容重复 ⇒ 本地查重拦下另一条，
   // 实测 jaccard=0.98，deduped 计数虚高且白占 recent 窗口。
-  const body = stripMemoryTag(stripCodeFences(text));
+  const body = stripMemoryTag(stripCodeFences(source));
 
   // 按句切（含中英文句读），逐句判定
   for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
@@ -544,6 +570,59 @@ export function constraintsFromProse(text: string, maxLines = 4): string[] {
     if (out.length >= maxLines) break;
   }
   return out;
+}
+
+/**
+ * 文本是否携带**具体资源位置**（路径 / 媒体文件名 / 桌面这类位置词）。
+ *
+ * ## 为什么单列这一条
+ *
+ * 真实事故里最关键的一条用户消息是：
+ * ```
+ * D:\Desktop，score-Dtle1HAU.wav，这是你要打音频。继续任务
+ * ```
+ * 它既没有约束词，也不是纠正句式 —— `hasConstraintMarker` 与
+ * `constraintsFromUser` 双双漏过，于是「音频在桌面」从未入库。
+ * 而模型缺的正是这个事实，只能去点下载链接，最终引出用户的第二次纠正。
+ *
+ * ## 两处使用
+ *
+ * 1. `session-text.ts` 的用户消息门槛（让它进沉淀源）
+ * 2. `offloader.ts` 的快照取词（让它**排到注入内容里**）
+ *
+ * 第 2 处是事故真正没被修完的地方：事实进了库，但 `rank()` 把它归到
+ * `code_context`（最低优先级），在 `snapshotItems=3` 且高价值条目充足时
+ * **永远不会被注入** —— 「进了库但注入不到」等于没进。
+ *
+ * 判据只看**结构特征**，不猜语义。这类消息在真实会话里极少（5 条里 1 条），
+ * 误收代价低，而漏收的代价是整个任务方向跑偏。
+ */
+export function carriesResourceLocation(text: string): boolean {
+  // 盘符绝对路径（D:\Desktop、C:/Users/xxx）。
+  //
+  // 必须先在**去掉 URL** 的文本上判断：`https://` 里的 `s:/` 会被
+  // `[A-Za-z]:[\\/]` 命中，于是「https://github.com/… 做个视频」这类
+  // 纯任务描述会被误判成资源位置（实测真实 seq=620 就中招）。
+  const withoutUrls = text.replace(/\bhttps?:\/\/\S+/gi, ' ');
+  if (/(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(withoutUrls)) return true;
+  // 带**媒体/素材**类扩展名的文件名（score-Dtle1HAU.wav）。
+  //
+  // 刻意**不收**代码/文档扩展名（.ts/.md/.json…）：用户说
+  // 「帮我排版 docs/禁止事项.md」是在交代任务对象，不是「资源在哪」；
+  // 放进来会把大量普通任务描述灌进沉淀源（实测该门槛被 `docs/禁止事项.md`
+  // 直接骗过，把整条普通指令当成约束入库）。
+  if (
+    /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp|svg|pdf|docx?|xlsx?|pptx?)\b/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  // 用户口语里常见的「在桌面 / 在下载目录」+ 资源名词
+  if (/(?:桌面|downloads?|下载目录|文档目录|视频目录)/i.test(text) && /(?:音频|视频|文件|素材|图片|脚本)/.test(text)) {
+    return true;
+  }
+  return false;
 }
 
 /**

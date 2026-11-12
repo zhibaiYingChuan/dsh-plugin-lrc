@@ -1026,6 +1026,7 @@ function isOptionLabel(line) {
   const t = line.trim();
   if (/^[-*+]\s*\*\*[A-Za-z0-9]{1,3}\*\*\s*[：:]/.test(t)) return true;
   if (/^[-*+]\s*[A-Za-z0-9]{1,3}[.、)]\s/.test(t)) return true;
+  if (/^\|.*\|/.test(t)) return true;
   return false;
 }
 var PATH_BOUNDARY = "[^\\s，。；：、！？\"'`（）()【】\\[\\]{}<>《》「」]";
@@ -1144,7 +1145,7 @@ function hardFilter(text) {
   }
   return kept.join("\n");
 }
-var DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用/;
+var DECISION_MARKERS = /(?:决定|决策)(?:用|采用|走|把|先|是|为|定|改)|(?:采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用)/;
 var PROSE_NARRATION = /^(?:我(?:先|来|去|再|正在|会先)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:检查|查看|读取|尝试|运行)(?:一下|下)/;
 var PAST_OR_PLANNING = (
   // 仅「动词 + 过」且后接句读（排除 过滤/过程/过度 等构词）
@@ -1154,7 +1155,8 @@ var STRONG_CONSTRAINT = /(?:必须|务必|一定要|禁止|严禁|切勿|不得|
 function constraintsFromProse(text, maxLines = 4) {
   const out = [];
   const seen = /* @__PURE__ */ new Set();
-  const body = stripMemoryTag(stripCodeFences(text));
+  const source = text.replace(/^\s*\|.*\|\s*$/gm, " ").replace(/^\s*#{1,6}\s.*$/gm, " ");
+  const body = stripMemoryTag(stripCodeFences(source));
   for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
     const line = raw.trim().replace(/^[-*+\d.)\s]+/, "").trim();
     if (line.length > 200) continue;
@@ -1178,6 +1180,19 @@ function constraintsFromProse(text, maxLines = 4) {
     if (out.length >= maxLines) break;
   }
   return out;
+}
+function carriesResourceLocation(text) {
+  const withoutUrls = text.replace(/\bhttps?:\/\/\S+/gi, " ");
+  if (/(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(withoutUrls)) return true;
+  if (/[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp|svg|pdf|docx?|xlsx?|pptx?)\b/i.test(
+    text
+  )) {
+    return true;
+  }
+  if (/(?:桌面|downloads?|下载目录|文档目录|视频目录)/i.test(text) && /(?:音频|视频|文件|素材|图片|脚本)/.test(text)) {
+    return true;
+  }
+  return false;
 }
 var USER_CORRECTION = (
   // 必须**有第二人称指向 + 完成态**（你）或「说过 N 次」的明确重申。
@@ -1353,6 +1368,7 @@ function pickDiverseSnapshot(items, maxItems) {
   if (items.length === 0 || maxItems <= 0) return [];
   const rank = (item) => {
     if (item.memory_type === "preference" || item.tags?.includes("constraint")) return 0;
+    if (carriesResourceLocation(item.content)) return 0;
     if (item.memory_type === "decision" || item.tags?.includes("decision")) return 1;
     if (item.tags?.includes("conclusion")) return 2;
     return 3;
@@ -1369,6 +1385,33 @@ function pickDiverseSnapshot(items, maxItems) {
   const picked = [];
   const pickedKeys = [];
   const cursor = /* @__PURE__ */ new Map();
+  const takeNext = (r) => {
+    const list = groups.get(r) ?? [];
+    let i = cursor.get(r) ?? 0;
+    while (i < list.length) {
+      const body = bodyOf(list[i]);
+      const key = keyOf(body);
+      i += 1;
+      if (key.length === 0) continue;
+      if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
+      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+      pickedKeys.push(key);
+      cursor.set(r, i);
+      return true;
+    }
+    cursor.set(r, i);
+    return false;
+  };
+  if (maxItems >= 2) {
+    const resItem = (groups.get(0) ?? []).find((i) => carriesResourceLocation(i.content));
+    if (resItem !== void 0) {
+      const idx = (groups.get(0) ?? []).indexOf(resItem);
+      const body = bodyOf(resItem);
+      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+      pickedKeys.push(keyOf(body));
+      cursor.set(0, idx + 1);
+    }
+  }
   const order = [...groups.keys()].sort((a, b) => a - b);
   const HIGH = order.filter((r) => r <= 1);
   const LOW = order.filter((r) => r > 1);
@@ -1377,37 +1420,13 @@ function pickDiverseSnapshot(items, maxItems) {
     progress = false;
     for (const r of HIGH) {
       if (picked.length >= maxItems) break;
-      const list = groups.get(r) ?? [];
-      let i = cursor.get(r) ?? 0;
-      while (i < list.length) {
-        const body = bodyOf(list[i]);
-        const key = keyOf(body);
-        const dup = pickedKeys.some((p) => areNearDuplicate(p, key, 0.75));
-        i += 1;
-        if (key.length > 0 && !dup) {
-          picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-          pickedKeys.push(key);
-          progress = true;
-          break;
-        }
-      }
-      cursor.set(r, i);
+      if (takeNext(r)) progress = true;
     }
   }
   for (const r of [...LOW, ...HIGH]) {
     if (picked.length >= maxItems) break;
-    const list = groups.get(r) ?? [];
-    let i = cursor.get(r) ?? 0;
-    while (i < list.length && picked.length < maxItems) {
-      const body = bodyOf(list[i]);
-      const key = keyOf(body);
-      i += 1;
-      if (key.length === 0) continue;
-      if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
-      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-      pickedKeys.push(key);
+    while (picked.length < maxItems && takeNext(r)) {
     }
-    cursor.set(r, i);
   }
   return picked;
 }
@@ -1688,14 +1707,18 @@ var Offloader = class {
     const freshBlocks = [];
     let deduped = 0;
     for (const item of taggedItems) {
-      if (isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+      const sameInBatch = freshTagged.some(
+        (f) => areNearDuplicate(f.content, item.content, this.config.dedupThreshold)
+      );
+      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
       freshTagged.push(item);
     }
     for (const block of untagged) {
-      if (isDuplicate(block, this.recent, this.config.dedupThreshold)) {
+      const sameInBatch = freshBlocks.some((f) => areNearDuplicate(f, block, this.config.dedupThreshold));
+      if (sameInBatch || isDuplicate(block, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
@@ -1771,7 +1794,8 @@ var Offloader = class {
     const fresh = [];
     let deduped = 0;
     for (const item of items) {
-      if (isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+      const sameInBatch = fresh.some((f) => areNearDuplicate(f.content, item.content, this.config.dedupThreshold));
+      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
@@ -1887,19 +1911,6 @@ function isRealUserMessage(event) {
 function hasUserConstraint(text) {
   return hasConstraintMarker(text);
 }
-function carriesResourceLocation(text) {
-  const withoutUrls = text.replace(/\bhttps?:\/\/\S+/gi, " ");
-  if (/(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(withoutUrls)) return true;
-  if (/[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp|svg|pdf|docx?|xlsx?|pptx?)\b/i.test(
-    text
-  )) {
-    return true;
-  }
-  if (/(?:桌面|downloads?|下载目录|文档目录|视频目录)/i.test(text) && /(?:音频|视频|文件|素材|图片|脚本)/.test(text)) {
-    return true;
-  }
-  return false;
-}
 function linesFromSession(session) {
   const log = session?.log;
   if (!Array.isArray(log)) return [];
@@ -1998,7 +2009,8 @@ function normalizeMaxNodes(value) {
   return Math.max(1, Math.floor(asNumber));
 }
 function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {
-  const keep = normalizeCount(keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
+  const rawKeep = normalizeCount(keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
+  const keep = rawKeep < 1 ? DEFAULT_KEEP_RECENT : rawKeep;
   const limit = normalizeMaxNodes(maxNodes);
   const n = nodes.length;
   if (n <= keep + 1) return null;

@@ -340,7 +340,13 @@ export function selectTrimRange(
   maxNodes?: number,
 ): TrimRange | null {
   // 两个入参都在这里收口（理由见 `normalizeCount` / `normalizeMaxNodes`）。
-  const keep = normalizeCount(keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
+  //
+  // `keepRecentNodes` 的**合法值是 ≥1**：保留 0 个等于「不留任何近期上下文」，
+  // 实测 141 节点裁 139（98.6%），比事故的 92% 更激进。
+  // 但 1 是合法配置（只留最后一条），不能因为防 0 就把它抬到 2 ——
+  // 那会悄悄改变用户显式配置的行为。
+  const rawKeep = normalizeCount(keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
+  const keep = rawKeep < 1 ? DEFAULT_KEEP_RECENT : rawKeep;
   const limit = normalizeMaxNodes(maxNodes);
 
   const n = nodes.length;
