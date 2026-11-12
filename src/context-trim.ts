@@ -58,6 +58,26 @@ export interface TrimOptions {
    * 节点数是**不依赖任何服务**的硬指标，用它兜底最可靠。
    */
   force?: boolean;
+  /**
+   * 本次最多裁掉多少个节点（`force` 时生效）。
+   *
+   * ## 为什么必须有上限
+   *
+   * 原实现 force 时把 `[startIdx, endIdx]` 整段一次替换掉。实测
+   * （session-e1419190）：
+   *
+   * ```
+   * 23:53  节点=141 → 裁掉 131 个（92%）
+   * 08:27  节点=137 → 裁掉 127 个（92%）
+   * ```
+   *
+   * 每次都是「一次性重写整段前缀」—— KV 缓存按前缀复用，这等于把
+   * 缓存全部作废。而且裁完只剩 8 个保留节点，模型立刻丢失最近的工作脉络。
+   *
+   * 改为每次只裁一部分（默认保留约 1/4 的待裁区间），代价分摊到多次：
+   * 单次缓存损失更小，且上下文始终保有较近的历史。
+   */
+  maxNodesPerRun?: number;
 }
 
 /** 一次裁剪的结果。 */
@@ -220,12 +240,14 @@ function toolDelta(event: unknown): number {
  * @param nodes - `session.surface.nodes`（当前 surface 的事件 seq 列表）
  * @param events - `session.events`（按 seq 索引的事件数组）
  * @param keepRecentNodes - 尾部原样保留的节点数
+ * @param maxNodes - 本次最多裁多少个节点（`undefined` = 不限制，裁到 keepRecent 边界）
  * @returns 可裁剪范围；没有安全范围时返回 null
  */
 export function selectTrimRange(
   nodes: readonly number[],
   events: readonly unknown[],
   keepRecentNodes: number,
+  maxNodes?: number,
 ): TrimRange | null {
   const n = nodes.length;
   if (n <= keepRecentNodes + 1) return null;
@@ -238,8 +260,13 @@ export function selectTrimRange(
     cut[i + 1] = running === 0;
   }
 
-  // 终点必须同时满足：切点平衡 + 是可替换的对话节点
-  let endIdx = n - keepRecentNodes - 1;
+  // ── 先定终点（从保留边界往回收）──
+  //
+  // 顺序与原来一致：先确定一个**可用的**尾部边界，再据此限定起点。
+  // 不能先定起点：若边界处节点不可替换（大量 injected 消息），
+  // 先算起点会一路加到边界之外直接返回 null，而实际上往回收一步就能裁。
+  const hardEnd = n - keepRecentNodes - 1;
+  let endIdx = hardEnd;
   while (
     endIdx >= 0 &&
     (cut[endIdx + 1] !== true || !isTrimBoundaryEligible(events[nodes[endIdx] as number]))
@@ -248,7 +275,7 @@ export function selectTrimRange(
   }
   if (endIdx < 0) return null;
 
-  // 起点同理：跳过 system/message、技能目录、运行时上下文等不可替换节点
+  // ── 再定起点（上限是已确定的 endIdx）──
   let startIdx = 0;
   while (
     startIdx <= endIdx &&
@@ -257,6 +284,23 @@ export function selectTrimRange(
     startIdx += 1;
   }
   if (startIdx > endIdx) return null;
+
+  // ── 最后按 maxNodes 收缩终点 ──
+  //
+  // 裁掉的节点数 = endIdx - startIdx + 1。渐进裁剪把单次规模压到
+  // maxNodes 以内，避免「一次重写整段前缀」把 KV 缓存全部作废。
+  if (maxNodes !== undefined && maxNodes > 0 && endIdx - startIdx + 1 > maxNodes) {
+    // 收缩后终点仍需满足「切点平衡 + 可替换」，故继续往回收
+    let shrunk = startIdx + maxNodes - 1;
+    while (
+      shrunk >= startIdx &&
+      (cut[shrunk + 1] !== true || !isTrimBoundaryEligible(events[nodes[shrunk] as number]))
+    ) {
+      shrunk -= 1;
+    }
+    if (shrunk < startIdx) return null;
+    endIdx = shrunk;
+  }
 
   return {
     start: nodes[startIdx] as number,
@@ -1032,7 +1076,14 @@ export async function trimContext(deps: {
     };
   }
 
-  const range = selectTrimRange(nodes, events, options.keepRecentNodes);
+  const range = selectTrimRange(
+    nodes,
+    events,
+    options.keepRecentNodes,
+    // 只在 force（节点数超限）时限制单次规模：token 超阈值是「真的太大了」，
+    // 该一次裁够；而节点数超限是常态兜底，必须摊开裁，否则每次重写整段前缀。
+    options.force ? options.maxNodesPerRun : undefined,
+  );
   if (range === null) {
     return {
       ok: false,

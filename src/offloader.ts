@@ -97,10 +97,53 @@ export interface OffloadStats {
   recentWindow: number;
 }
 
-/** 把提炼结果压成一行状态快照。 */
+/**
+ * 把提炼结果压成一行状态快照。
+ *
+ * ## 为什么不是「取最近几条」
+ *
+ * 原实现是 `items.slice(0, maxItems)` —— 纯按顺序取，等于「最新优先」。
+ * 实测注入序列（session-e1419190，20 次注入）：
+ *
+ * ```
+ * [LRC 状态] CLI 已安装（@motionharness/cli@0.1.5）
+ * [LRC 状态] CLI 已安装                    ← 重复
+ * [LRC 状态] The binary is truncated...
+ * [LRC 状态] 桌面上的文件与 assets/score.wav 的 MD5 一致
+ * ```
+ *
+ * 全是**过程中遇到的问题**，没有一条是「当前任务的约束」。
+ * 而 turn 4 用户明确说「音频在桌面，别走 IDM 下载」—— 这条约束从未进入快照。
+ *
+ * 根因不只是取法：沉淀源本身几乎都来自硬规则从推理流抽的过程记录
+ * （因为模型 98.2% 的轮次不输出 `<lrc_memory>`，见 `constraintsFromProse`）。
+ *
+ * ## 新的取法：约束 > 决策 > 结论，同类按新到旧
+ *
+ * 「约束」和「决策」是**跨轮有效**的（"不要用 IDM"、"已改用 --stdin"），
+ * 结论和事实多半是**当轮有效**的（"CLI 已安装"）。
+ * 把跨轮有效的放前面，才让注入的东西对下一轮真的有用。
+ *
+ * @param items - 本轮新沉淀的条目
+ * @param maxItems - 快照里最多列几条
+ */
 export function buildSnapshot(items: DistilledItem[], maxItems: number): string {
   if (items.length === 0) return '';
-  const picked = items.slice(0, maxItems).map((item) => {
+
+  // 按「约束(0) → 决策(1) → 结论(2) → 事实(3)」稳定排序，
+  // 同优先级保持原顺序（即新到旧）。
+  const rank = (item: DistilledItem): number => {
+    if (item.memory_type === 'preference' || item.tags?.includes('constraint')) return 0;
+    if (item.memory_type === 'decision' || item.tags?.includes('decision')) return 1;
+    if (item.tags?.includes('conclusion')) return 2;
+    return 3;
+  };
+  const ordered = items
+    .map((item, index) => ({ item, index, rank: rank(item) }))
+    .sort((a, b) => (a.rank !== b.rank ? a.rank - b.rank : a.index - b.index))
+    .map((x) => x.item);
+
+  const picked = ordered.slice(0, maxItems).map((item) => {
     // 去掉 `[决策] ` 这类前缀，快照里用更短的标签
     const body = item.content.replace(/^\[[^\]]+\]\s*/, '');
     // 40 字符会把中文结论截成半句（实测快照读起来像噪声），放宽到 120。

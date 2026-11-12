@@ -41,7 +41,7 @@ import {
   textBlocksOnly,
   userMessageText,
 } from './session-text.ts';
-import { conclusionsFromReasoning, extractMemoryTag, isNoUpdate } from './memory-filter.ts';
+import { conclusionsFromReasoning, constraintsFromProse, extractMemoryTag, isNoUpdate } from './memory-filter.ts';
 import {
   pruneReasoning,
   pruneToolCallArguments,
@@ -106,6 +106,14 @@ export interface Config {
   trimMinSteps: number;
   /** surface 节点数硬上限：超过就跳过 token 阈值强制裁剪 */
   trimMaxNodes: number;
+  /**
+   * 节点数超限时，**单次最多裁掉多少节点**。
+   *
+   * 实测（session-e1419190）：141 个节点一次裁掉 131 个（92%），
+   * 这是「一次性重写整段前缀」，KV 前缀缓存全部作废。
+   * 渐进裁剪把代价分摊到多次，且始终保留较近的历史脉络。
+   */
+  trimMaxNodesPerRun: number;
   /** 确定性摘要的字符上限 */
   trimMaxSummaryChars: number;
   /** 首次重连等待（毫秒）；0 = 不重试 */
@@ -167,6 +175,9 @@ export const Config: Schema = Schema.object({
   // 阈值配错），纯 token 触发会让上下文无限增长；节点数不依赖任何服务，用它兜底。
   // 实测正常稳态 31–72 节点，120 只在异常时触发。
   trimMaxNodes: Schema.number().default(120),
+  // 单次最多裁 40 个（约 1/3）。宁可多裁几轮，也别一次重写整段前缀 ——
+  // 每裁一次就打断一次 KV 前缀缓存，粗粒度裁剪的代价是细粒度的数倍。
+  trimMaxNodesPerRun: Schema.number().default(40),
   // ★2026-11-07：2000 → 4000。实测 2000 字符的摘要会把关键结论截掉，
   // 用户反馈「关键信息基本都丢了」；4000 仍远小于被裁剪区间（约 9k tokens）。
   trimMaxSummaryChars: Schema.number().default(4000),
@@ -241,9 +252,12 @@ function buildPromptText(recallInjected: boolean): string {
     '发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），',
     '不要让它继续污染后续对话。',
     '',
-    '## 长期记忆沉淀（必须遵守）',
+    '## 长期记忆沉淀',
     '',
-    '每次回答的最后一行，必须输出一个 <lrc_memory> 块，格式固定：',
+    '插件会自动从你的回答里提取**约束**（"不要用 X"、"必须 Y"）和**决策**（"改用 X"），',
+    '所以不需要额外格式化输出。只要在回答里把结论说清楚即可。',
+    '',
+    '如果你愿意显式标注，可用下面的块（可选，不是必须）：',
     '',
     '<lrc_memory>',
     '- 决策：…',
@@ -253,9 +267,7 @@ function buildPromptText(recallInjected: boolean): string {
     '',
     '规则：',
     '- 只写本轮产生的决策、约束、最终结论；没有的条目直接省略。',
-    '- 本轮没有任何值得长期保留的内容时，输出 <lrc_memory>无新增</lrc_memory>。',
     '- 只写结论，不写过程、待办清单、选项罗列或代码。',
-    '- 标签必须出现在回答的最末尾，且每轮只出现一次。',
   ].join('\n');
 }
 
@@ -467,6 +479,13 @@ export function apply(ctx: Context, config: Config): void {
    */
   let turnHits = 0;
   let turnMisses = 0;
+  /**
+   * 通过**正文抽取**拿到约束的轮次数（2026-11-12 新增）。
+   *
+   * 与 `turnHits`（显式标签）并列展示：模型几乎不写标签，所以只看
+   * 「标签命中率」会长期 0%，被误读成插件失效。这个计数才是真实来源。
+   */
+  let proseTurns = 0;
   /** 整轮没有正文的轮次数（标签根本没地方出现，不该计入分母） */
   let turnNoText = 0;
   /** 当前轮状态 */
@@ -989,14 +1008,20 @@ export function apply(ctx: Context, config: Config): void {
    * 抽带结论标记的句子，否则整轮内容一条都搬不走。
    */
   async function finishTurn(session: unknown): Promise<void> {
-    // 1. 按轮记账：只有"本轮有正文"才计入命中率分母
+    // 1. 按轮记账：只有"本轮有正文"才计入分母
+    //
+    // ★2026-11-12：标签已改为**可选**（模型 98.2% 的轮次不输出它，
+    // 强制要求等于没有要求）。所以这个「命中率」不再是健康指标 ——
+    // 长期 0% 是正常的，沉淀改走正文抽取那条路。
+    // 两者一起打印，避免看到 0% 就误判成插件坏了。
     if (turnHadText) {
       if (turnTagSeen) turnHits += 1;
       else turnMisses += 1;
       const seen = turnHits + turnMisses;
       if (seen % 20 === 0) {
         ctx.logger.info(
-          `[lrc] <lrc_memory> 命中率 ${turnHits}/${seen} 轮（另有 ${turnNoText} 轮无正文）`,
+          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取 ${proseTurns} 轮` +
+            `（另有 ${turnNoText} 轮无正文）`,
         );
       }
     } else {
@@ -1088,6 +1113,46 @@ export function apply(ctx: Context, config: Config): void {
       turnHadText = true;
       if (extractMemoryTag(text) !== null) turnTagSeen = true;
       offloader.observe(text);
+
+      // ★2026-11-12：**不等 turn 结束**，正文里出现约束/决策就立刻收走。
+      //
+      // 为什么必须另开一条路：系统提示要求模型每轮输出 `<lrc_memory>`，
+      // 实测 56 条正文里只有 1 条带标签（1.8%）。于是沉淀几乎全靠
+      // 推理流兜底，抽到的是「CLI 已安装」这类过程记录。
+      //
+      // 模型其实一直在正文里说约束（「不要用 IDM 下载」「已改用 --stdin」），
+      // 只是没按要求的格式重写。这里直接抓它已经说出口的话。
+      //
+      // 为什么在事件里而不是 turn/end：turn 可能被用户中止（实测 turn 2/3
+      // 都是 aborted by user），中止时不会走到轮末兜底，那批约束就丢了。
+      const prose = constraintsFromProse(text);
+      if (prose.length > 0) {
+        // **在同步阶段捕获 sessionId**：下面的 `.then` 是异步的（要等 distill +
+        // migrate 两次 HTTP），期间用户可能已切到别的会话。若那时才读
+        // `currentSessionId`，会把 A 的约束写成 B 的归属 —— 正是上一轮
+        // 在 `flush()` 里修过的同一个坑，不能在新路径上重犯。
+        const proseSessionId = sessionId;
+        proseTurns += 1;
+        void offloader
+          .offloadItems(itemsFromTag(prose.join('\n')))
+          .then((result) => {
+            if (result.distilled > 0) {
+              if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+                saveSnapshot(result.snapshot, proseSessionId);
+              }
+              ctx.logger.info(
+                `[lrc] 正文抽取 ${result.distilled} 条约束/决策（写入 ${result.written}）`,
+              );
+            }
+          })
+          .catch((error: unknown) => {
+            ctx.logger.warn(
+              `[lrc] 正文抽取沉淀失败（不影响对话）：${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+      }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       // 只有「声明了 text/reasoning 块但 text 不是字符串」才是结构异常。
       // 纯 tool-call 消息本来就没有这两类块，不该报警（实测 39 条误报）。
@@ -1278,6 +1343,7 @@ export function apply(ctx: Context, config: Config): void {
               keepRecentNodes: config.keepRecentNodes,
               maxSummaryChars: config.trimMaxSummaryChars,
               force,
+              maxNodesPerRun: force ? config.trimMaxNodesPerRun : undefined,
             },
             log: (message) => ctx.logger.info(message),
           });

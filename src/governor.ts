@@ -161,7 +161,21 @@ export async function runGovernor(deps: {
   }
 
   if (executed.length > 0) {
-    log(`[lrc][governor] 第 ${state.steps} 步执行：${executed.join(' → ')}`);
+    // **区分「执行」与「生效」**。
+    //
+    // 原写法只列动作名（"执行：prune-results → trim"），读日志的人会以为
+    // trim 真的裁了。实测（session-e1419190）大量步骤是
+    // `below-threshold` / `no-range` —— 动作跑了，但什么都没裁。
+    // 排障时这个区别决定了「上下文为什么还在涨」，必须一眼可见。
+    const annotated = executed.map((name) => {
+      const outcome = state.lastOutcome[name];
+      if (outcome === undefined) return name;
+      if (outcome.ok) return name;
+      // 未生效的原因压成短标签，避免日志过长
+      const short = outcome.reason.split(':')[0] ?? outcome.reason;
+      return `${name}(${short})`;
+    });
+    log(`[lrc][governor] 第 ${state.steps} 步执行：${annotated.join(' → ')}`);
   }
   return executed;
 }

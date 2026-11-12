@@ -1059,6 +1059,10 @@ var CONSTRAINT_WORDS = [
   "不得",
   "不能",
   "不要",
+  "不会",
+  "不用",
+  "无需",
+  "不需要",
   "不允许",
   "不许",
   "不准",
@@ -1140,6 +1144,36 @@ function hardFilter(text) {
   }
   return kept.join("\n");
 }
+var DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|定为|选型|就用/;
+var PROSE_NARRATION = /^(?:我(?:先|来|去|再|正在|会先)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:检查|查看|读取|尝试|运行)(?:一下|下)/;
+var PAST_OR_PLANNING = /(?:过|正在|刚刚|刚才|目前|已经|接着|然后|所以|因此|但是|不过|可是)|(?:了[，。；\s]|了$)/;
+var STRONG_CONSTRAINT = /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:不要|不会|不用|别|不能)(?:用|走|把|在|连|写|加|改|删|碰|连)/;
+function constraintsFromProse(text, maxLines = 4) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const body = stripCodeFences(text);
+  for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
+    const line = raw.trim().replace(/^[-*+\d.)\s]+/, "").trim();
+    if (line.length < 8 || line.length > 200) continue;
+    if (isSmallTalk(line) || isOptionLabel(line) || looksLikeNormalLog(line)) continue;
+    if (/^\s{4,}|^(?:const|let|var|function|class|import|export|def|fn)\s/.test(line)) continue;
+    if (PROSE_NARRATION.test(line)) continue;
+    const masked = maskPaths(line);
+    const isDecision = DECISION_MARKERS.test(masked);
+    const isConstraint = STRONG_CONSTRAINT.test(masked);
+    if (!isDecision && !isConstraint) continue;
+    if (!isDecision && PAST_OR_PLANNING.test(masked)) continue;
+    const kind = isDecision ? "决策" : "约束";
+    const body2 = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, "").trim();
+    if (body2.length < 6) continue;
+    const key = body2.replace(/\s+/g, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(`${kind}：${body2}`);
+    if (out.length >= maxLines) break;
+  }
+  return out;
+}
 var CONCLUSION_MARKERS = [
   "结论",
   "因此",
@@ -1216,7 +1250,14 @@ var DEFAULT_OFFLOAD_CONFIG = {
 };
 function buildSnapshot(items, maxItems) {
   if (items.length === 0) return "";
-  const picked = items.slice(0, maxItems).map((item) => {
+  const rank = (item) => {
+    if (item.memory_type === "preference" || item.tags?.includes("constraint")) return 0;
+    if (item.memory_type === "decision" || item.tags?.includes("decision")) return 1;
+    if (item.tags?.includes("conclusion")) return 2;
+    return 3;
+  };
+  const ordered = items.map((item, index) => ({ item, index, rank: rank(item) })).sort((a, b) => a.rank !== b.rank ? a.rank - b.rank : a.index - b.index).map((x) => x.item);
+  const picked = ordered.slice(0, maxItems).map((item) => {
     const body = item.content.replace(/^\[[^\]]+\]\s*/, "");
     const short = body.length > 120 ? `${body.slice(0, 120)}…` : body;
     return short;
@@ -1690,7 +1731,7 @@ function toolDelta(event) {
   if (e?.type === "tool/result") return -1;
   return 0;
 }
-function selectTrimRange(nodes, events, keepRecentNodes) {
+function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {
   const n = nodes.length;
   if (n <= keepRecentNodes + 1) return null;
   const cut = new Array(n + 1).fill(false);
@@ -1700,7 +1741,8 @@ function selectTrimRange(nodes, events, keepRecentNodes) {
     running += toolDelta(events[nodes[i]]);
     cut[i + 1] = running === 0;
   }
-  let endIdx = n - keepRecentNodes - 1;
+  const hardEnd = n - keepRecentNodes - 1;
+  let endIdx = hardEnd;
   while (endIdx >= 0 && (cut[endIdx + 1] !== true || !isTrimBoundaryEligible(events[nodes[endIdx]]))) {
     endIdx -= 1;
   }
@@ -1710,6 +1752,14 @@ function selectTrimRange(nodes, events, keepRecentNodes) {
     startIdx += 1;
   }
   if (startIdx > endIdx) return null;
+  if (maxNodes !== void 0 && maxNodes > 0 && endIdx - startIdx + 1 > maxNodes) {
+    let shrunk = startIdx + maxNodes - 1;
+    while (shrunk >= startIdx && (cut[shrunk + 1] !== true || !isTrimBoundaryEligible(events[nodes[shrunk]]))) {
+      shrunk -= 1;
+    }
+    if (shrunk < startIdx) return null;
+    endIdx = shrunk;
+  }
   return {
     start: nodes[startIdx],
     end: nodes[endIdx],
@@ -2090,7 +2140,14 @@ async function trimContext(deps) {
       detail: `nodes=${Array.isArray(nodes) ? nodes.length : "missing"} events=${events === void 0 ? "missing" : events.length}`
     };
   }
-  const range = selectTrimRange(nodes, events, options.keepRecentNodes);
+  const range = selectTrimRange(
+    nodes,
+    events,
+    options.keepRecentNodes,
+    // 只在 force（节点数超限）时限制单次规模：token 超阈值是「真的太大了」，
+    // 该一次裁够；而节点数超限是常态兜底，必须摊开裁，否则每次重写整段前缀。
+    options.force ? options.maxNodesPerRun : void 0
+  );
   if (range === null) {
     return {
       ok: false,
@@ -2680,7 +2737,14 @@ async function runGovernor(deps) {
     }
   }
   if (executed.length > 0) {
-    log(`[lrc][governor] 第 ${state.steps} 步执行：${executed.join(" → ")}`);
+    const annotated = executed.map((name2) => {
+      const outcome = state.lastOutcome[name2];
+      if (outcome === void 0) return name2;
+      if (outcome.ok) return name2;
+      const short = outcome.reason.split(":")[0] ?? outcome.reason;
+      return `${name2}(${short})`;
+    });
+    log(`[lrc][governor] 第 ${state.steps} 步执行：${annotated.join(" → ")}`);
   }
   return executed;
 }
@@ -2755,6 +2819,9 @@ var Config = Schema.object({
   // 阈值配错），纯 token 触发会让上下文无限增长；节点数不依赖任何服务，用它兜底。
   // 实测正常稳态 31–72 节点，120 只在异常时触发。
   trimMaxNodes: Schema.number().default(120),
+  // 单次最多裁 40 个（约 1/3）。宁可多裁几轮，也别一次重写整段前缀 ——
+  // 每裁一次就打断一次 KV 前缀缓存，粗粒度裁剪的代价是细粒度的数倍。
+  trimMaxNodesPerRun: Schema.number().default(40),
   // ★2026-11-07：2000 → 4000。实测 2000 字符的摘要会把关键结论截掉，
   // 用户反馈「关键信息基本都丢了」；4000 仍远小于被裁剪区间（约 9k tokens）。
   trimMaxSummaryChars: Schema.number().default(4e3),
@@ -2802,9 +2869,12 @@ function buildPromptText(recallInjected) {
     "发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），",
     "不要让它继续污染后续对话。",
     "",
-    "## 长期记忆沉淀（必须遵守）",
+    "## 长期记忆沉淀",
     "",
-    "每次回答的最后一行，必须输出一个 <lrc_memory> 块，格式固定：",
+    '插件会自动从你的回答里提取**约束**（"不要用 X"、"必须 Y"）和**决策**（"改用 X"），',
+    "所以不需要额外格式化输出。只要在回答里把结论说清楚即可。",
+    "",
+    "如果你愿意显式标注，可用下面的块（可选，不是必须）：",
     "",
     "<lrc_memory>",
     "- 决策：…",
@@ -2814,9 +2884,7 @@ function buildPromptText(recallInjected) {
     "",
     "规则：",
     "- 只写本轮产生的决策、约束、最终结论；没有的条目直接省略。",
-    "- 本轮没有任何值得长期保留的内容时，输出 <lrc_memory>无新增</lrc_memory>。",
-    "- 只写结论，不写过程、待办清单、选项罗列或代码。",
-    "- 标签必须出现在回答的最末尾，且每轮只出现一次。"
+    "- 只写结论，不写过程、待办清单、选项罗列或代码。"
   ].join("\n");
 }
 function apply(ctx, config) {
@@ -2911,6 +2979,7 @@ function apply(ctx, config) {
   });
   let turnHits = 0;
   let turnMisses = 0;
+  let proseTurns = 0;
   let turnNoText = 0;
   let turnHadText = false;
   let turnTagSeen = false;
@@ -3159,7 +3228,7 @@ ${latestSnapshot}`;
       const seen = turnHits + turnMisses;
       if (seen % 20 === 0) {
         ctx.logger.info(
-          `[lrc] <lrc_memory> 命中率 ${turnHits}/${seen} 轮（另有 ${turnNoText} 轮无正文）`
+          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取 ${proseTurns} 轮（另有 ${turnNoText} 轮无正文）`
         );
       }
     } else {
@@ -3213,6 +3282,25 @@ ${latestSnapshot}`;
       turnHadText = true;
       if (extractMemoryTag(text) !== null) turnTagSeen = true;
       offloader.observe(text);
+      const prose = constraintsFromProse(text);
+      if (prose.length > 0) {
+        const proseSessionId = sessionId;
+        proseTurns += 1;
+        void offloader.offloadItems(itemsFromTag(prose.join("\n"))).then((result) => {
+          if (result.distilled > 0) {
+            if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+              saveSnapshot(result.snapshot, proseSessionId);
+            }
+            ctx.logger.info(
+              `[lrc] 正文抽取 ${result.distilled} 条约束/决策（写入 ${result.written}）`
+            );
+          }
+        }).catch((error) => {
+          ctx.logger.warn(
+            `[lrc] 正文抽取沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       warnedShape = true;
       const data = event?.data;
@@ -3352,7 +3440,8 @@ ${latestSnapshot}`;
               minTokens: trimMinTokens,
               keepRecentNodes: config.keepRecentNodes,
               maxSummaryChars: config.trimMaxSummaryChars,
-              force
+              force,
+              maxNodesPerRun: force ? config.trimMaxNodesPerRun : void 0
             },
             log: (message) => ctx.logger.info(message)
           });

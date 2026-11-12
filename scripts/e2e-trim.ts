@@ -523,6 +523,55 @@ const forced = await trimContext({
 });
 check('force 跳过 token 阈值', forced.ok === true && forced.reason === 'ok', forced);
 
+// ★2026-11-12 实测回归：节点数超限时必须**渐进裁剪**，不能一次砍 92%
+//
+// 事故（session-e1419190）：141 个节点一次裁掉 131 个，08:27 又裁 127/137。
+// 每次都是「一次性重写整段前缀」，KV 前缀缓存全部作废，且只剩 8 个节点
+// 让模型丢失工作脉络。
+{
+  // 记录 compactRegion 实际收到的区间，用它算「裁了多少节点」
+  function engineWithRange(): { engine: ReturnType<typeof makeEngine>; ranges: Array<{ start: number; end: number }> } {
+    const ranges: Array<{ start: number; end: number }> = [];
+    const engine = makeEngine(100);
+    engine.compactRegion = async (start: number, end: number) => {
+      ranges.push({ start, end });
+      await engine.summarize({ messages: [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(200) }] }] });
+      return { start, end };
+    };
+    return { engine, ranges };
+  }
+
+  const limited = engineWithRange();
+  await trimContext({
+    ctx: { get: (n: string) => (n === 'agentPresets' ? { serviceFor: () => limited.engine } : undefined) },
+    agent,
+    options: { minTokens: 60000, keepRecentNodes: 2, maxSummaryChars: 2000, force: true, maxNodesPerRun: 3 },
+    log: () => {},
+  });
+  const unlimited = engineWithRange();
+  await trimContext({
+    ctx: { get: (n: string) => (n === 'agentPresets' ? { serviceFor: () => unlimited.engine } : undefined) },
+    agent,
+    options: { minTokens: 60000, keepRecentNodes: 2, maxSummaryChars: 2000, force: true },
+    log: () => {},
+  });
+
+  // nodes 是 seq 数组；用下标差算节点数
+  const count = (r: Array<{ start: number; end: number }>): number => {
+    if (r.length === 0) return 0;
+    const { start, end } = r[0];
+    const si = nodes.indexOf(start);
+    const ei = nodes.indexOf(end);
+    return si >= 0 && ei >= 0 ? ei - si + 1 : 0;
+  };
+  const limitedCount = count(limited.ranges);
+  const unlimitedCount = count(unlimited.ranges);
+  console.log(`  渐进裁剪: 单次裁 ${limitedCount} 个；不限制: 裁 ${unlimitedCount} 个`);
+  check('maxNodesPerRun 真的限制了单次规模', limitedCount > 0 && limitedCount <= 3, limitedCount);
+  check('不限制时裁得更多', unlimitedCount > limitedCount, { limitedCount, unlimitedCount });
+  check('渐进裁剪不是一次砍光', limitedCount < unlimitedCount, { limitedCount, unlimitedCount });
+}
+
 const okEngine = makeEngine(100000);
 const originalSummarize = okEngine.summarize;
 const logs: string[] = [];

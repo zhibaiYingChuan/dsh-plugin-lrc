@@ -239,6 +239,10 @@ export const CONSTRAINT_WORDS = [
   '不得',
   '不能',
   '不要',
+  '不会',
+  '不用',
+  '无需',
+  '不需要',
   '不允许',
   '不许',
   '不准',
@@ -380,6 +384,125 @@ export function hardFilter(text: string): string {
     kept.push(line);
   }
   return kept.join('\n');
+}
+
+/** 决策类词：从正文里识别「已经定下来的做法」。 */
+const DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|定为|选型|就用/;
+
+/**
+ * 正文里的**过程叙述**：第一人称正在做事，不是结论也不是约束。
+ *
+ * 与 `conclusionsFromReasoning` 里的 `PROCESS_NARRATION` 不同：那个针对
+ * 推理流（英文居多），这个针对**正文答复**（中文居多）。
+ */
+const PROSE_NARRATION =
+  /^(?:我(?:先|来|去|再|正在|会先)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:检查|查看|读取|尝试|运行)(?:一下|下)/;
+
+/**
+ * 「已经在做/刚刚发生」的句式 —— 不是约束。
+ *
+ * 实测抽到的噪声（session-e1419190）：
+ * ```
+ * 约束：开工前先定几件事，其余我按默认来          ← 过程安排
+ * 约束：你上一轮的意图是「用 mh 创建…」，所以我先确认…  ← 回顾
+ * 约束：这个 CLI 现在能启动了，但它默认把缓存写到…      ← 状态陈述
+ * ```
+ *
+ * 这类句子的共同点：描述**已发生**或**即将做**，而不是**必须遵守**。
+ * 真正的约束是「缓存必须放在工作区外」这种无主语、无条件成立的陈述。
+ */
+const PAST_OR_PLANNING =
+  /(?:过|正在|刚刚|刚才|目前|已经|接着|然后|所以|因此|但是|不过|可是)|(?:了[，。；\s]|了$)/;
+
+/**
+ * 真正的「约束」形态：情态/祈使/禁止。
+ *
+ * 比 `CONSTRAINT_WORDS` 更严：词表里的「改用/改成/换成」属于**决策**，
+ * 「不会/不用」在过程叙述里也常见（"这个 CLI 不会启动"是状态，不是约束）。
+ * 这里只认**强制性**表述，用来区分「约束」与「状态」。
+ */
+const STRONG_CONSTRAINT =
+  /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:不要|不会|不用|别|不能)(?:用|走|把|在|连|写|加|改|删|碰|连)/;
+
+/**
+ * 从**正文**里抽取「约束 / 决策」（不依赖 `<lrc_memory>` 标签）。
+ *
+ * ## 为什么必须有这一层
+ *
+ * 系统提示要求「每次回答最后一行必须输出 <lrc_memory>」。实测
+ * （session-e1419190，56 条有正文的 assistant 消息）：
+ *
+ * | 指标 | 数值 |
+ * |---|---|
+ * | 带标签的轮次 | **1 条（1.8%）** |
+ * | 正文长度 P50 | **46 字符** |
+ *
+ * 98.2% 的轮次没有标签，于是沉淀只能退回硬规则 —— 而硬规则从推理流
+ * 抽的是「CLI 已安装」「binary truncated」这类**过程记录**。
+ * 这些过程记录被当作「状态」反复注入，与当前任务无关。
+ *
+ * 这与「模型从未想起调 lrc_recall」是同一个病：**要求模型做一个额外的、
+ * 与它当前任务无关的动作，它就不会做**。两次都是如此。
+ *
+ * ## 做法
+ *
+ * 模型其实**一直在说**约束和决策，只是混在正常答复里：
+ * 「不要用 IDM 下载」、「已改用 --stdin 传入」。这里直接从正文抓这些句子，
+ * 不要求它换一种格式重写一遍。
+ *
+ * @param text - assistant 正文
+ * @param maxLines - 最多返回几条
+ * @returns 形如 `约束：…` / `决策：…` 的行（可直接喂 `itemsFromTag`）
+ */
+export function constraintsFromProse(text: string, maxLines = 4): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  // **必须先整段剥掉代码围栏**。
+  //
+  // 逐句判定时 `stripCodeFences(line) !== line` 是无效的：那时围栏标记
+  // 已经被切句切走了，单行内看不到 ```，于是代码行被当成正文抽出来。
+  // 实测会把 `const x = 1; // 必须用 const` 抽成「约束」。
+  const body = stripCodeFences(text);
+
+  // 按句切（含中英文句读），逐句判定
+  for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
+    const line = raw.trim().replace(/^[-*+\d.)\s]+/, '').trim();
+    if (line.length < 8 || line.length > 200) continue;
+    if (isSmallTalk(line) || isOptionLabel(line) || looksLikeNormalLog(line)) continue;
+    // 兜底：整段剥完围栏后仍以代码特征开头的行（如缩进 4 空格以上的代码）
+    if (/^\s{4,}|^(?:const|let|var|function|class|import|export|def|fn)\s/.test(line)) continue;
+    // 过程叙述不是约束（"我先看一下文件"）
+    if (PROSE_NARRATION.test(line)) continue;
+
+    // 路径先挖掉再匹配，避免 `docs/禁止.md` 骗过判定
+    const masked = maskPaths(line);
+
+    // 判定顺序有讲究：先认「决策」（改用/换成），再认「强约束」（必须/禁止）。
+    //
+    // 不用宽泛的 `CONSTRAINT_WORDS`：实测那样会把「现在改用无 BOM 方式」
+    // 「缓存必须放在工作区外」之外的大量**状态陈述**也捞进来
+    // （"这个 CLI 现在能启动了"、"刚刚安装完成"），
+    // 覆盖率 25% 看似变好，实际一半是噪声。
+    const isDecision = DECISION_MARKERS.test(masked);
+    const isConstraint = STRONG_CONSTRAINT.test(masked);
+    if (!isDecision && !isConstraint) continue;
+
+    // 决策句即使带「了/现在」也要留（"已改用 --stdin" 是有价值的决策）；
+    // 约束句若含过去/计划语气，多半是状态描述，丢掉。
+    if (!isDecision && PAST_OR_PLANNING.test(masked)) continue;
+
+    const kind = isDecision ? '决策' : '约束';
+    const body = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, '').trim();
+    if (body.length < 6) continue;
+
+    const key = body.replace(/\s+/g, '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(`${kind}：${body}`);
+    if (out.length >= maxLines) break;
+  }
+  return out;
 }
 
 /**
