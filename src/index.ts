@@ -36,6 +36,7 @@ import {
   hasMalformedTextBlock,
   isRealUserMessage,
   linesFromSession,
+  linesWithOrigin,
   messageContent,
   reasoningBlocksOnly,
   textBlocksOnly,
@@ -1116,7 +1117,7 @@ export function apply(ctx: Context, config: Config): void {
       // 而 `bindSnapshotToSession` 拿到的是真实 ID ⇒ 下次启动判定归属不符、
       // 把本会话的快照丢掉。空串让"取不到 ID"这件事显式可辨（见 saveSnapshot）。
       const sessionId = (session as { id?: string })?.id ?? '';
-      const lines = linesFromSession(session);
+      const lines = linesWithOrigin(session);
       if (lines.length === 0) {
         // 只警告一次：否则每一步都会刷同一条日志
         if (!warnedEmpty) {
@@ -1329,7 +1330,12 @@ export function apply(ctx: Context, config: Config): void {
       // 这条路径比「靠 `linesFromSession` 放行 + `hardFilter` 过滤」可靠：
       // `hardFilter` 有 20 字门槛，「音频在桌面」这种口语会被直接吞掉
       // （实测 distilled=0、零 HTTP、零日志）。这里显式收，来源标 `user`。
-      if (isKeyResourceLocation(userText, true)) {
+      //
+      // **与纠正路径互斥**：同一句用户话若已被 `constraintsFromUser` 收走
+      // （如 IDM 纠正句里也提到「音频在的位置」），不再重复包成 `[事实]`。
+      // 两条独立调用之间没有共享查重窗口，实测会产生语义重复的两条条目
+      // 白占快照槽位。
+      if (corrections.length === 0 && isKeyResourceLocation(userText, true)) {
         const body = userText.trim();
         if (body.length > 0) {
           offloadExtracted(

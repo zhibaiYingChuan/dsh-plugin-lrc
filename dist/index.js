@@ -1203,7 +1203,6 @@ function carriesResourceLocation(text) {
   }
   return false;
 }
-var LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
 var ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
 var MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
 var LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
@@ -1212,9 +1211,13 @@ function isKeyResourceLocation(text, fromUser) {
   const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
   if (ENGLISH_PROCESS.test(body)) return false;
   if (MEDIA_FILE.test(body)) return true;
-  const hasLocation = LEADING_PATH.test(body) || LOCATION_HINT.test(body);
-  const hasResourceNoun = /(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)/.test(body);
-  return hasLocation && hasResourceNoun;
+  if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
+  const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
+  const LOC = "(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)";
+  const adjacent = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
+  if (!adjacent.test(body)) return false;
+  if (/(?:在|位于|放在|放到|存在|来自)的/.test(body)) return false;
+  return true;
 }
 var USER_CORRECTION = (
   // 必须**有第二人称指向 + 完成态**（你）或「说过 N 次」的明确重申。
@@ -1717,25 +1720,39 @@ var Offloader = class {
   async offload(sessionId, lines) {
     const epoch = this.poolEpoch;
     const state = this.cursors.get(sessionId);
-    const slice = sliceByCursor(lines, state);
+    const plain = lines.map((l) => typeof l === "string" ? l : l.text);
+    const originOf = (i) => {
+      const l = lines[i];
+      return typeof l === "string" ? void 0 : l.origin;
+    };
+    const slice = sliceByCursor(plain, state);
     if (slice.text.trim().length === 0) {
       this.resetCounters();
       return null;
     }
-    const newLines = lines.slice(slice.fromLine);
+    const newLines = plain.slice(slice.fromLine);
     const taggedItems = [];
     const untagged = [];
-    for (const message of newLines) {
+    const untaggedOrigin = [];
+    for (let i = 0; i < newLines.length; i += 1) {
+      const message = newLines[i];
+      const origin = originOf(slice.fromLine + i);
       const tag = extractMemoryTag(message);
       if (tag !== null) {
-        if (!isNoUpdate(tag)) taggedItems.push(...itemsFromTag(tag));
+        if (!isNoUpdate(tag)) {
+          taggedItems.push(...itemsFromTag(tag).map((item) => origin === void 0 ? item : { ...item, origin }));
+        }
         continue;
       }
       const cleaned = hardFilter(message);
-      if (cleaned.trim().length > 0) untagged.push(cleaned);
+      if (cleaned.trim().length > 0) {
+        untagged.push(cleaned);
+        untaggedOrigin.push(origin);
+      }
     }
     const freshTagged = [];
     const freshBlocks = [];
+    const freshBlockOrigin = [];
     let deduped = 0;
     for (const item of taggedItems) {
       const sameInBatch = freshTagged.some(
@@ -1747,16 +1764,18 @@ var Offloader = class {
       }
       freshTagged.push(item);
     }
-    for (const block of untagged) {
+    for (let i = 0; i < untagged.length; i += 1) {
+      const block = untagged[i];
       const sameInBatch = freshBlocks.some((f) => areNearDuplicate(f, block, this.config.dedupThreshold));
       if (sameInBatch || isDuplicate(block, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
       freshBlocks.push(block);
+      freshBlockOrigin.push(untaggedOrigin[i]);
     }
     if (freshTagged.length === 0 && freshBlocks.length === 0) {
-      this.commitCursor(sessionId, lines, slice.fromLine);
+      this.commitCursor(sessionId, plain, slice.fromLine);
       const empty = {
         charsSent: 0,
         distilled: 0,
@@ -1779,7 +1798,11 @@ var Offloader = class {
         this.config.project,
         this.config.maxItems
       );
-      items = [...items, ...distilled.items];
+      const batchOrigin = freshBlockOrigin.includes("user") ? "user" : freshBlockOrigin.includes("assistant") ? "assistant" : void 0;
+      items = [
+        ...items,
+        ...distilled.items.map((item) => batchOrigin === void 0 ? item : { ...item, origin: batchOrigin })
+      ];
     }
     let written = 0;
     let merged = 0;
@@ -1788,7 +1811,7 @@ var Offloader = class {
       written = migrated.written;
       merged = migrated.merged;
     }
-    this.commitCursor(sessionId, lines, slice.fromLine);
+    this.commitCursor(sessionId, plain, slice.fromLine);
     this.recent.push(...freshTagged.map((item) => item.content), ...freshBlocks);
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
@@ -1942,7 +1965,7 @@ function isRealUserMessage(event) {
 function hasUserConstraint(text) {
   return hasConstraintMarker(text);
 }
-function linesFromSession(session) {
+function linesWithOrigin(session) {
   const log = session?.log;
   if (!Array.isArray(log)) return [];
   const lines = [];
@@ -1951,13 +1974,13 @@ function linesFromSession(session) {
     const category = classifyEvent(event);
     if (category === "assistant") {
       const text = textBlocksOnly(event.data?.message?.content);
-      if (text.length > 0) lines.push(text);
+      if (text.length > 0) lines.push({ text, origin: "assistant" });
     } else if (category === "user") {
       if (!isRealUserMessage(event)) continue;
       const text = textBlocksOnly(event.data?.content);
       if (text.length === 0) continue;
       if (!hasUserConstraint(text) && !carriesResourceLocation(text)) continue;
-      lines.push(text);
+      lines.push({ text, origin: "user" });
     }
   }
   return lines;
@@ -3572,7 +3595,7 @@ ${latestSnapshot}`;
     flushing = true;
     try {
       const sessionId = session?.id ?? "";
-      const lines = linesFromSession(session);
+      const lines = linesWithOrigin(session);
       if (lines.length === 0) {
         if (!warnedEmpty) {
           warnedEmpty = true;
@@ -3696,7 +3719,7 @@ ${latestSnapshot}`;
           "用户纠正"
         );
       }
-      if (isKeyResourceLocation(userText, true)) {
+      if (corrections.length === 0 && isKeyResourceLocation(userText, true)) {
         const body = userText.trim();
         if (body.length > 0) {
           offloadExtracted(

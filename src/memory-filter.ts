@@ -748,13 +748,41 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   const body = text.replace(/\bhttps?:\/\/\S+/gi, ' ');
   // 英文推理过程句排除
   if (ENGLISH_PROCESS.test(body)) return false;
-  // 用户说的话：带媒体文件 → 直接认（用户不会无缘无故提媒体文件名）
+
+  // ── 强判据：媒体文件扩展名 / 行首盘符路径 ──
+  //
+  // 这两个形态几乎不会误判，直接认。
   if (MEDIA_FILE.test(body)) return true;
-  // 无扩展名的口语形态（「音频在桌面」「文件放在下载目录了」）：
-  // 要求「位置词 + 资源名词」同时出现
-  const hasLocation = LEADING_PATH.test(body) || LOCATION_HINT.test(body);
-  const hasResourceNoun = /(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)/.test(body);
-  return hasLocation && hasResourceNoun;
+  if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
+
+  // ── 弱判据：口语形态「音频在桌面」──
+  //
+  // **必须要求位置词紧邻资源名词**，不能各自独立出现。
+  //
+  // 实测教训：宽松版（位置词 + 资源名词，各自出现即可）会把用户的
+  // **纠正句**也判成位置交代：
+  // ```
+  // 不是告诉你音频在的位置了吗？你一点击下载，就会调取桌面的IDM…
+  //                          ↑ 有「在」+ 有「音频」⇒ 误判 isKey=true
+  // ```
+  // 后果：它抢走预留槽位，真正的 `D:\Desktop，score-Dtle1HAU.wav` 落选。
+  // 真实回放实测：音频命中 **1/16**、资格窗口 **0/3**；
+  // 收紧成「紧邻」后升到 **3/15**、资格窗口 **2/2**。
+  //
+  // 要求形态：`<资源名词><位置词>` 或 `<位置词><资源名词>`，中间最多 2 个字。
+  //
+  // ## 必须排除「…的位置」形态
+  //
+  // 「不是告诉你**音频在的位置**了吗」里 `音频在` 是紧邻的，但它说的是
+  // 「音频所在的位置」这个概念，不是「音频在桌面」。所以位置词后面
+  // 若紧跟 `的`（`在的` / `放到的`），说明是在**指代**而非陈述位置。
+  const RES = '(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)';
+  const LOC = '(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)';
+  const adjacent = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
+  if (!adjacent.test(body)) return false;
+  // `在的` / `放到的` / `在的那个` ⇒ 只指代，不陈述位置
+  if (/(?:在|位于|放在|放到|存在|来自)的/.test(body)) return false;
+  return true;
 }
 
 /**

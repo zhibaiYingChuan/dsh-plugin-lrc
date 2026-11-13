@@ -15,6 +15,7 @@ import {
   isKeyResourceLocation,
 } from '../src/memory-filter.ts';
 import { Offloader, buildSnapshot } from '../src/offloader.ts';
+import { linesWithOrigin } from '../src/session-text.ts';
 import { CursorStore } from '../src/cursor.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -513,7 +514,7 @@ console.log('=== 7f-1) 提权判据看来源 ===');
   });
   const rank0Pool: DistilledItem[] = [];
   for (let i = 0; i < 10; i += 1) {
-    rank0Pool.push(mk(`[约束] 约束${i}：必须遵守第 ${i} 条规范`, 'preference', ['constraint']));
+    rank0Pool.push(mk(`[约束] 约束${i}：必须遵守第 ${i} 条规范`, 'preference', ['constraint'], 'assistant'));
   }
   rank0Pool.push(mk('[结论] 桌面上的文件与工程里的 assets/score.wav 的 MD5 一致', 'fact', ['conclusion'], 'assistant'));
   rank0Pool.push(mk('[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'fact', ['resource', 'user'], 'user'));
@@ -522,6 +523,28 @@ console.log('=== 7f-1) 提权判据看来源 ===');
   console.log(`    rank0 竞争 → ${snapRank0}`);
   check('用户资源位置抢到预留槽位', snapRank0.includes('score-Dtle1HAU'), snapRank0);
   check('中文助手结论未抢到槽位', !snapRank0.includes('MD5'), snapRank0);
+
+  // ★第九轮 P0-1：**用户自己的纠正句**不得冒充资源位置抢槽。
+  // 原文：`不是告诉你音频在的位置了吗？你一点击下载，就会调取桌面的IDM…`
+  // 它同时有「音频」和「在」，旧判据误判 isKey=true，把真位置挤掉。
+  check(
+    'IDM 纠正句不算资源位置',
+    !isKeyResourceLocation(
+      '不是告诉你音频在的位置了吗？你一点击下载，就会调取桌面的IDM的下载软件，然后你就不知道下载到哪了。',
+      true,
+    ),
+  );
+
+  // 真实竞争组合：IDM 约束 + 真资源位置共存（这正是本轮 bug 的现场）
+  const realCombo: DistilledItem[] = [
+    mk('[约束] 不要走 IDM 下载音频，直接用桌面文件', 'preference', ['constraint'], 'assistant'),
+    mk('[约束] 不是告诉你音频在的位置了吗；你一点击下载，就会调取IDM', 'preference', ['constraint'], 'user'),
+    mk('[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'fact', ['resource', 'user'], 'user'),
+  ];
+  const snapCombo = buildSnapshot(realCombo, 3);
+  console.log(`    IDM+资源位置组合 → ${snapCombo}`);
+  check('组合场景：资源位置出现', snapCombo.includes('score-Dtle1HAU'), snapCombo);
+  check('组合场景：IDM 约束也出现', snapCombo.includes('IDM'), snapCombo);
 }
 
 // ── 7f-2) 池淘汰必须与取词同源（资源位置要钉住） ──
@@ -555,6 +578,53 @@ console.log('=== 7f-2) 池满后资源位置仍在池 ===');
   console.log(`    池=${pool.snapshotPool.length} 资源位置仍在池=${pool.snapshotPool.some((i) => i.content.includes('score-Dtle1HAU'))}`);
   check('池满后资源位置仍在池里', pool.snapshotPool.some((i) => i.content.includes('score-Dtle1HAU')), pool.snapshotPool.length);
   check('池仍不超上限', pool.snapshotPool.length <= 20, pool.snapshotPool.length);
+}
+
+// ── 7f-3) flush 路径也必须带来源（否则池满后资源位置被挤掉） ──
+//
+// ★第九轮 P0-2：`linesFromSession` 只返回字符串，`offload → distill`
+// 拿到的条目没有来源 ⇒ `origin=undefined` ⇒ 不提权。
+// 实测：真位置经 flush 入池后灌 18 条助手约束，注入里**音频完全消失**。
+console.log('=== 7f-3) flush 路径带来源 ===');
+{
+  const session = {
+    log: [
+      { type: 'system/message', data: { content: [{ type: 'text', text: 'sys' }] } },
+      {
+        type: 'user/message',
+        data: { content: [{ type: 'text', text: 'D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频。继续任务' }] },
+      },
+      {
+        type: 'assistant/message',
+        data: {
+          message: { content: [{ type: 'text', text: '桌面上的文件与工程里的 assets/score.wav 的 MD5 一致' }] },
+        },
+      },
+    ],
+  };
+  const lines = linesWithOrigin(session);
+  check('用户消息标 origin=user', lines.some((l) => l.origin === 'user' && l.text.includes('score-Dtle1HAU')), lines);
+  check('助手消息标 origin=assistant', lines.some((l) => l.origin === 'assistant'), lines);
+
+  // 池满 19/20 时，用户资源位置仍必须能注入
+  const off = new Offloader(null, new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-flush.json`)), {
+    snapshotItems: 3,
+  });
+  const pool = off as unknown as {
+    buildPooledSnapshot: (i: DistilledItem[]) => string;
+    snapshotPool: DistilledItem[];
+  };
+  const mk = (c: string, t: string, tags: string[], origin?: 'user' | 'assistant'): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0], origin,
+  });
+  pool.buildPooledSnapshot([mk('[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'fact', ['resource'], 'user')]);
+  const batch: DistilledItem[] = [];
+  for (let i = 0; i < 18; i += 1) {
+    batch.push(mk(`[约束] 助手约束${i}：必须遵守规范`, 'preference', ['constraint'], 'assistant'));
+  }
+  const snapFlush = pool.buildPooledSnapshot(batch);
+  console.log(`    池=${pool.snapshotPool.length} 注入=${snapFlush}`);
+  check('池满后资源位置仍能注入', snapFlush.includes('score-Dtle1HAU'), snapFlush);
 }
 
 // ── 7g) 表格行 / 计数句不得冒充决策 ──

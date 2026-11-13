@@ -178,9 +178,28 @@ export function hasUserConstraint(text: string): boolean {
  * `log` 是 append-only 的事件数组，正好满足游标"按行号推进"的前提。
  */
 export function linesFromSession(session: unknown): string[] {
+  return linesWithOrigin(session).map((l) => l.text);
+}
+
+/**
+ * 带来源的对话行（`offload` 用来给条目打 `origin`）。
+ *
+ * ## 为什么需要来源
+ *
+ * 快照提权（资源位置）必须区分「谁在说」：用户交代「音频在桌面」
+ * 与助手陈述「桌面上的文件与 assets/score.wav 的 MD5 一致」在文本形态上
+ * 无法区分。早期版本靠词表区分，三代判据（宽松 / 黑名单 / 白名单）全部失败，
+ * 真资源位置在真实回放里只命中 1/16。
+ *
+ * 只有把来源一路带下去，`keepPriority` 才能正确只给用户条目提权。
+ *
+ * @param session - 宿主会话
+ * @returns 每条对话文本 + 来源
+ */
+export function linesWithOrigin(session: unknown): Array<{ text: string; origin: 'user' | 'assistant' }> {
   const log = (session as { log?: unknown })?.log;
   if (!Array.isArray(log)) return [];
-  const lines: string[] = [];
+  const lines: Array<{ text: string; origin: 'user' | 'assistant' }> = [];
   for (const raw of log) {
     const event = raw as {
       type?: string;
@@ -190,7 +209,7 @@ export function linesFromSession(session: unknown): string[] {
     if (category === 'assistant') {
       // 只取正文块：推理流不进沉淀源（否则会把内部思考写成长期记忆）
       const text = textBlocksOnly(event.data?.message?.content);
-      if (text.length > 0) lines.push(text);
+      if (text.length > 0) lines.push({ text, origin: 'assistant' });
     } else if (category === 'user') {
       // `user/message` 不只装用户说的话：DSH 会把技能目录、运行时上下文、
       // 时间上下文、模型切换通知都塞进同一个事件类型，靠 `data.source.kind` 区分。
@@ -210,7 +229,7 @@ export function linesFromSession(session: unknown): string[] {
       // 判据只看「有没有具体的文件/路径 token」，不猜语义：路径类内容
       // 被 `maskPaths` 挖掉后正文会很短，这里必须先判断原文。
       if (!hasUserConstraint(text) && !carriesResourceLocation(text)) continue;
-      lines.push(text);
+      lines.push({ text, origin: 'user' });
     }
   }
   return lines;

@@ -672,11 +672,20 @@ export class Offloader {
    * @param lines 当前 transcript 的全部行
    * @returns 卸载结果；没有新增内容时返回 null
    */
-  async offload(sessionId: string, lines: string[]): Promise<OffloadResult | null> {
+  async offload(
+    sessionId: string,
+    lines: readonly (string | { text: string; origin?: 'user' | 'assistant' })[],
+  ): Promise<OffloadResult | null> {
     // 同 `offloadItems`：在 await 之前捕获代次，避免在飞结果污染新会话的池子
     const epoch = this.poolEpoch;
     const state = this.cursors.get(sessionId);
-    const slice = sliceByCursor(lines, state);
+    // 兼容纯字符串（旧调用方 / 测试）与带来源的对象两种形态
+    const plain = lines.map((l) => (typeof l === 'string' ? l : l.text));
+    const originOf = (i: number): 'user' | 'assistant' | undefined => {
+      const l = lines[i];
+      return typeof l === 'string' ? undefined : l.origin;
+    };
+    const slice = sliceByCursor(plain, state);
 
     if (slice.text.trim().length === 0) {
       this.resetCounters();
@@ -688,26 +697,38 @@ export class Offloader {
     // **按"消息"整段过滤，不能按物理行**：`stripCodeFences` 需要跨行维护
     // 围栏状态，逐行调用时状态永远是初始值，围栏内的代码会直接透传。
     // `lines` 的每个元素就是一条完整消息（可能多行），正好是过滤单元。
-    const newLines = lines.slice(slice.fromLine);
+    const newLines = plain.slice(slice.fromLine);
 
     // 第二层产物：标签内容直接成条目，**绕过 distill**（避免二次过滤）
     const taggedItems: DistilledItem[] = [];
     // 兜底路径：没有标签的消息走硬规则 + distill
     const untagged: string[] = [];
+    // 与 `untagged` 一一对应的来源（下标始终对齐）
+    const untaggedOrigin: Array<'user' | 'assistant' | undefined> = [];
 
-    for (const message of newLines) {
+    for (let i = 0; i < newLines.length; i += 1) {
+      const message = newLines[i] as string;
+      const origin = originOf(slice.fromLine + i);
       const tag = extractMemoryTag(message);
       if (tag !== null) {
-        if (!isNoUpdate(tag)) taggedItems.push(...itemsFromTag(tag));
+        if (!isNoUpdate(tag)) {
+          // 标签内容继承所在消息的来源，否则用户消息里的标签会失去 `user`
+          taggedItems.push(...itemsFromTag(tag).map((item) => (origin === undefined ? item : { ...item, origin })));
+        }
         continue;
       }
       const cleaned = hardFilter(message);
-      if (cleaned.trim().length > 0) untagged.push(cleaned);
+      if (cleaned.trim().length > 0) {
+        untagged.push(cleaned);
+        untaggedOrigin.push(origin);
+      }
     }
 
     // 第三层：本地查重 —— 换措辞复述连 HTTP 都不发
     const freshTagged: DistilledItem[] = [];
     const freshBlocks: string[] = [];
+    /** 与 `freshBlocks` 一一对应的来源 */
+    const freshBlockOrigin: Array<'user' | 'assistant' | undefined> = [];
     let deduped = 0;
     for (const item of taggedItems) {
       // 同批查重：与 `offloadItems` 同因（模型常一轮内重复同一条约束）
@@ -720,18 +741,20 @@ export class Offloader {
       }
       freshTagged.push(item);
     }
-    for (const block of untagged) {
+    for (let i = 0; i < untagged.length; i += 1) {
+      const block = untagged[i] as string;
       const sameInBatch = freshBlocks.some((f) => areNearDuplicate(f, block, this.config.dedupThreshold));
       if (sameInBatch || isDuplicate(block, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
       freshBlocks.push(block);
+      freshBlockOrigin.push(untaggedOrigin[i]);
     }
 
     // 没有新内容：这段确实没有可沉淀的东西，游标可以安全推进
     if (freshTagged.length === 0 && freshBlocks.length === 0) {
-      this.commitCursor(sessionId, lines, slice.fromLine);
+      this.commitCursor(sessionId, plain, slice.fromLine);
       const empty: OffloadResult = {
         charsSent: 0,
         distilled: 0,
@@ -756,7 +779,18 @@ export class Offloader {
         this.config.project,
         this.config.maxItems,
       );
-      items = [...items, ...distilled.items];
+      // **`distill` 返回的条目没有来源**（那是 LRC 侧的规则式提炼）。
+      // 按块级来源回填：只要这一批里有用户块，就按 `user` 算 ——
+      // 用户消息本来极少，误判代价远低于把用户的资源位置降级。
+      const batchOrigin: 'user' | 'assistant' | undefined = freshBlockOrigin.includes('user')
+        ? 'user'
+        : freshBlockOrigin.includes('assistant')
+          ? 'assistant'
+          : undefined;
+      items = [
+        ...items,
+        ...distilled.items.map((item) => (batchOrigin === undefined ? item : { ...item, origin: batchOrigin })),
+      ];
     }
 
     let written = 0;
@@ -769,7 +803,7 @@ export class Offloader {
 
     // **只有 distill + migrate 都成功才推进游标**。
     // 提前推进会让任何一次网络抖动 / LRC 重启 / 超时把这一批对话永久丢掉。
-    this.commitCursor(sessionId, lines, slice.fromLine);
+    this.commitCursor(sessionId, plain, slice.fromLine);
 
     // 记录已发送的块，供后续查重
     this.recent.push(...freshTagged.map((item) => item.content), ...freshBlocks);
