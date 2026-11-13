@@ -763,16 +763,29 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
 
   // ── 强判据：媒体文件扩展名 / 行首盘符路径 ──
   //
-  // 这两个形态几乎不会误判，直接认。
-  // 但要先排除「整行就是一个裸路径」的指针行：
-  // `materials/架构图.png` 是「见这个文件」，不是「资源在哪」。
-  const isBarePath = /^\s*[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]*[\\/][^\s]*$/.test(body);
-  if (!isBarePath) {
-    if (MEDIA_FILE.test(body)) return true;
+  // ## 必须排除两种「只有路径、没有交代」的形态
+  //
+  // 1. **整行就是一个带目录的裸路径**：`materials/架构图.png`、`G:\proj\端口.md`
+  //    —— 这是「见这个文件」，不是「资源在哪」。
+  // 2. **整行就是一个裸文件名**：`score-Dtle1HAU.wav`
+  //    —— 同理。上一版 `isBarePath` 只认含 `[\\/]` 的形态，裸文件名漏过，
+  //    实测它会被标成 `origin=user` 并独占预留槽位：
+  //    `maxItems=2 → [LRC 状态] score-Dtle1HAU.wav；不要走 IDM 下载音频`
+  //
+  // 判据统一为：**整行除了这个文件 token 之外没有别的实质内容** ⇒ 是纯指针行。
+  // 真实的资源位置交代一定带说明或位置词：
+  // `D:\Desktop，score-Dtle1HAU.wav，这是你要打音频`。
+  const withoutFileToken = body.replace(
+    /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)/gi,
+    '',
+  );
+  // 去掉文件 token 后剩下的「实质字符」（排除标点与空白）
+  const residue = withoutFileToken.replace(/[\s，。；：、！？,.;:!?"'`（）()【】\[\]{}<>《》「」\\/-]/g, '');
+  const hasMediaFile = MEDIA_FILE.test(body);
+  const isPointerOnly = hasMediaFile && residue.length <= 2;
+  if (!isPointerOnly) {
+    if (hasMediaFile) return true;
     if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
-  } else if (LEADING_PATH.test(body) && MEDIA_FILE.test(body) && /[，,。\s]/.test(body)) {
-    // 行首盘符 + 媒体文件 + 还有别的说明（`D:\Desktop，score.wav，这是你要打音频`）
-    return true;
   }
 
   // ── 弱判据：口语形态「音频在桌面」──

@@ -1211,12 +1211,16 @@ function isKeyResourceLocation(text, fromUser) {
   if (!fromUser) return false;
   const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
   if (ENGLISH_PROCESS.test(body)) return false;
-  const isBarePath = /^\s*[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]*[\\/][^\s]*$/.test(body);
-  if (!isBarePath) {
-    if (MEDIA_FILE.test(body)) return true;
+  const withoutFileToken = body.replace(
+    /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)/gi,
+    ""
+  );
+  const residue = withoutFileToken.replace(/[\s，。；：、！？,.;:!?"'`（）()【】\[\]{}<>《》「」\\/-]/g, "");
+  const hasMediaFile = MEDIA_FILE.test(body);
+  const isPointerOnly = hasMediaFile && residue.length <= 2;
+  if (!isPointerOnly) {
+    if (hasMediaFile) return true;
     if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
-  } else if (LEADING_PATH.test(body) && MEDIA_FILE.test(body) && /[，,。\s]/.test(body)) {
-    return true;
   }
   const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
   const LOC = "(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)";
@@ -1445,10 +1449,8 @@ function pickDiverseSnapshot(items, maxItems) {
     pickedKeys.push(keyOf(body));
     return true;
   };
-  if (maxItems >= 2) {
-    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === "user"));
-  }
   if (maxItems >= 3) {
+    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === "user"));
     takeMatching(0, (i) => i.origin === "user" && !isKeyResourceLocation(i.content, true));
   }
   const order = [...groups.keys()].sort((a, b) => a - b);

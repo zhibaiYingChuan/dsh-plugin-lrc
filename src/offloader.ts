@@ -281,12 +281,17 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
   //    实测注入次数从 3/16 **回退到 1/15**（被大量助手约束挤掉）。
   //    而「用户明确纠正过」恰恰是跨轮最该被记住的一类。
   //
-  // 两个槽位都只在 `maxItems >= 3` 时预留，避免 `maxItems=2` 时
-  // 把约束全部挤光。默认 `snapshotItems=3`，正好各占一个。
-  if (maxItems >= 2) {
-    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === 'user'));
-  }
+  // ## 必须给「至少 1 条约束」留位置
+  //
+  // 上一版写成 `maxItems >= 2` 给资源位置、`>= 3` 给纠正，于是
+  // `maxItems=2` 且两类用户条目都在时 ⇒ **一条约束都不剩**
+  // （实测 `maxItems=2 → 资源+纠正，助手约束 0 条`），
+  // 与「避免把小配置挤死」的意图正好相反。
+  //
+  // 现在两个预留都要求 `maxItems >= 3`：`snapshotItems=3`（生产默认）
+  // 恰好是「资源位置 + 用户纠正 + 一条约束」。
   if (maxItems >= 3) {
+    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === 'user'));
     takeMatching(0, (i) => i.origin === 'user' && !isKeyResourceLocation(i.content, true));
   }
 

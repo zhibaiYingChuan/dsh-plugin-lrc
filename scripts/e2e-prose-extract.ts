@@ -461,10 +461,11 @@ console.log('=== 7f) 资源位置必须被注入 ===');
   check('过程结论未被提权（G:\\loong 不在）', !snap3.includes('loong'), snap3);
   check('MD5 类过程结论未被提权', !snap3.includes('MD5'), snap3);
 
+  // `maxItems=2` 时**不预留**资源位置槽（第十一轮修正）：
+  // 两个预留槽会把约束全部挤光。此时优先保约束，资源位置退化为普通 rank0 参与轮转。
   const snap2 = buildSnapshot(pool, 2);
   console.log(`    snapshotItems=2 → ${snap2}`);
-  check('资源位置在 snapshotItems=2 时仍露脸', snap2.includes('score-Dtle1HAU'), snap2);
-  check('snapshotItems=2 时真约束也在', snap2.includes('IDM'), snap2);
+  check('snapshotItems=2 时优先保真约束', snap2.includes('IDM'), snap2);
 
   // 池里没有资源位置时，行为不得改变
   const noRes = pool.filter((i) => !i.content.includes('score-Dtle1HAU'));
@@ -561,6 +562,22 @@ console.log('=== 7f-1) 提权判据看来源 ===');
   console.log(`    压力场景 → ${snapPressure}`);
   check('压力下资源位置仍出现', snapPressure.includes('score-Dtle1HAU'), snapPressure);
   check('压力下用户纠正仍出现（不回退）', snapPressure.includes('IDM'), snapPressure);
+
+  // ★第十一轮 P1：`maxItems=2` 不得被两个预留槽位吃光（必须留一条约束）
+  const s2 = buildSnapshot(pressure, 2);
+  console.log(`    maxItems=2 → ${s2}`);
+  check('maxItems=2 时仍有一条约束', s2.includes('约束'), s2);
+
+  // ★第十一轮 P1：裸文件名/裸路径不得提权（否则独占槽位）
+  check('裸文件名不提权', !isKeyResourceLocation('score-Dtle1HAU.wav', true));
+  check('裸路径不提权', !isKeyResourceLocation('materials/架构图.png', true));
+  check('裸盘符路径不提权', !isKeyResourceLocation('G:\\proj\\端口.md', true));
+  check('带说明的真实交代仍提权', isKeyResourceLocation('D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', true));
+
+  // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
+  check('「音频在桌面」过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));
+  check('「文件放在下载目录了」过 hardFilter', hardFilter('文件放在下载目录了').length > 0);
+  check('裸文件名被 hardFilter 拦', hardFilter('score-Dtle1HAU.wav') === '', hardFilter('score-Dtle1HAU.wav'));
 }
 
 // ── 7f-2) 池淘汰必须与取词同源（资源位置要钉住） ──
