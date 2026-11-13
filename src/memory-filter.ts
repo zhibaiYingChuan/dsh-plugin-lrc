@@ -804,13 +804,27 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   const LOC = '(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)';
   // 排除「动作动词 + 资源名词」形态：`正在生成封面.png`、`处理一下 assets/bgm.mp3`
   // 里的 `在` 是「正在」，`生成` 是动词，二者都不在交代位置。
+  //
+  // ## 只能"降级"不能"否决"
+  //
+  // 上一版把它写成整句 `return false`，于是「真位置 + 派活」被一律判死：
+  // ```
+  // 音频在桌面，你处理一下        ← 位置是真的，却判 false
+  // 素材位于 assets/score.wav，导入后检查   ← 同上
+  // 文件放在下载目录了，你去读取一下        ← 同上
+  // ```
+  // 实测 10/11 被误杀，且这类句子**两条路都死**：
+  // `isKey=false` 不进直通路径，`hardFilter` 又因 20 字门槛丢掉 ——
+  // 位置事实彻底丢失，正是事故 B 以新入口复现。
+  //
+  // 正确做法：动作词只用来**否掉"弱形态"**（没有紧邻位置信号时的推断），
+  // 一旦有「资源名词紧邻位置词」这个强信号，动作词不影响判定。
   const ACTION_VERB = /(?:生成|处理|检查|查看|打开|转换|渲染|导出|加载|读取|修改|替换|删除)/;
   const adjacentLocation = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
-  const positional =
-    adjacentLocation.test(body) &&
-    !/(?:在|位于|放在|放到|存在|来自)的/.test(body) &&
-    !ACTION_VERB.test(body);
-  const hasLocationSignal = LEADING_PATH.test(body) || positional;
+  // 强信号：紧邻且不是「…的位置」指代
+  const strongLocation =
+    adjacentLocation.test(body) && !/(?:在|位于|放在|放到|存在|来自)的/.test(body);
+  const hasLocationSignal = LEADING_PATH.test(body) || strongLocation;
 
   // ## 过程词只在**没有位置信号**时否决
   //
@@ -885,8 +899,8 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   if (!adjacentLocation.test(body)) return false;
   // `在的` / `放到的` / `在的那个` ⇒ 只指代，不陈述位置
   if (/(?:在|位于|放在|放到|存在|来自)的/.test(body)) return false;
-  // 动作动词句不是交代位置（`正在生成封面.png`）
-  if (ACTION_VERB.test(body)) return false;
+  // 「正在 / 现在 / 别再」里的「在」是时间副词或语气词，不是位置介词
+  if (/(?:正在|现在|正在|别再|还在)/.test(body)) return false;
   return true;
 }
 

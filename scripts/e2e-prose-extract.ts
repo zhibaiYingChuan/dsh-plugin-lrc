@@ -605,6 +605,26 @@ console.log('=== 7f-1) 提权判据看来源 ===');
     check(`真位置+过程词仍提权「${s.slice(0, 22)}」`, isKeyResourceLocation(s, true), s);
   }
 
+  // ★第十四轮 P1：**真位置 + 派活动词**必须仍提权。
+  //
+  // 上一版 `ACTION_VERB` 做整句否决，把「音频在桌面，你处理一下」这类
+  // 最自然的资源交代判死 —— 而这类句子**两条路都死**：`isKey=false` 不进
+  // 直通路径，`hardFilter` 又因 20 字门槛丢掉 ⇒ 位置事实彻底丢失，
+  // 正是事故 B 以新入口复现。实测 10/11 被误杀。
+  const locWithAction = [
+    '音频在桌面，你处理一下',
+    '音频在桌面，帮我导出 mp4',
+    '文件放在下载目录了，你去读取一下',
+    '封面在下载目录，你渲染一下',
+    '素材位于 assets/score.wav，导入后检查',
+    '音频在桌面，转换一下格式',
+    '文件放在下载目录了，打开看看',
+    '音频在桌面，检查一下有没有杂音',
+  ];
+  for (const s of locWithAction) {
+    check(`真位置+派活仍提权「${s.slice(0, 22)}」`, isKeyResourceLocation(s, true), s);
+  }
+
   // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
   check('「音频在桌面」过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));
   check('「文件放在下载目录了」过 hardFilter', hardFilter('文件放在下载目录了').length > 0);

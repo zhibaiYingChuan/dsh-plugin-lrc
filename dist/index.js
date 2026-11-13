@@ -1217,8 +1217,8 @@ function isKeyResourceLocation(text, fromUser) {
   const LOC = "(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)";
   const ACTION_VERB = /(?:生成|处理|检查|查看|打开|转换|渲染|导出|加载|读取|修改|替换|删除)/;
   const adjacentLocation = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
-  const positional = adjacentLocation.test(body) && !/(?:在|位于|放在|放到|存在|来自)的/.test(body) && !ACTION_VERB.test(body);
-  const hasLocationSignal = LEADING_PATH.test(body) || positional;
+  const strongLocation = adjacentLocation.test(body) && !/(?:在|位于|放在|放到|存在|来自)的/.test(body);
+  const hasLocationSignal = LEADING_PATH.test(body) || strongLocation;
   if (!hasLocationSignal && PROCESS_CONCLUSION_CN.test(body)) return false;
   const withoutFileToken = body.replace(
     /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)/gi,
@@ -1232,7 +1232,7 @@ function isKeyResourceLocation(text, fromUser) {
   }
   if (!adjacentLocation.test(body)) return false;
   if (/(?:在|位于|放在|放到|存在|来自)的/.test(body)) return false;
-  if (ACTION_VERB.test(body)) return false;
+  if (/(?:正在|现在|正在|别再|还在)/.test(body)) return false;
   return true;
 }
 var USER_CORRECTION = (
