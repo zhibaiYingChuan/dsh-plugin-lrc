@@ -726,7 +726,21 @@ export function carriesResourceLocation(text: string): boolean {
  * 英文句也一并排除：`fail/error/unsupported/too large/Hmm/Let me` 这类
  * 是推理过程，不是交代位置。
  */
-const LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
+/**
+ * 位置词：**只用于「紧邻」形态判断，不再单独作为闸门**。
+ *
+ * 早期版本用它做独立闸门（`LOCATION_HINT.test(body)`），但裸「在」是中文
+ * 最高频虚词，于是任何日常句都命中：
+ * ```
+ * 现在把 assets/bgm.mp3 处理一下   ← 有「在」（现在）
+ * 正在生成封面.png                ← 有「在」（正在）
+ * 你在吗，assets/bgm.mp3 卡住了     ← 有「在」（你在吗）
+ * ```
+ * 实测这 3 条会被判成资源位置并 pin 进池，**把真资源位置挤掉**。
+ *
+ * 现在只认「紧邻」形态（见下方 `ADJACENT_LOCATION`）。
+ */
+const LOCATION_HINT = /(?:位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
 const ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
 /**
  * 中文**过程结论**词：说明「对文件做了什么/校验结果」，不是「文件在哪」。
@@ -771,8 +785,41 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   const body = text.replace(/\bhttps?:\/\/\S+/gi, ' ');
   // 英文推理过程句排除
   if (ENGLISH_PROCESS.test(body)) return false;
-  // 中文过程结论句排除（`MD5 一致`、`验证通过`、`已导入`…）
-  if (PROCESS_CONCLUSION_CN.test(body)) return false;
+
+  const hasMediaFile = MEDIA_FILE.test(body);
+  // ## 位置信号必须严格，不能用宽泛的位置词
+  //
+  // 早期用 `LOCATION_HINT`（含「桌面/目录/在」）做闸门，实测三条误报：
+  // ```
+  // 桌面上的文件与 assets/score.wav 的 MD5 一致     ← 命中「桌面」
+  // 音频已经验证通过，位于 assets/bgm.mp3          ← 命中「位于」
+  // 正在生成封面.png                              ← 命中弱判据的「封面在」
+  // ```
+  // 它们讲的都是**过程/状态**，不是「文件在哪」。
+  //
+  // 所以位置信号只认两种**不可伪造**的形态：
+  // 1. 行首盘符路径（`D:\Desktop，score.wav`）
+  // 2. 「资源名词 紧邻 位置词」（`音频在`、`文件放在`），中间最多 2 字
+  const RES = '(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)';
+  const LOC = '(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)';
+  // 排除「动作动词 + 资源名词」形态：`正在生成封面.png`、`处理一下 assets/bgm.mp3`
+  // 里的 `在` 是「正在」，`生成` 是动词，二者都不在交代位置。
+  const ACTION_VERB = /(?:生成|处理|检查|查看|打开|转换|渲染|导出|加载|读取|修改|替换|删除)/;
+  const adjacentLocation = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
+  const positional =
+    adjacentLocation.test(body) &&
+    !/(?:在|位于|放在|放到|存在|来自)的/.test(body) &&
+    !ACTION_VERB.test(body);
+  const hasLocationSignal = LEADING_PATH.test(body) || positional;
+
+  // ## 过程词只在**没有位置信号**时否决
+  //
+  // 上一版把过程词检查放在最前面，于是「真位置 + 顺带提到校验」被整句判死：
+  // ```
+  // 音频在桌面，校验一下 MD5                 ← 位置是真的，被判 false
+  // 素材位于 assets/score.wav，和之前的一致     ← 同上
+  // ```
+  if (!hasLocationSignal && PROCESS_CONCLUSION_CN.test(body)) return false;
 
   // ── 强判据：媒体文件扩展名 / 行首盘符路径 ──
   //
@@ -794,7 +841,6 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   );
   // 去掉文件 token 后剩下的「实质字符」（排除标点与空白）
   const residue = withoutFileToken.replace(/[\s，。；：、！？,.;:!?"'`（）()【】\[\]{}<>《》「」\\/-]/g, '');
-  const hasMediaFile = MEDIA_FILE.test(body);
   const isPointerOnly = hasMediaFile && residue.length <= 2;
   if (!isPointerOnly) {
     // ## 有媒体文件还不够，必须**同时**有「交代位置」的信号
@@ -806,10 +852,12 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
     // assets/bgm.mp3 的时长是 55 秒吗           ← 在问问题
     // 我把 score.wav 换成了新的版本             ← 说动作
     // 封面.png 换成暗金色试试                   ← 说改动
+    // 现在把 assets/bgm.mp3 处理一下            ← 只有「在」（现在）
+    // 正在生成封面.png                          ← 只有「在」（正在）
     // ```
-    // 真正的交代一定有位置指示：`D:\Desktop，score.wav，这是你要打音频`、
-    // `音频文件在 assets/bgm.mp3` —— 含盘符路径或 `在/位于/放到…`。
-    if (hasMediaFile && (LOCATION_HINT.test(body) || LEADING_PATH.test(body))) return true;
+    // 所以位置信号必须用**紧邻形态**（`hasLocationSignal`），
+    // 不能用裸「在」——那是中文里最高频的虚词，任何句子都会命中。
+    if (hasMediaFile && hasLocationSignal) return true;
     if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
   }
 
@@ -834,12 +882,11 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   // 「不是告诉你**音频在的位置**了吗」里 `音频在` 是紧邻的，但它说的是
   // 「音频所在的位置」这个概念，不是「音频在桌面」。所以位置词后面
   // 若紧跟 `的`（`在的` / `放到的`），说明是在**指代**而非陈述位置。
-  const RES = '(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)';
-  const LOC = '(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)';
-  const adjacent = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
-  if (!adjacent.test(body)) return false;
+  if (!adjacentLocation.test(body)) return false;
   // `在的` / `放到的` / `在的那个` ⇒ 只指代，不陈述位置
   if (/(?:在|位于|放在|放到|存在|来自)的/.test(body)) return false;
+  // 动作动词句不是交代位置（`正在生成封面.png`）
+  if (ACTION_VERB.test(body)) return false;
   return true;
 }
 

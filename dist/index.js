@@ -1204,7 +1204,6 @@ function carriesResourceLocation(text) {
   }
   return false;
 }
-var LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
 var ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
 var PROCESS_CONCLUSION_CN = /(?:MD5|哈希|一致|已确认|已验证|验证通过|已生成|已删除|已复制|已上传|已导入|处理完毕|测试通过|校验)/;
 var MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
@@ -1213,23 +1212,27 @@ function isKeyResourceLocation(text, fromUser) {
   if (!fromUser) return false;
   const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
   if (ENGLISH_PROCESS.test(body)) return false;
-  if (PROCESS_CONCLUSION_CN.test(body)) return false;
+  const hasMediaFile = MEDIA_FILE.test(body);
+  const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
+  const LOC = "(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)";
+  const ACTION_VERB = /(?:生成|处理|检查|查看|打开|转换|渲染|导出|加载|读取|修改|替换|删除)/;
+  const adjacentLocation = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
+  const positional = adjacentLocation.test(body) && !/(?:在|位于|放在|放到|存在|来自)的/.test(body) && !ACTION_VERB.test(body);
+  const hasLocationSignal = LEADING_PATH.test(body) || positional;
+  if (!hasLocationSignal && PROCESS_CONCLUSION_CN.test(body)) return false;
   const withoutFileToken = body.replace(
     /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)/gi,
     ""
   );
   const residue = withoutFileToken.replace(/[\s，。；：、！？,.;:!?"'`（）()【】\[\]{}<>《》「」\\/-]/g, "");
-  const hasMediaFile = MEDIA_FILE.test(body);
   const isPointerOnly = hasMediaFile && residue.length <= 2;
   if (!isPointerOnly) {
-    if (hasMediaFile && (LOCATION_HINT.test(body) || LEADING_PATH.test(body))) return true;
+    if (hasMediaFile && hasLocationSignal) return true;
     if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
   }
-  const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
-  const LOC = "(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)";
-  const adjacent = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
-  if (!adjacent.test(body)) return false;
+  if (!adjacentLocation.test(body)) return false;
   if (/(?:在|位于|放在|放到|存在|来自)的/.test(body)) return false;
+  if (ACTION_VERB.test(body)) return false;
   return true;
 }
 var USER_CORRECTION = (

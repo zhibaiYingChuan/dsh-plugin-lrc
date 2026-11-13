@@ -656,14 +656,14 @@ console.log('=== 1b) 真实 surface 回归锁（141 节点，仅 surface 真实�
   //   = 1 + 19 + 118 + 3 + 1 = 142 → 去掉一个 user 类，得 141
   const realEvents: unknown[] = [];
   realEvents.push({ type: 'system/message', data: { content: [{ type: 'text', text: 'sys' }] } });
-  // 19 个 user 类（含各种 injected 与 1 条真实用户）
+  // 18 个 injected user 类（与真实 137 节点时刻的 17 injected + 1 real user 同量级）
   const kinds = [
     'compact-checkpoint', 'skill-catalog', 'lrc-prune',
     ...Array.from({ length: 9 }, () => 'runtime-context'),
     ...Array.from({ length: 5 }, () => 'time-context'),
   ];
   for (const k of kinds) realEvents.push(injected(k));
-  realUser();
+  // 1 条真实用户消息（`classifyEvent` 判为 user，可作裁剪边界）
   realEvents.push(realUser());
   // 主体：59 组「1 tool-call + tool/result」
   for (let i = 0; i < 59; i += 1) {
@@ -734,9 +734,16 @@ console.log('=== 1b) 真实 surface 回归锁（141 节点，仅 surface 真实�
   // 第十一轮又发现 `0.3 → 1` 更糟：真实增长节奏是「每步 +2.25、每 10 步裁一次」，
   // limit=1 ⇒ 141 → 161 → 181 → … → 341 **单调膨胀**（事故 A 的观感）。
   // 所以 (0,1) 必须退化为默认上限 40。
+  // ★第十二轮 P2：`<= 40` 是单向宽松断言 —— 实现回退成 `0.3 → 1` 时
+  // `1 <= 40` 仍 PASS，抓不到。必须断言**与显式传 40 的结果完全相等**。
+  const ref40 = cntOf(selectTrimRange(realNodes, realEvents, 8, 40));
   for (const v of [0.3, 0.5, 0.9]) {
     const r = selectTrimRange(realNodes, realEvents, 8, v);
-    check(`小数 ${v} 退化为默认 40（不是 1）`, r !== null && cntOf(r) <= 40, { v, count: cntOf(r) });
+    check(`小数 ${v} 与 limit=40 完全等价（不是退化成 1）`, cntOf(r) === ref40, {
+      v,
+      count: cntOf(r),
+      ref40,
+    });
   }
 
   // ★第三次独立审查 P1-1：上一版把 `'40'` 断言成「视为不限制」，

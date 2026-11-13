@@ -584,9 +584,25 @@ console.log('=== 7f-1) 提权判据看来源 ===');
     '我把 score.wav 换成了新的版本',
     '封面.png 换成暗金色试试',
     '桌面上的文件与 assets/score.wav 的 MD5 一致',
+    '音频已经验证通过，位于 assets/bgm.mp3',
+    // ★第十三轮 P1-A：裸「在」造成的误报（现在/正在/你在吗）
+    '现在把 assets/bgm.mp3 处理一下',
+    '正在生成封面.png',
+    '你在吗，assets/bgm.mp3 卡住了',
   ];
   for (const s of casualMentions) {
     check(`随口提文件不提权「${s.slice(0, 22)}」`, !isKeyResourceLocation(s, true), s);
+  }
+
+  // ★第十三轮 P1-B：**真位置 + 顺带过程词**必须仍提权（过程词不能一刀切）
+  const locWithProcess = [
+    '音频在桌面，校验一下 MD5',
+    '文件放在下载目录了，MD5 你自己看',
+    '素材位于 assets/score.wav，和之前的一致',
+    '音频在 D:\\Desktop，你验证通过后再用',
+  ];
+  for (const s of locWithProcess) {
+    check(`真位置+过程词仍提权「${s.slice(0, 22)}」`, isKeyResourceLocation(s, true), s);
   }
 
   // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
