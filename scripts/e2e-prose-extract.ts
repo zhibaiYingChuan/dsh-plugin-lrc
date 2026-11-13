@@ -7,7 +7,13 @@
  * 实测模型只有 1.8% 的轮次输出 <lrc_memory>，所以约束抽取几乎全靠它。
  * 它抽错 = 沉淀垃圾；抽漏 = 约束丢失，下一轮模型重犯同样的错。
  */
-import { areNearDuplicate, carriesResourceLocation, constraintsFromProse, constraintsFromUser } from '../src/memory-filter.ts';
+import {
+  areNearDuplicate,
+  carriesResourceLocation,
+  constraintsFromProse,
+  constraintsFromUser,
+  isKeyResourceLocation,
+} from '../src/memory-filter.ts';
 import { Offloader, buildSnapshot } from '../src/offloader.ts';
 import { CursorStore } from '../src/cursor.ts';
 import { tmpdir } from 'node:os';
@@ -424,40 +430,124 @@ console.log('=== 7e) 池上限与淘汰端 ===');
 // ★第六次独立审查的 P0：用户说「音频在桌面」（seq=1539）终于进了库，
 // 但 LRC distill 把它归成 `code_context` ⇒ 快照 rank 最后。
 // 真实池里 rank 0/1 有 15 条，`snapshotItems=3` 时它**永远进不了注入**。
-// 「进了库但注入不到」等于没进 —— 用户原始诉求的另一半仍未修好。
+//
+// ★★第七次审查又发现两个反向回归，这里全部锁住：
+//   (a) 用宽松的 `carriesResourceLocation` 提权，把 `G:\loong 是仓库`
+//       这类过程结论也提到 rank0 ⇒ IDM 约束注入次数 4 → **0**。
+//   (b) 淘汰判据不认资源位置 ⇒ 池满 20 时先删掉它，提权等于没做。
 console.log('=== 7f) 资源位置必须被注入 ===');
 {
   const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
     content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
   });
-  // 模拟真实池：15 条高价值约束/决策 + 1 条资源位置（LRC 归类为 code_context）
-  const pool: DistilledItem[] = [];
-  for (let i = 0; i < 8; i += 1) {
-    pool.push(mk(`[约束] 约束${i}：必须遵守第 ${i} 条规范`, 'preference', ['constraint']));
-  }
-  for (let i = 0; i < 7; i += 1) {
-    pool.push(mk(`[决策] 决策${i}：改用方案${i}`, 'decision', ['decision']));
-  }
-  pool.push({
-    content: '[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频',
-    memory_type: 'code_context',
-    tags: ['code'],
-    importance: 5,
-    source_turns: [0, 0],
-  });
+  // 模拟真实池：高价值约束/决策 + 资源位置（LRC 归类为 code_context）
+  // + 助手正文里的路径类过程结论（第七轮指出的污染源）
+  const pool: DistilledItem[] = [
+    mk('[约束] 不要走 IDM 下载音频，直接用桌面文件', 'preference', ['constraint']),
+    mk('[约束] 缓存必须放在工作区之外', 'preference', ['constraint']),
+    mk('[结论] G:\\loong 是 LRC 的源码仓库', 'fact', ['conclusion']),
+    mk('[结论] 在 C:\\Users\\Administrator\\.dsh 下确认配置', 'fact', ['conclusion']),
+    mk('[结论] 工程里的 assets/score.wav 的 MD5 一致', 'fact', ['conclusion']),
+    mk('[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'code_context', ['code']),
+    mk('[决策] 改用 --stdin 传入', 'decision', ['decision']),
+  ];
 
   const snap3 = buildSnapshot(pool, 3);
   console.log(`    snapshotItems=3 → ${snap3}`);
   check('资源位置出现在注入内容里（snapshotItems=3）', snap3.includes('score-Dtle1HAU'), snap3);
+  check('真约束没有被资源位置挤掉', snap3.includes('IDM'), snap3);
+  check('过程结论未被提权（G:\\loong 不在）', !snap3.includes('loong'), snap3);
+  check('MD5 类过程结论未被提权', !snap3.includes('MD5'), snap3);
 
   const snap2 = buildSnapshot(pool, 2);
   console.log(`    snapshotItems=2 → ${snap2}`);
-  check('资源位置出现在注入内容里（snapshotItems=2）', snap2.includes('score-Dtle1HAU'), snap2);
+  check('资源位置在 snapshotItems=2 时仍露脸', snap2.includes('score-Dtle1HAU'), snap2);
+  check('snapshotItems=2 时真约束也在', snap2.includes('IDM'), snap2);
 
-  // 池里没有资源位置时，行为不得改变（不能因为它而少注入约束）
+  // 池里没有资源位置时，行为不得改变
   const noRes = pool.filter((i) => !i.content.includes('score-Dtle1HAU'));
   const snapNoRes = buildSnapshot(noRes, 3);
-  check('无资源位置时仍注入约束', snapNoRes.includes('约束') || snapNoRes.includes('决策'), snapNoRes);
+  check('无资源位置时仍注入约束', snapNoRes.includes('IDM'), snapNoRes);
+}
+
+// ── 7f-1) 提权判据必须是「位置白名单」，不能是黑名单 ──
+//
+// ★第八次审查的核心发现：真实日志 seq≈1550 的英文推理句
+// `…fails with "unsupported format"… score.wav is 10MB` 被旧判据
+// （媒体扩展名 + 过程词黑名单）判为关键资源，**抢走预留槽位**：
+// 真资源位置在 17 次注入里只出现 **1** 次（剔除该假条目后升到 7 次）。
+// 黑名单永远补不全，所以改成「媒体文件 + 位置指示词」白名单。
+console.log('=== 7f-1) 提权判据白名单化 ===');
+{
+  const should = [
+    '[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频',
+    '音频文件在 assets/bgm.mp3',
+    '音频放到 D:\\Desktop\\score.wav',
+    '素材位于 assets/score.wav',
+  ];
+  for (const s of should) check(`提权「${s.slice(0, 28)}」`, isKeyResourceLocation(s), s);
+
+  const shouldNot = [
+    // ★真实日志原文片段（第八轮实测的假货）
+    'With existing file, the bundler tries to load it as a module and fails with "unsupported or unrecognizable format". Hmm — this could be because the file is too large? score.wav is 10MB',
+    'score.wav is 10MB',
+    '工程里的 assets/score.wav 的 MD5 一致',
+    'G:\\loong 是 LRC 的源码仓库',
+    '在 C:\\Users\\Administrator\\.dsh 下确认配置',
+    '检查 src/index.ts 里的逻辑',
+    '帮我排版 docs/禁止事项.md',
+    'https://example.com/shot.png 这张图',
+  ];
+  for (const s of shouldNot) check(`不提权「${s.slice(0, 30)}」`, !isKeyResourceLocation(s), s);
+
+  // 提权判据的竞争场景：假货不得抢走真位置的槽位
+  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  });
+  const competing: DistilledItem[] = [
+    mk('[约束] 不要走 IDM 下载音频，直接用桌面文件', 'preference', ['constraint']),
+    mk('[结论] With existing file, the bundler fails with "unsupported format". score.wav is 10MB', 'fact', ['conclusion']),
+    mk('[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'code_context', ['code']),
+    mk('[决策] 改用 --stdin 传入', 'decision', ['decision']),
+  ];
+  const snapComp = buildSnapshot(competing, 3);
+  console.log(`    竞争场景 → ${snapComp}`);
+  check('真位置在竞争中仍能注入', snapComp.includes('score-Dtle1HAU'), snapComp);
+  check('IDM 约束未被挤掉', snapComp.includes('IDM'), snapComp);
+  check('假货（10MB 推理句）未被注入', !snapComp.includes('10MB'), snapComp);
+}
+
+// ── 7f-2) 池淘汰必须与取词同源（资源位置要钉住） ──
+//
+// ★第七次审查 P0-2：资源位置天然最早确立，而淘汰逻辑是
+// 「高价值按新到旧保留」⇒ 它第一个被丢。实测「池=20 但资源位置在池=false」。
+console.log('=== 7f-2) 池满后资源位置仍在池 ===');
+{
+  const off = new Offloader(null, new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-pin.json`)), {
+    snapshotItems: 3,
+  });
+  const pool = off as unknown as {
+    buildPooledSnapshot: (i: DistilledItem[]) => string;
+    snapshotPool: DistilledItem[];
+  };
+  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  });
+  // 先放资源位置（用户一开始就交代文件在哪）
+  pool.buildPooledSnapshot([
+    mk('[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'code_context', ['code']),
+  ]);
+  // 再灌 30 条约束把池撑满
+  for (let round = 0; round < 6; round += 1) {
+    const batch: DistilledItem[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      batch.push(mk(`[约束] 约束${round}-${i}：必须遵守第 ${i} 条规范`, 'preference', ['constraint']));
+    }
+    pool.buildPooledSnapshot(batch);
+  }
+  console.log(`    池=${pool.snapshotPool.length} 资源位置仍在池=${pool.snapshotPool.some((i) => i.content.includes('score-Dtle1HAU'))}`);
+  check('池满后资源位置仍在池里', pool.snapshotPool.some((i) => i.content.includes('score-Dtle1HAU')), pool.snapshotPool.length);
+  check('池仍不超上限', pool.snapshotPool.length <= 20, pool.snapshotPool.length);
 }
 
 // ── 7g) 表格行 / 计数句不得冒充决策 ──
@@ -478,6 +568,35 @@ console.log('=== 7g) 表格行/名词化决策不冒充 ===');
   // 真正的决策句仍要抽到
   for (const d of ['决定采用 --stdin 传入', '决策是改用 --file', '改用 --file 传入音频']) {
     check(`仍抽「${d}」`, constraintsFromProse(d).length > 0, constraintsFromProse(d));
+  }
+  // ★第七次审查 P1-3：收紧「决策/决定」曾漏掉 8 条真决策（决定 + 任意动词）
+  for (const d of [
+    '决定不再使用 IDM',
+    '决定放弃 IDM',
+    '决定取消 --json 方案',
+    '决定停止使用临时目录',
+    '决定去掉 BOM',
+    '决定保留 8 个节点',
+    '决定重写整个场景',
+    '决定使用 --stdin',
+  ]) {
+    check(`「决定+动词」不漏「${d}」`, constraintsFromProse(d).length > 0, constraintsFromProse(d));
+  }
+  // 名词化/未定用法仍要排除
+  for (const n of ['关于这个功能的决策的细节。', '我需要决定要不要这么做。']) {
+    check(`名词化不抽「${n}」`, constraintsFromProse(n).length === 0, constraintsFromProse(n));
+  }
+  // ★第八次审查 P1-1：引号内引用的「决策」/英文画面描述/参数行不得冒充
+  const quotedNoise = [
+    'Deleted item: below-left, a block "决策 · 端口纪律 3099/3111" with strike, at y 750, big type 44',
+    'The dropped decision text appears where the cut was: "决策 · 端口纪律 3099/3111" struck through',
+    'Scene 2 at 6.9s: "压缩" verdict COLLIDES with the struck-through "决策 · 端口纪律 3099/3111"',
+    'hop=5 "吃完洗碗，洗碗布该换了"',
+  ];
+  for (const n of quotedNoise) check(`引用/参数行不抽「${n.slice(0, 24)}」`, constraintsFromProse(n).length === 0, constraintsFromProse(n));
+  // 但含 ASCII 参数的真决策不能被「中文占比」误杀
+  for (const d of ['决定使用 --stdin', '目前改用 --stdin 传入', '决策是改用 --file']) {
+    check(`含 ASCII 参数的真决策「${d}」`, constraintsFromProse(d).length > 0, constraintsFromProse(d));
   }
 }
 

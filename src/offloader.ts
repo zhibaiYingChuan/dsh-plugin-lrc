@@ -28,6 +28,7 @@ import {
   extractMemoryTag,
   hardFilter,
   isDuplicate,
+  isKeyResourceLocation,
   isNoUpdate,
   jaccard,
   maskPaths,
@@ -168,30 +169,47 @@ export function buildSnapshot(items: DistilledItem[], maxItems: number): string 
  * @param items - 候选池
  * @param maxItems - 最多输出几条
  */
+/**
+ * 快照候选的优先级（0 最高）。
+ *
+ * ## 为什么必须抽成模块级函数
+ *
+ * 它同时被两处使用，两处**必须同源**：
+ * 1. `buildPooledSnapshot` 的淘汰判据（池满时保留哪些）
+ * 2. `pickDiverseSnapshot` 的取词顺序（注入哪些）
+ *
+ * 上一版两处各写一套（淘汰只认 preference/decision），结果
+ * 「资源位置」在取词时是 rank 0、在淘汰时是 low ⇒ 池一满先被删，
+ * 提权等于没做（实测前 24 次注入一次都没出现）。
+ *
+ * ## 「资源位置」提权，但要用**收窄**判据
+ *
+ * 事故的另一半：用户说「音频在桌面」（seq=1539）终于进了库，
+ * 但 LRC 的 distill 把它归成 `code_context`（默认最低优先级），
+ * `snapshotItems=3` 时它永远进不了注入。
+ *
+ * 但**不能**用宽松的 `carriesResourceLocation`：那个判据会把助手正文里的
+ * `G:\loong 是仓库`、`在 C:\Users\...\.dsh 下确认配置`、`assets/score.wav 的 MD5 一致`
+ * 全提到 rank 0 —— 实测 rank0 从 5 条膨胀到 13 条，
+ * 「不要用 IDM 下载」旧版注入 4 次、新版 **0 次**，是明确的**反向回归**。
+ *
+ * 所以只认 `isKeyResourceLocation`：媒体文件 + 不含过程结论词。
+ *
+ * @param item - 候选条目
+ * @returns 0 = 约束/关键资源；1 = 决策；2 = 结论；3 = 其他（过程/事实）
+ */
+function keepPriority(item: DistilledItem): number {
+  if (item.memory_type === 'preference' || item.tags?.includes('constraint')) return 0;
+  if (isKeyResourceLocation(item.content)) return 0;
+  if (item.memory_type === 'decision' || item.tags?.includes('decision')) return 1;
+  if (item.tags?.includes('conclusion')) return 2;
+  return 3;
+}
+
 export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): string[] {
   if (items.length === 0 || maxItems <= 0) return [];
 
-  /**
-   * 类别优先级。
-   *
-   * ## 「资源位置」必须与约束同级（rank 0）
-   *
-   * 事故的另一半：用户说「音频在桌面」（seq=1539）终于进了库，
-   * 但 LRC 的 distill 把它归成 `code_context`，落进默认的 rank 3，
-   * 而真实池里 rank 0/1 有 15 条 —— `snapshotItems=3` 时它**永远进不了注入**。
-   * 「进了库但注入不到」等于没进。
-   *
-   * 判据不猜语义，只看内容里有没有具体路径/媒体文件名（与
-   * `carriesResourceLocation` 同源）。这类条目在池里极少，占一个槽位
-   * 换来的是「模型知道源文件在哪」，性价比远高于多一条同义约束。
-   */
-  const rank = (item: DistilledItem): number => {
-    if (item.memory_type === 'preference' || item.tags?.includes('constraint')) return 0;
-    if (carriesResourceLocation(item.content)) return 0;
-    if (item.memory_type === 'decision' || item.tags?.includes('decision')) return 1;
-    if (item.tags?.includes('conclusion')) return 2;
-    return 3;
-  };
+  const rank = keepPriority;
 
   // 分组（保持各组内原顺序 = 新到旧）
   const groups = new Map<number, DistilledItem[]>();
@@ -236,15 +254,23 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
   // 它和约束同为 rank 0，但触发的判据完全不同（结构特征 vs 情态词）。
   // 若只靠轮转，池里一旦有多条同义约束排在前面，资源位置仍可能被挤掉。
   // 所以先单独取一条，保证它一定露脸。
+  //
+  // **必须用 `isKeyResourceLocation`（收窄判据）**：用宽松的
+  // `carriesResourceLocation` 会把 `assets/score.wav 的 MD5 一致`
+  // 这类过程结论选中，反而不是用户交代的音频位置。
   if (maxItems >= 2) {
-    const resItem = (groups.get(0) ?? []).find((i) => carriesResourceLocation(i.content));
-    if (resItem !== undefined) {
-      const idx = (groups.get(0) ?? []).indexOf(resItem);
+    const rank0 = groups.get(0) ?? [];
+    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content));
+    if (idx >= 0) {
+      const resItem = rank0[idx] as DistilledItem;
+      // **必须从组里摘掉，不能只挪游标**：资源位置常常排在约束**之后**，
+      // 把游标设到 `idx + 1` 会把它前面那几条真约束一起跳过。
+      // 实测这样写导致「不要用 IDM 下载」被跳掉、反而注入了 rank2 的
+      // `G:\loong 是仓库` —— 正是要避免的那种污染。
+      rank0.splice(idx, 1);
       const body = bodyOf(resItem);
       picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
       pickedKeys.push(keyOf(body));
-      // 游标跳过它，避免下一轮重复取
-      cursor.set(0, idx + 1);
     }
   }
 
@@ -560,13 +586,34 @@ export class Offloader {
     // 最早确立的，恰好最先被淘汰。实测：先攒 3 条关键约束，再一次
     // distill 返回 25 条过程结论（常见量级），3 条约束**全部被挤出**。
     if (this.snapshotPool.length > this.snapshotPoolMax) {
-      const isHigh = (i: DistilledItem): boolean =>
-        i.memory_type === 'preference' ||
-        i.memory_type === 'decision' ||
-        i.tags?.includes('constraint') === true ||
-        i.tags?.includes('decision') === true;
-      const high = this.snapshotPool.filter(isHigh);
-      const low = this.snapshotPool.filter((i) => !isHigh(i));
+      // ## 淘汰判据必须与取词判据**同一套**
+      //
+      // 上一版 `isHigh` 只认 preference/decision，而 `rank()` 已经把
+      // 「关键资源位置」也提到了 rank 0。两边不一致的后果（实测）：
+      // 资源位置进了池，但池一满就被判 low 先删掉，
+      // 于是 P0-1 的提权在真实时序下完全失效（前 24 次注入一次都没出现）。
+      //
+      // 现在统一用 `keepPriority`：它返回 0/1 的就是必须优先保留的。
+      const isHigh = (i: DistilledItem): boolean => keepPriority(i) <= 1;
+
+      // ## 资源位置要**钉住**，不参与「按新旧淘汰」
+      //
+      // 它天然是最早确立的（用户一上来就交代文件在哪），而下面的保留逻辑
+      // 是「高价值按新到旧留最后 N 条」—— 一旦高价值超过上限，
+      // 最早的资源位置恰好第一个被丢。实测：先放 1 条资源位置、
+      // 再灌 30 条约束 ⇒ 池满 20，资源位置**已被淘汰**。
+      //
+      // 所以先把它单独摘出来固定保留（最多 2 条，避免极端情况占满池子）。
+      const pinned: DistilledItem[] = [];
+      const rest: DistilledItem[] = [];
+      for (const item of this.snapshotPool) {
+        if (pinned.length < 2 && isKeyResourceLocation(item.content)) pinned.push(item);
+        else rest.push(item);
+      }
+
+      const high = rest.filter(isHigh);
+      const low = rest.filter((i) => !isHigh(i));
+      const budget = Math.max(0, this.snapshotPoolMax - pinned.length);
 
       // ## 两个必须避开的坑
       //
@@ -579,9 +626,10 @@ export class Offloader {
       //    越新越相关」的设计意图相反。
       //
       // 所以：高价值按**新到旧**保留，剩余槽位才用低价值从新到旧补。
-      const highKept = high.slice(-this.snapshotPoolMax);
-      const room = Math.max(0, this.snapshotPoolMax - highKept.length);
-      this.snapshotPool = room > 0 ? [...highKept, ...low.slice(-room)] : highKept;
+      const highKept = high.slice(-budget);
+      const room = Math.max(0, budget - highKept.length);
+      this.snapshotPool =
+        room > 0 ? [...pinned, ...highKept, ...low.slice(-room)] : [...pinned, ...highKept];
     }
     // 池子是**追加**的（旧 → 新）。注入时要从**新到旧**取：
     // 淘汰端保留的是最新 20 条（见上），如果取词仍从旧的一端开始，

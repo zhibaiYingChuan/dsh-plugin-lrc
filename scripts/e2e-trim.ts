@@ -606,70 +606,103 @@ check('force 跳过 token 阈值', forced.ok === true && forced.reason === 'ok',
 //   j=job/registered  J=job/settled  B=compaction/start  E=compaction/end
 //   M=compaction/summary  H=request/header
 // ────────────────────────────────────────────────────────────
-console.log('=== 1b) 真实 surface 回归锁（145 节点） ===');
+// ★第二次审查的核心批评：上一版用 6 节点玩具 fixture 验证渐进裁剪，
+// 而「遇到不可替换就 break」的旧实现在小 surface 上也能得同样结果 ——
+// 断言无法区分对错。
+//
+// ★★第七次审查指出上一版 fixture **仍然失真**：145 个节点里有 98 个是
+// 宿主**不会放进 surface** 的类型（`tool/call`、`step/start`、`job/*`、
+// `request/header`、`compaction/*`）。真实的 `foldSurface` 结果只有 4 种：
+// `tool/result` / `assistant/message` / `user/message` / `system/message`
+// —— `tool/call` 是 `assistant/message` 的内嵌块，不是独立节点。
+// 把 fixture 削成真实类型后只剩 47 节点，新旧实现都得 37，断言完全失去区分力。
+//
+// 现在按**真实构成**生成（141 节点：system 1、user 类 19、
+// assistant 61、tool/result 60），只使用那 4 种类型，且 tool 配对平衡。
+// ────────────────────────────────────────────────────────────
+console.log('=== 1b) 真实 surface 回归锁（141 节点，仅 surface 真实类型） ===');
 {
-  const encoded = [
-    'C,E,s,S,H,A,c,j,J,r,e,s,A,c,j,J,r,e,s,A',
-    'c,j,J,r,e,s,A,c,j,J,r,e,s,A,c,r,e,s,A,c',
-    'j,J,r,e,s,A,c,r,e,s,A,c,j,J,r,e,s,A,c,j',
-    'J,r,e,s,A,c,j,J,r,e,B,M,C,E,s,R,S,H,A2,c',
-    'r,c,j,J,r,e,s,A,c,r,e,J,s,A,c,r,e,s,A,c',
-    'j,J,r,e,s,A2,c,c,r,r,e,s,A2,c,r,c,j,J,r,e',
-    's,A,c,j,J,r,e,s,A,c,j,J,r,e,s,A,c,j,J,r',
-    'e,s,A,c,j',
-  ].join(',').split(',');
-
-  // 编码 → 逼真的宿主事件形状（字段必须让 classifyEvent / toolDelta 认得出）
-  const realEvents: unknown[] = encoded.map((code): unknown => {
-    switch (code) {
-      case 'C':
-        return {
-          type: 'user/message',
-          data: { source: { kind: 'compact-checkpoint' }, content: [{ type: 'text', text: 'summary' }] },
-        };
-      case 'S':
-      case 'R':
-        return {
-          type: 'user/message',
-          data: {
-            source: { kind: code === 'S' ? 'skill-catalog' : 'runtime-context' },
-            content: [{ type: 'text', text: 'ctx' }],
-          },
-        };
-      case 'U':
-        return { type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } };
-      case 'A':
-        return {
-          type: 'assistant/message',
-          data: { message: { content: [{ type: 'reasoning', text: 'r' }, { type: 'tool-call' }] } },
-        };
-      case 'A2':
-        return {
-          type: 'assistant/message',
-          data: {
-            message: {
-              content: [
-                { type: 'reasoning', text: 'r' },
-                { type: 'tool-call' },
-                { type: 'tool-call' },
-              ],
-            },
-          },
-        };
-      case 'A0':
-        return { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'x' }] } } };
-      case 'r':
-        return { type: 'tool/result', data: { content: [{ type: 'text', text: 'out' }] } };
-      default:
-        // c/s/e/j/J/B/E/M/H 都是「非对话、不参与 tool 平衡」的节点
-        return { type: code === 'c' ? 'tool/call' : 'other', data: {} };
-    }
+  /** 一条带 n 个 tool-call 的 assistant 消息。 */
+  const assistant = (calls: number): unknown => ({
+    type: 'assistant/message',
+    data: {
+      message: {
+        content: [
+          { type: 'reasoning', text: 'r' },
+          ...Array.from({ length: calls }, () => ({ type: 'tool-call' })),
+        ],
+      },
+    },
   });
+  /** 纯文本 assistant（无 tool-call，不参与 tool 平衡）。 */
+  const assistantText = (): unknown => ({
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: 'ok' }] } },
+  });
+  const toolResult = (): unknown => ({ type: 'tool/result', data: { content: [{ type: 'text', text: 'out' }] } });
+  const injected = (kind: string): unknown => ({
+    type: 'user/message',
+    data: { source: { kind }, content: [{ type: 'text', text: 'ctx' }] },
+  });
+  const realUser = (): unknown => ({
+    type: 'user/message',
+    data: { content: [{ type: 'text', text: '请继续' }] },
+  });
+
+  // 按真实构成拼装（比例取自解码日志：141 时刻 tool/result 64、assistant 58、
+  // user 类 19、system 1）。这里让 tool 严格配对：
+  //   1 system + 19 user类 + 59×(assistant1+toolResult) + 1×(assistant2+2toolResult)
+  //   + 1 纯文本 assistant
+  //   = 1 + 19 + 118 + 3 + 1 = 142 → 去掉一个 user 类，得 141
+  const realEvents: unknown[] = [];
+  realEvents.push({ type: 'system/message', data: { content: [{ type: 'text', text: 'sys' }] } });
+  // 19 个 user 类（含各种 injected 与 1 条真实用户）
+  const kinds = [
+    'compact-checkpoint', 'skill-catalog', 'lrc-prune',
+    ...Array.from({ length: 9 }, () => 'runtime-context'),
+    ...Array.from({ length: 5 }, () => 'time-context'),
+  ];
+  for (const k of kinds) realEvents.push(injected(k));
+  realUser();
+  realEvents.push(realUser());
+  // 主体：59 组「1 tool-call + tool/result」
+  for (let i = 0; i < 59; i += 1) {
+    realEvents.push(assistant(1));
+    realEvents.push(toolResult());
+  }
+  // 1 组并行（2 tool-call + 2 tool/result），用于覆盖并行场景
+  realEvents.push(assistant(2));
+  realEvents.push(toolResult());
+  realEvents.push(toolResult());
+  // 结尾纯文本 assistant
+  realEvents.push(assistantText());
+
   const realNodes = realEvents.map((_, i) => i);
-  check('fixture 节点数与真实一致（145）', realNodes.length === 145, realNodes.length);
+  console.log(`    节点数=${realNodes.length}`);
+  check('fixture 规模与真实事故同量级（130~150）', realNodes.length >= 130 && realNodes.length <= 150, realNodes.length);
+
+  // 只允许 surface 真实类型
+  const allowed = new Set(['tool/result', 'assistant/message', 'user/message', 'system/message']);
+  const badTypes = realEvents
+    .map((e) => (e as { type?: string }).type ?? '')
+    .filter((t) => !allowed.has(t));
+  check('fixture 只含 surface 真实类型', badTypes.length === 0, [...new Set(badTypes)]);
+
+  // tool 配对必须平衡到 0
+  let running = 0;
+  for (const e of realEvents) {
+    const ev = e as { type?: string; data?: { message?: { content?: unknown } } };
+    if (ev.type === 'assistant/message') {
+      const content = ev.data?.message?.content;
+      running += Array.isArray(content)
+        ? content.filter((b) => (b as { type?: string })?.type === 'tool-call').length
+        : 0;
+    } else if (ev.type === 'tool/result') running -= 1;
+  }
+  check('fixture 的 tool 配对在结尾平衡（=0）', running === 0, running);
 
   const unlimited = selectTrimRange(realNodes, realEvents, 8);
-  const capped = selectTrimRange(realEvents.map((_, i) => i), realEvents, 8, 40);
+  const capped = selectTrimRange(realNodes, realEvents, 8, 40);
   const cntOf = (r: typeof unlimited): number => (r === null ? 0 : r.endIdx - r.startIdx + 1);
   console.log(`    不限制: 裁 ${cntOf(unlimited)}；limit=40: 裁 ${cntOf(capped)}`);
 
@@ -680,17 +713,17 @@ console.log('=== 1b) 真实 surface 回归锁（145 节点） ===');
   // 端点必须落在「切点平衡 + 可替换」位置，否则宿主会拒绝
   const balancedAt = (r: typeof unlimited): boolean => {
     if (r === null) return false;
-    let running = 0;
+    let run = 0;
     const cut = [true];
     for (let i = 0; i < realNodes.length; i += 1) {
       const ev = realEvents[i] as { type?: string; data?: { message?: { content?: unknown } } };
       if (ev.type === 'assistant/message') {
         const content = ev.data?.message?.content;
-        running += Array.isArray(content)
+        run += Array.isArray(content)
           ? content.filter((b) => (b as { type?: string })?.type === 'tool-call').length
           : 0;
-      } else if (ev.type === 'tool/result') running -= 1;
-      cut.push(running === 0);
+      } else if (ev.type === 'tool/result') run -= 1;
+      cut.push(run === 0);
     }
     return cut[r.startIdx] === true && cut[r.endIdx + 1] === true;
   };

@@ -394,22 +394,74 @@ export function hardFilter(text: string): string {
 /**
  * 决策类词：从正文里识别「已经定下来的做法」。
  *
- * ## 为什么「决策 / 决定 / 采用」必须带后接成分
+ * ## 为什么不能是裸 `includes`
  *
- * 裸 `includes` 会把**名词化用法**全捞进来，实测污染注入：
+ * 裸词会把**名词化 / 计数句**全捞进来，实测污染注入：
  * ```
- * 决策：这次有 3 条关键决策          ← 计数句，不是决策
- * 决策：我需要决定采用哪个方案        ← 待办意图，不是已定结论
+ * 决策：这次有 3 条关键决策          ← 计数句
  * 决策：| 0–8s | 一次对话，光点起势…  ← 表格行碎片
  * ```
- * 这些条目 memory_type=`decision` ⇒ 快照 rank 1，直接抢高价值槽位。
- * 注入总共只有 1~3 条，一条噪声等于砍掉 1/3 信息量。
  *
- * 所以「决策/决定」要求后接**已定的动作或取值**（决定用 / 决策是 …），
- * 其余动词形（改用/换成/改到/设为…）本身就隐含完成态，可以直接匹配。
+ * ## 但也不能用白名单后接字
+ *
+ * 上一版写成 `(?:决定|决策)(?:用|采用|走|把|先|是|为|定|改)`，
+ * 实测**漏掉 9 条真决策**（比噪声重要得多）：
+ * `决定不再使用 IDM`、`决定放弃 IDM`、`决定取消 --json 方案`、
+ * `决定停止使用临时目录`、`决定去掉 BOM`、`决定保留 8 个节点`、
+ * `决定重写整个场景`、`决定使用 --stdin`。
+ * 「决定 + 任意动词」本身就是最标准的决策句式。
+ *
+ * ## 采用**排除式**
+ *
+ * 只排除「决策/决定」后面**没有动作**的名词化/计数用法：
+ * - `3 条关键决策` / `关键决策是` → 前面是数量词或后面接「的/是/有」
+ * - `需要决定` / `要决定` → 前面是情态词（未定）
+ *
+ * @see `NOMINAL_DECISION` 为对应的排除正则
  */
 const DECISION_MARKERS =
-  /(?:决定|决策)(?:用|采用|走|把|先|是|为|定|改)|(?:采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用)/;
+  /决定|决策|采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用/;
+
+/**
+ * 「决策」的**名词化 / 未定 / 被引用**用法（不是已定结论）。
+ *
+ * - `N 条/个 关键决策`：计数
+ * - `需要/要/待 决定`：还没定
+ * - `…的决策`：名词短语
+ * - `"…决策…"`：**引号里被引用的名词**（实测画面描述里出现
+ *   `Deleted item: a block "决策 · 端口纪律 3099/3111" with strike`）
+ */
+const NOMINAL_DECISION =
+  /(?:\d+\s*[条个项]\s*(?:关键)?决策)|(?:(?:需要|要|待|待定|未)\s*决定)|(?:的决策)|(?:决策[到的])|(?:["'「"][^"'」"]*决策[^"'」"]*["'」"])/;
+
+/**
+ * 是否是「像样的中文正文」——决策判定的额外闸门。
+ *
+ * 两个必要条件：
+ * 1. 中文字符占比 ≥ 50%（英文推理流里引用中文词不算）
+ * 2. **不以代码/参数形态开头**（`hop=5 "…"`、`x = 1` 这类是配置/参数行）
+ *
+ * 实测被这个闸门挡掉的噪声：
+ * ```
+ * hop=5 "吃完洗碗，洗碗布该换了"        ← 画面参数行
+ * Deleted item: a block "决策 · 端口纪律"  ← 英文描述
+ * ```
+ */
+function looksLikeChineseProse(text: string): boolean {
+  // 参数/赋值行：`hop=5 …`、`foo: bar`、`x = 1`
+  if (/^\s*[A-Za-z_][A-Za-z0-9_]*\s*[=:]\s*/.test(text)) return false;
+  // **只有当英文单词占主导时才算英文句**。
+  //
+  // 不能简单用「中文字符占比 < 50%」：`目前改用 --stdin 传入` 这类
+  // 短决策句里 `--stdin` 是 8 个 ASCII 字符，会把占比压到 50% 以下，
+  // 实测误杀了「决定使用 --stdin」「决策是改用 --file」等真决策。
+  const cjk = (text.match(/[\u4e00-\u9fa5]/g) ?? []).length;
+  const englishWords = (text.match(/\b[A-Za-z]{3,}\b/g) ?? []).length;
+  // 中文一个字都没有 ⇒ 不是中文正文
+  if (cjk === 0) return false;
+  // 英文单词 ≥ 4 个且明显多于中文字数 ⇒ 是英文叙述
+  return !(englishWords >= 4 && englishWords > cjk);
+}
 
 /**
  * 正文里的**过程叙述**：第一人称正在做事，不是结论也不是约束。
@@ -541,9 +593,14 @@ export function constraintsFromProse(text: string, maxLines = 4): string[] {
     // 不用宽泛的 `CONSTRAINT_WORDS`：实测那样会把大量**状态陈述**也捞进来
     // （"这个 CLI 现在能启动了"、"刚刚安装完成"），
     // 覆盖率看似变好，实际一半是噪声。
-    const isDecision = DECISION_MARKERS.test(masked);
+    const isDecision = DECISION_MARKERS.test(masked) && !NOMINAL_DECISION.test(masked);
     const isConstraint = STRONG_CONSTRAINT.test(masked);
     if (!isDecision && !isConstraint) continue;
+
+    // 决策类判定额外要求「这是中文正文」：英文推理流里引用中文词
+    // （`a block "决策 · 端口纪律" with strike`）会被裸词「决策」骗过，
+    // 实测这类 4 条以 decision 入池并进入注入。
+    if (isDecision && !isConstraint && !looksLikeChineseProse(line)) continue;
 
     // **情态词优先于时态词**：带「必须/禁止/不要」的句子就是约束，
     // 即使句中有「然后/已经/现在」。
@@ -623,6 +680,54 @@ export function carriesResourceLocation(text: string): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * 是否是**用户交代的关键资源位置**（用于快照提权）。
+ *
+ * ## 为什么不能用黑名单
+ *
+ * 前两版都栽在这里：
+ * 1. 用宽松的 `carriesResourceLocation` ⇒ 助手正文里 `G:\loong 是仓库`
+ *    也被提权，rank0 从 5 条膨胀到 13 条，IDM 约束注入 4 → **0** 次。
+ * 2. 改成「媒体扩展名 + 过程词黑名单」⇒ 英文推理句
+ *    `…fails with "unsupported format"… score.wav is 10MB` 既含 `.wav`
+ *    又没命中黑名单词，仍被判为关键资源，**抢走预留槽位**：
+ *    真实重放里真资源位置注入 **1/17** 次（剔除它后升到 7/17）。
+ *
+ * 黑名单永远补不全（`验证通过`/`已导入`/`too large`/`unsupported`…）。
+ *
+ * ## 改成「位置指示词」白名单
+ *
+ * 事故里真正缺的信息是「文件**在哪**」。所以要求同时满足：
+ * 1. 含媒体类文件 token（`.wav/.mp3/.mp4/...`）
+ * 2. 含**位置指示词**：`在/位于/放到/放在/存在/桌面/路径/目录/来自`，
+ *    或行首直接就是路径（`D:\Desktop，score.wav`）
+ *
+ * 这样：
+ * - `D:\Desktop，score-Dtle1HAU.wav，这是你要打音频` ✓（行首路径）
+ * - `音频文件是 assets/bgm.wav` ✓（有 `是`…但需位置词，见下）
+ * - `score.wav is 10MB` ✗（只是描述大小，没有位置）
+ * - `assets/score.wav 的 MD5 一致` ✗
+ * - `G:\loong 是仓库` ✗（没有媒体扩展名）
+ *
+ * 英文句也一并排除：`fail/error/unsupported/too large/Hmm/Let me` 这类
+ * 是推理过程，不是交代位置。
+ */
+const LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
+const ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
+const MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
+/** 行首就是盘符路径（`D:\Desktop，score.wav`）—— 用户直接贴位置的最常见形态。 */
+const LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
+
+export function isKeyResourceLocation(text: string): boolean {
+  // 先剥 URL：`https://example.com/shot.png` 不该被当成资源位置
+  const body = text.replace(/\bhttps?:\/\/\S+/gi, ' ');
+  if (!MEDIA_FILE.test(body)) return false;
+  // 英文推理过程句一律排除（判据：含过程动词且不含位置词）
+  if (ENGLISH_PROCESS.test(body) && !LOCATION_HINT.test(body)) return false;
+  // 行首直贴路径，或句中出现位置指示词
+  return LEADING_PATH.test(body) || LOCATION_HINT.test(body);
 }
 
 /**

@@ -1145,7 +1145,15 @@ function hardFilter(text) {
   }
   return kept.join("\n");
 }
-var DECISION_MARKERS = /(?:决定|决策)(?:用|采用|走|把|先|是|为|定|改)|(?:采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用)/;
+var DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用/;
+var NOMINAL_DECISION = /(?:\d+\s*[条个项]\s*(?:关键)?决策)|(?:(?:需要|要|待|待定|未)\s*决定)|(?:的决策)|(?:决策[到的])|(?:["'「"][^"'」"]*决策[^"'」"]*["'」"])/;
+function looksLikeChineseProse(text) {
+  if (/^\s*[A-Za-z_][A-Za-z0-9_]*\s*[=:]\s*/.test(text)) return false;
+  const cjk = (text.match(/[\u4e00-\u9fa5]/g) ?? []).length;
+  const englishWords = (text.match(/\b[A-Za-z]{3,}\b/g) ?? []).length;
+  if (cjk === 0) return false;
+  return !(englishWords >= 4 && englishWords > cjk);
+}
 var PROSE_NARRATION = /^(?:我(?:先|来|去|再|正在|会先)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:检查|查看|读取|尝试|运行)(?:一下|下)/;
 var PAST_OR_PLANNING = (
   // 仅「动词 + 过」且后接句读（排除 过滤/过程/过度 等构词）
@@ -1166,9 +1174,10 @@ function constraintsFromProse(text, maxLines = 4) {
     const masked = maskPaths(line);
     const strongHit = STRONG_CONSTRAINT.test(masked);
     if (line.length < (strongHit ? 4 : 8)) continue;
-    const isDecision = DECISION_MARKERS.test(masked);
+    const isDecision = DECISION_MARKERS.test(masked) && !NOMINAL_DECISION.test(masked);
     const isConstraint = STRONG_CONSTRAINT.test(masked);
     if (!isDecision && !isConstraint) continue;
+    if (isDecision && !isConstraint && !looksLikeChineseProse(line)) continue;
     if (!isConstraint && PAST_OR_PLANNING.test(masked)) continue;
     const kind = isDecision && !isConstraint ? "决策" : "约束";
     const body2 = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, "").trim();
@@ -1193,6 +1202,16 @@ function carriesResourceLocation(text) {
     return true;
   }
   return false;
+}
+var LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
+var ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
+var MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
+var LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
+function isKeyResourceLocation(text) {
+  const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
+  if (!MEDIA_FILE.test(body)) return false;
+  if (ENGLISH_PROCESS.test(body) && !LOCATION_HINT.test(body)) return false;
+  return LEADING_PATH.test(body) || LOCATION_HINT.test(body);
 }
 var USER_CORRECTION = (
   // 必须**有第二人称指向 + 完成态**（你）或「说过 N 次」的明确重申。
@@ -1364,15 +1383,16 @@ function buildSnapshot(items, maxItems) {
   if (picked.length === 0) return "";
   return `[LRC 状态] ${picked.join("；")}。细节在 LRC，需要时 recall。`;
 }
+function keepPriority(item) {
+  if (item.memory_type === "preference" || item.tags?.includes("constraint")) return 0;
+  if (isKeyResourceLocation(item.content)) return 0;
+  if (item.memory_type === "decision" || item.tags?.includes("decision")) return 1;
+  if (item.tags?.includes("conclusion")) return 2;
+  return 3;
+}
 function pickDiverseSnapshot(items, maxItems) {
   if (items.length === 0 || maxItems <= 0) return [];
-  const rank = (item) => {
-    if (item.memory_type === "preference" || item.tags?.includes("constraint")) return 0;
-    if (carriesResourceLocation(item.content)) return 0;
-    if (item.memory_type === "decision" || item.tags?.includes("decision")) return 1;
-    if (item.tags?.includes("conclusion")) return 2;
-    return 3;
-  };
+  const rank = keepPriority;
   const groups = /* @__PURE__ */ new Map();
   for (const item of items) {
     const r = rank(item);
@@ -1403,13 +1423,14 @@ function pickDiverseSnapshot(items, maxItems) {
     return false;
   };
   if (maxItems >= 2) {
-    const resItem = (groups.get(0) ?? []).find((i) => carriesResourceLocation(i.content));
-    if (resItem !== void 0) {
-      const idx = (groups.get(0) ?? []).indexOf(resItem);
+    const rank0 = groups.get(0) ?? [];
+    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content));
+    if (idx >= 0) {
+      const resItem = rank0[idx];
+      rank0.splice(idx, 1);
       const body = bodyOf(resItem);
       picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
       pickedKeys.push(keyOf(body));
-      cursor.set(0, idx + 1);
     }
   }
   const order = [...groups.keys()].sort((a, b) => a - b);
@@ -1643,12 +1664,19 @@ var Offloader = class {
       this.snapshotPool.push(item);
     }
     if (this.snapshotPool.length > this.snapshotPoolMax) {
-      const isHigh = (i) => i.memory_type === "preference" || i.memory_type === "decision" || i.tags?.includes("constraint") === true || i.tags?.includes("decision") === true;
-      const high = this.snapshotPool.filter(isHigh);
-      const low = this.snapshotPool.filter((i) => !isHigh(i));
-      const highKept = high.slice(-this.snapshotPoolMax);
-      const room = Math.max(0, this.snapshotPoolMax - highKept.length);
-      this.snapshotPool = room > 0 ? [...highKept, ...low.slice(-room)] : highKept;
+      const isHigh = (i) => keepPriority(i) <= 1;
+      const pinned = [];
+      const rest = [];
+      for (const item of this.snapshotPool) {
+        if (pinned.length < 2 && isKeyResourceLocation(item.content)) pinned.push(item);
+        else rest.push(item);
+      }
+      const high = rest.filter(isHigh);
+      const low = rest.filter((i) => !isHigh(i));
+      const budget = Math.max(0, this.snapshotPoolMax - pinned.length);
+      const highKept = high.slice(-budget);
+      const room = Math.max(0, budget - highKept.length);
+      this.snapshotPool = room > 0 ? [...pinned, ...highKept, ...low.slice(-room)] : [...pinned, ...highKept];
     }
     return buildSnapshot([...this.snapshotPool].reverse(), this.config.snapshotItems);
   }
