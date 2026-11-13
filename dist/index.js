@@ -1263,8 +1263,8 @@ function isKeyResourceLocation(text, fromUser) {
   const REVERSE = new RegExp(
     `(?:位于|放在|放到|存在|来自|存到|拷到|复制到).{0,2}${RES}`
   );
-  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次|哪一个|有没有|是否|吗)/;
-  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|打包|覆盖|处理|替换|修改|重写|移除)/;
+  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次|哪一个|有没有|是否|吗|还是|哪里|哪儿)/;
+  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|删了|打包|覆盖|处理|替换|修改|重写|移除)/;
   const clauseWithLocation = () => {
     const clauses = body.split(/[，。；、！？,;!?]+/);
     for (const c of clauses) {

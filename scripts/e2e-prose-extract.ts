@@ -748,6 +748,11 @@ console.log('=== 7f-1) 提权判据看来源 ===');
     '音频在 build 产物里被压缩了',
     '文件在 tmp 里被清掉了',
     '音频在桌面上显示的是什么',
+    // ★第二十轮：`还是` / `哪里` / `删了` 三类既有漏网
+    '音频在 D 盘还是 C 盘',
+    '音频在桌面还是下载目录',
+    '音频在桌面哪里',
+    '文件在 tmp 里被删了',
   ];
   for (const s of questionInClause) {
     check(`位置小句内提问仍 false「${s.slice(0, 22)}」`, !isKeyResourceLocation(s, true), s);
