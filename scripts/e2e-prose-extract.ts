@@ -437,19 +437,19 @@ console.log('=== 7e) 池上限与淘汰端 ===');
 //   (b) 淘汰判据不认资源位置 ⇒ 池满 20 时先删掉它，提权等于没做。
 console.log('=== 7f) 资源位置必须被注入 ===');
 {
-  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
-    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  const mk = (c: string, t: string, tags: string[], origin?: 'user' | 'assistant'): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0], origin,
   });
-  // 模拟真实池：高价值约束/决策 + 资源位置（LRC 归类为 code_context）
+  // 模拟真实池：高价值约束/决策 + 资源位置（用户说的）
   // + 助手正文里的路径类过程结论（第七轮指出的污染源）
   const pool: DistilledItem[] = [
     mk('[约束] 不要走 IDM 下载音频，直接用桌面文件', 'preference', ['constraint']),
     mk('[约束] 缓存必须放在工作区之外', 'preference', ['constraint']),
-    mk('[结论] G:\\loong 是 LRC 的源码仓库', 'fact', ['conclusion']),
-    mk('[结论] 在 C:\\Users\\Administrator\\.dsh 下确认配置', 'fact', ['conclusion']),
-    mk('[结论] 工程里的 assets/score.wav 的 MD5 一致', 'fact', ['conclusion']),
-    mk('[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'code_context', ['code']),
-    mk('[决策] 改用 --stdin 传入', 'decision', ['decision']),
+    mk('[结论] G:\\loong 是 LRC 的源码仓库', 'fact', ['conclusion'], 'assistant'),
+    mk('[结论] 在 C:\\Users\\Administrator\\.dsh 下确认配置', 'fact', ['conclusion'], 'assistant'),
+    mk('[结论] 工程里的 assets/score.wav 的 MD5 一致', 'fact', ['conclusion'], 'assistant'),
+    mk('[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'fact', ['resource', 'user'], 'user'),
+    mk('[决策] 改用 --stdin 传入', 'decision', ['decision'], 'assistant'),
   ];
 
   const snap3 = buildSnapshot(pool, 3);
@@ -470,51 +470,58 @@ console.log('=== 7f) 资源位置必须被注入 ===');
   check('无资源位置时仍注入约束', snapNoRes.includes('IDM'), snapNoRes);
 }
 
-// ── 7f-1) 提权判据必须是「位置白名单」，不能是黑名单 ──
+// ── 7f-1) 提权判据必须看「谁在说」，不能只看文本形态 ──
 //
-// ★第八次审查的核心发现：真实日志 seq≈1550 的英文推理句
-// `…fails with "unsupported format"… score.wav is 10MB` 被旧判据
-// （媒体扩展名 + 过程词黑名单）判为关键资源，**抢走预留槽位**：
-// 真资源位置在 17 次注入里只出现 **1** 次（剔除该假条目后升到 7 次）。
-// 黑名单永远补不全，所以改成「媒体文件 + 位置指示词」白名单。
-console.log('=== 7f-1) 提权判据白名单化 ===');
+// ★八轮/九轮审查的核心结论：靠词表永远追不上。
+//
+// | 版本 | 判据 | 结果 |
+// |---|---|---|
+// | v1 | 宽松 `carriesResourceLocation` | 助手正文 `G:\loong 是仓库` 也提权，IDM 注入 4→0 |
+// | v2 | 媒体扩展名 + 过程词黑名单 | 英文推理句 `score.wav is 10MB` 冒充，真位置 1/17 |
+// | v3 | 位置词白名单 | 英文假货消失，**中文助手结论**顶上来
+//       （`桌面上的文件与 assets/score.wav 的 MD5 一致`），真位置 **1/16** |
+//
+// 根因不在词表，在**没有来源维度**：助手陈述与用户交代在文本上无法区分。
+// 所以 `isKeyResourceLocation(text, fromUser)` 只对用户来源返回 true。
+console.log('=== 7f-1) 提权判据看来源 ===');
 {
-  const should = [
-    '[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频',
+  // 用户说的话 —— 必须提权
+  const fromUser = [
+    '[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频',
+    '音频在桌面',
+    '文件放在下载目录了',
     '音频文件在 assets/bgm.mp3',
-    '音频放到 D:\\Desktop\\score.wav',
-    '素材位于 assets/score.wav',
   ];
-  for (const s of should) check(`提权「${s.slice(0, 28)}」`, isKeyResourceLocation(s), s);
+  for (const s of fromUser) check(`用户来源提权「${s.slice(0, 26)}」`, isKeyResourceLocation(s, true), s);
 
-  const shouldNot = [
-    // ★真实日志原文片段（第八轮实测的假货）
-    'With existing file, the bundler tries to load it as a module and fails with "unsupported or unrecognizable format". Hmm — this could be because the file is too large? score.wav is 10MB',
-    'score.wav is 10MB',
-    '工程里的 assets/score.wav 的 MD5 一致',
+  // 助手说的话 —— 一律不提权（这是三轮反复踩的坑）
+  const fromAssistant = [
+    '[结论] 桌面上的文件与工程里的 assets/score.wav 的 MD5 一致',
+    '[结论] 成片位于 build/LRC-intro.mp4',
+    '[结论] 音频已放在 assets/bgm.mp3',
+    '[结论] 我把图片放到 public/cover.png 了',
+    'With existing file, the bundler fails with "unsupported format". score.wav is 10MB',
     'G:\\loong 是 LRC 的源码仓库',
-    '在 C:\\Users\\Administrator\\.dsh 下确认配置',
-    '检查 src/index.ts 里的逻辑',
-    '帮我排版 docs/禁止事项.md',
-    'https://example.com/shot.png 这张图',
   ];
-  for (const s of shouldNot) check(`不提权「${s.slice(0, 30)}」`, !isKeyResourceLocation(s), s);
+  for (const s of fromAssistant) {
+    check(`助手来源不提权「${s.slice(0, 26)}」`, !isKeyResourceLocation(s, false), s);
+  }
 
-  // 提权判据的竞争场景：假货不得抢走真位置的槽位
-  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
-    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  // 关键竞争场景：中文助手结论不得抢走用户资源位置的预留槽位
+  const mk = (c: string, t: string, tags: string[], origin?: 'user' | 'assistant'): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0], origin,
   });
-  const competing: DistilledItem[] = [
-    mk('[约束] 不要走 IDM 下载音频，直接用桌面文件', 'preference', ['constraint']),
-    mk('[结论] With existing file, the bundler fails with "unsupported format". score.wav is 10MB', 'fact', ['conclusion']),
-    mk('[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'code_context', ['code']),
-    mk('[决策] 改用 --stdin 传入', 'decision', ['decision']),
-  ];
-  const snapComp = buildSnapshot(competing, 3);
-  console.log(`    竞争场景 → ${snapComp}`);
-  check('真位置在竞争中仍能注入', snapComp.includes('score-Dtle1HAU'), snapComp);
-  check('IDM 约束未被挤掉', snapComp.includes('IDM'), snapComp);
-  check('假货（10MB 推理句）未被注入', !snapComp.includes('10MB'), snapComp);
+  const rank0Pool: DistilledItem[] = [];
+  for (let i = 0; i < 10; i += 1) {
+    rank0Pool.push(mk(`[约束] 约束${i}：必须遵守第 ${i} 条规范`, 'preference', ['constraint']));
+  }
+  rank0Pool.push(mk('[结论] 桌面上的文件与工程里的 assets/score.wav 的 MD5 一致', 'fact', ['conclusion'], 'assistant'));
+  rank0Pool.push(mk('[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'fact', ['resource', 'user'], 'user'));
+
+  const snapRank0 = buildSnapshot(rank0Pool, 3);
+  console.log(`    rank0 竞争 → ${snapRank0}`);
+  check('用户资源位置抢到预留槽位', snapRank0.includes('score-Dtle1HAU'), snapRank0);
+  check('中文助手结论未抢到槽位', !snapRank0.includes('MD5'), snapRank0);
 }
 
 // ── 7f-2) 池淘汰必须与取词同源（资源位置要钉住） ──
@@ -530,12 +537,12 @@ console.log('=== 7f-2) 池满后资源位置仍在池 ===');
     buildPooledSnapshot: (i: DistilledItem[]) => string;
     snapshotPool: DistilledItem[];
   };
-  const mk = (c: string, t: string, tags: string[]): DistilledItem => ({
-    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0],
+  const mk = (c: string, t: string, tags: string[], origin?: 'user' | 'assistant'): DistilledItem => ({
+    content: c, memory_type: t, tags, importance: 7, source_turns: [0, 0], origin,
   });
   // 先放资源位置（用户一开始就交代文件在哪）
   pool.buildPooledSnapshot([
-    mk('[代码] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'code_context', ['code']),
+    mk('[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'fact', ['resource', 'user'], 'user'),
   ]);
   // 再灌 30 条约束把池撑满
   for (let round = 0; round < 6; round += 1) {

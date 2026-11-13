@@ -46,6 +46,7 @@ import {
   constraintsFromProse,
   constraintsFromUser,
   extractMemoryTag,
+  isKeyResourceLocation,
   isNoUpdate,
 } from './memory-filter.ts';
 import {
@@ -1311,7 +1312,41 @@ export function apply(ctx: Context, config: Config): void {
       // 约束从未入库，下一轮照旧去点下载链接。
       const corrections = constraintsFromUser(userText);
       if (corrections.length > 0) {
-        offloadExtracted(itemsFromTag(corrections.join('\n')), sessionId, '用户纠正');
+        offloadExtracted(
+          itemsFromTag(corrections.join('\n')).map((i) => ({ ...i, origin: 'user' as const })),
+          sessionId,
+          '用户纠正',
+        );
+      }
+
+      // ★用户交代的**资源位置**必须入库（事故的另一半）。
+      //
+      // 真实会话里最关键的一条是：
+      // `D:\Desktop，score-Dtle1HAU.wav，这是你要打音频。继续任务`
+      // 它既没有约束词（进不了 `hasConstraintMarker` 门槛），
+      // 也不是纠正句式（`constraintsFromUser` 也不收）。
+      //
+      // 这条路径比「靠 `linesFromSession` 放行 + `hardFilter` 过滤」可靠：
+      // `hardFilter` 有 20 字门槛，「音频在桌面」这种口语会被直接吞掉
+      // （实测 distilled=0、零 HTTP、零日志）。这里显式收，来源标 `user`。
+      if (isKeyResourceLocation(userText, true)) {
+        const body = userText.trim();
+        if (body.length > 0) {
+          offloadExtracted(
+            [
+              {
+                content: `[事实] ${body.length > 200 ? `${body.slice(0, 200)}…` : body}`,
+                memory_type: 'fact',
+                tags: ['resource', 'distilled', 'user'],
+                importance: 8,
+                source_turns: [0, 0],
+                origin: 'user',
+              },
+            ],
+            sessionId,
+            '资源位置',
+          );
+        }
       }
       return;
     }
@@ -1347,7 +1382,11 @@ export function apply(ctx: Context, config: Config): void {
         // migrate 两次 HTTP），期间用户可能已切到别的会话。若那时才读
         // `currentSessionId`，会把 A 的约束写成 B 的归属 —— 正是上一轮
         // 在 `flush()` 里修过的同一个坑，不能在新路径上重犯。
-        offloadExtracted(itemsFromTag(prose.join('\n')), sessionId, '正文抽取');
+        offloadExtracted(
+          itemsFromTag(prose.join('\n')).map((i) => ({ ...i, origin: 'assistant' as const })),
+          sessionId,
+          '正文抽取',
+        );
       }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       // 只有「声明了 text/reasoning 块但 text 不是字符串」才是结构异常。

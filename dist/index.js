@@ -1207,11 +1207,14 @@ var LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来
 var ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
 var MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
 var LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
-function isKeyResourceLocation(text) {
+function isKeyResourceLocation(text, fromUser) {
+  if (!fromUser) return false;
   const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
-  if (!MEDIA_FILE.test(body)) return false;
-  if (ENGLISH_PROCESS.test(body) && !LOCATION_HINT.test(body)) return false;
-  return LEADING_PATH.test(body) || LOCATION_HINT.test(body);
+  if (ENGLISH_PROCESS.test(body)) return false;
+  if (MEDIA_FILE.test(body)) return true;
+  const hasLocation = LEADING_PATH.test(body) || LOCATION_HINT.test(body);
+  const hasResourceNoun = /(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)/.test(body);
+  return hasLocation && hasResourceNoun;
 }
 var USER_CORRECTION = (
   // 必须**有第二人称指向 + 完成态**（你）或「说过 N 次」的明确重申。
@@ -1385,7 +1388,7 @@ function buildSnapshot(items, maxItems) {
 }
 function keepPriority(item) {
   if (item.memory_type === "preference" || item.tags?.includes("constraint")) return 0;
-  if (isKeyResourceLocation(item.content)) return 0;
+  if (isKeyResourceLocation(item.content, item.origin === "user")) return 0;
   if (item.memory_type === "decision" || item.tags?.includes("decision")) return 1;
   if (item.tags?.includes("conclusion")) return 2;
   return 3;
@@ -1424,7 +1427,7 @@ function pickDiverseSnapshot(items, maxItems) {
   };
   if (maxItems >= 2) {
     const rank0 = groups.get(0) ?? [];
-    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content));
+    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content, i.origin === "user"));
     if (idx >= 0) {
       const resItem = rank0[idx];
       rank0.splice(idx, 1);
@@ -1668,7 +1671,7 @@ var Offloader = class {
       const pinned = [];
       const rest = [];
       for (const item of this.snapshotPool) {
-        if (pinned.length < 2 && isKeyResourceLocation(item.content)) pinned.push(item);
+        if (pinned.length < 2 && isKeyResourceLocation(item.content, item.origin === "user")) pinned.push(item);
         else rest.push(item);
       }
       const high = rest.filter(isHigh);
@@ -3687,7 +3690,30 @@ ${latestSnapshot}`;
       void refreshRecallInjection(userText);
       const corrections = constraintsFromUser(userText);
       if (corrections.length > 0) {
-        offloadExtracted(itemsFromTag(corrections.join("\n")), sessionId, "用户纠正");
+        offloadExtracted(
+          itemsFromTag(corrections.join("\n")).map((i) => ({ ...i, origin: "user" })),
+          sessionId,
+          "用户纠正"
+        );
+      }
+      if (isKeyResourceLocation(userText, true)) {
+        const body = userText.trim();
+        if (body.length > 0) {
+          offloadExtracted(
+            [
+              {
+                content: `[事实] ${body.length > 200 ? `${body.slice(0, 200)}…` : body}`,
+                memory_type: "fact",
+                tags: ["resource", "distilled", "user"],
+                importance: 8,
+                source_turns: [0, 0],
+                origin: "user"
+              }
+            ],
+            sessionId,
+            "资源位置"
+          );
+        }
       }
       return;
     }
@@ -3701,7 +3727,11 @@ ${latestSnapshot}`;
       offloader.observe(text);
       const prose = constraintsFromProse(text);
       if (prose.length > 0) {
-        offloadExtracted(itemsFromTag(prose.join("\n")), sessionId, "正文抽取");
+        offloadExtracted(
+          itemsFromTag(prose.join("\n")).map((i) => ({ ...i, origin: "assistant" })),
+          sessionId,
+          "正文抽取"
+        );
       }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       warnedShape = true;

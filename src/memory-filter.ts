@@ -720,14 +720,41 @@ const MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「�
 /** 行首就是盘符路径（`D:\Desktop，score.wav`）—— 用户直接贴位置的最常见形态。 */
 const LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
 
-export function isKeyResourceLocation(text: string): boolean {
+/**
+ * 是否是**用户交代的关键资源位置**（用于快照提权）。
+ *
+ * ## 必须传 `fromUser`，判据必须看「谁在说」
+ *
+ * 这是三轮反复踩的同一个坑：
+ *
+ * | 版本 | 判据 | 结果 |
+ * |---|---|---|
+ * | v1 | 宽松 `carriesResourceLocation` | 助手正文 `G:\loong 是仓库` 也提权，IDM 注入 4→**0** |
+ * | v2 | 媒体扩展名 + 过程词黑名单 | 英文推理句 `score.wav is 10MB` 冒充，真位置 **1/17** |
+ * | v3 | 位置词白名单 | 英文假货消失，但**中文助手结论**顶上来：`桌面上的文件与 assets/score.wav 的 MD5 一致` 抢走预留槽，真位置 **1/16** |
+ *
+ * 大病根不在词表，在**没有来源维度**：助手在正文里陈述「某文件和某文件一致」
+ * 与用户交代「文件在桌面」在文本形态上无法区分，靠加词永远追不上。
+ *
+ * 所以：**只有用户说的话才提权**。助手正文里的一切（哪怕是「音频在桌面」）
+ * 都交由 `rank` 的常规优先级处理。
+ *
+ * @param text - 条目内容
+ * @param fromUser - 是否来自用户消息（`index.ts` 的 `user/message` 分支）
+ */
+export function isKeyResourceLocation(text: string, fromUser: boolean): boolean {
+  if (!fromUser) return false;
   // 先剥 URL：`https://example.com/shot.png` 不该被当成资源位置
   const body = text.replace(/\bhttps?:\/\/\S+/gi, ' ');
-  if (!MEDIA_FILE.test(body)) return false;
-  // 英文推理过程句一律排除（判据：含过程动词且不含位置词）
-  if (ENGLISH_PROCESS.test(body) && !LOCATION_HINT.test(body)) return false;
-  // 行首直贴路径，或句中出现位置指示词
-  return LEADING_PATH.test(body) || LOCATION_HINT.test(body);
+  // 英文推理过程句排除
+  if (ENGLISH_PROCESS.test(body)) return false;
+  // 用户说的话：带媒体文件 → 直接认（用户不会无缘无故提媒体文件名）
+  if (MEDIA_FILE.test(body)) return true;
+  // 无扩展名的口语形态（「音频在桌面」「文件放在下载目录了」）：
+  // 要求「位置词 + 资源名词」同时出现
+  const hasLocation = LEADING_PATH.test(body) || LOCATION_HINT.test(body);
+  const hasResourceNoun = /(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)/.test(body);
+  return hasLocation && hasResourceNoun;
 }
 
 /**

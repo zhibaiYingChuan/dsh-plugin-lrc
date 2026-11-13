@@ -11,6 +11,19 @@ export interface DistilledItem {
   tags: string[];
   importance: number;
   source_turns: [number, number];
+  /**
+   * 来源：`user` = 用户说的话，`assistant` = 助手正文/推理。
+   *
+   * ## 为什么必须带
+   *
+   * 快照提权（资源位置）必须区分「谁在说」：用户交代「音频在桌面」
+   * 与助手陈述「桌面上的文件与 assets/score.wav 的 MD5 一致」在文本形态上
+   * 无法区分。靠不断加词表三次都失败了（英文推理句 → 中文结论 → …），
+   * 根治办法是让判据能看到来源。
+   *
+   * LRC 侧不需要这个字段（`migrate` 会忽略未知键），它只用于本地快照取词。
+   */
+  origin?: 'user' | 'assistant';
 }
 
 export interface DistillResult {

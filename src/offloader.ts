@@ -200,7 +200,8 @@ export function buildSnapshot(items: DistilledItem[], maxItems: number): string 
  */
 function keepPriority(item: DistilledItem): number {
   if (item.memory_type === 'preference' || item.tags?.includes('constraint')) return 0;
-  if (isKeyResourceLocation(item.content)) return 0;
+  // **只有用户来源才提权**（见 `isKeyResourceLocation` 的注释）
+  if (isKeyResourceLocation(item.content, item.origin === 'user')) return 0;
   if (item.memory_type === 'decision' || item.tags?.includes('decision')) return 1;
   if (item.tags?.includes('conclusion')) return 2;
   return 3;
@@ -260,7 +261,7 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
   // 这类过程结论选中，反而不是用户交代的音频位置。
   if (maxItems >= 2) {
     const rank0 = groups.get(0) ?? [];
-    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content));
+    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content, i.origin === 'user'));
     if (idx >= 0) {
       const resItem = rank0[idx] as DistilledItem;
       // **必须从组里摘掉，不能只挪游标**：资源位置常常排在约束**之后**，
@@ -607,7 +608,7 @@ export class Offloader {
       const pinned: DistilledItem[] = [];
       const rest: DistilledItem[] = [];
       for (const item of this.snapshotPool) {
-        if (pinned.length < 2 && isKeyResourceLocation(item.content)) pinned.push(item);
+        if (pinned.length < 2 && isKeyResourceLocation(item.content, item.origin === 'user')) pinned.push(item);
         else rest.push(item);
       }
 
