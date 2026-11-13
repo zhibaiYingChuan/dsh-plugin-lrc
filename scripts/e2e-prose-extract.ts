@@ -12,6 +12,7 @@ import {
   carriesResourceLocation,
   constraintsFromProse,
   constraintsFromUser,
+  hardFilter,
   isKeyResourceLocation,
 } from '../src/memory-filter.ts';
 import { Offloader, buildSnapshot } from '../src/offloader.ts';
@@ -545,6 +546,21 @@ console.log('=== 7f-1) 提权判据看来源 ===');
   console.log(`    IDM+资源位置组合 → ${snapCombo}`);
   check('组合场景：资源位置出现', snapCombo.includes('score-Dtle1HAU'), snapCombo);
   check('组合场景：IDM 约束也出现', snapCombo.includes('IDM'), snapCombo);
+
+  // ★第十轮 P1-1：真实压力场景 —— 12 条助手约束 + 用户纠正 + 用户资源位置。
+  // 只给资源位置预留槽位时，IDM 纠正从 3/16 **回退到 1/15**（被助手约束挤掉）。
+  // 修法是给「用户亲口说的两类事实」各预留一槽。
+  const pressure: DistilledItem[] = [];
+  for (let i = 0; i < 12; i += 1) {
+    pressure.push(mk(`[约束] 助手约束${i}：必须遵守第 ${i} 条规范`, 'preference', ['constraint'], 'assistant'));
+  }
+  pressure.push(mk('[约束] 不是告诉你音频在的位置了吗；你一点击下载，就会调取IDM', 'preference', ['constraint'], 'user'));
+  pressure.push(mk('[事实] D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', 'fact', ['resource', 'user'], 'user'));
+
+  const snapPressure = buildSnapshot(pressure, 3);
+  console.log(`    压力场景 → ${snapPressure}`);
+  check('压力下资源位置仍出现', snapPressure.includes('score-Dtle1HAU'), snapPressure);
+  check('压力下用户纠正仍出现（不回退）', snapPressure.includes('IDM'), snapPressure);
 }
 
 // ── 7f-2) 池淘汰必须与取词同源（资源位置要钉住） ──
@@ -606,6 +622,12 @@ console.log('=== 7f-3) flush 路径带来源 ===');
   check('用户消息标 origin=user', lines.some((l) => l.origin === 'user' && l.text.includes('score-Dtle1HAU')), lines);
   check('助手消息标 origin=assistant', lines.some((l) => l.origin === 'assistant'), lines);
 
+  // ★第十轮 P1-3：短口语资源位置不得被 `hardFilter` 的 20 字门槛吞掉
+  check('「音频在桌面」能过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));
+  check('「文件放在下载目录了」能过', hardFilter('文件放在下载目录了').length > 0, hardFilter('文件放在下载目录了'));
+  // 但纯指针行仍须拦掉（不能因为放宽短行而放进一堆路径）
+  check('纯路径行仍被拦', hardFilter('materials/架构图.png') === '', hardFilter('materials/架构图.png'));
+
   // 池满 19/20 时，用户资源位置仍必须能注入
   const off = new Offloader(null, new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-flush.json`)), {
     snapshotItems: 3,
@@ -625,6 +647,58 @@ console.log('=== 7f-3) flush 路径带来源 ===');
   const snapFlush = pool.buildPooledSnapshot(batch);
   console.log(`    池=${pool.snapshotPool.length} 注入=${snapFlush}`);
   check('池满后资源位置仍能注入', snapFlush.includes('score-Dtle1HAU'), snapFlush);
+}
+
+// ── 7f-4) 混合批来源：助手不得被标成 user ──
+//
+// ★第十轮 P0-1：上一版 `batchOrigin` 是**批级并集** ——「只要批内有 user 块就整批标 user」。
+// 实测混合批 `user「帮我配一段音乐」+ assistant「音频已放到 assets/bgm.mp3 了」`
+// 蒸馏出的条目拿到 `origin=user` ⇒ `isKey=true` ⇒ 抢 rank0。
+// 与前三轮修掉的假货是同一机制，入口从「文本形态」换成了「来源误标」。
+//
+// 修法：**取交集**，全部块都是 user 才标 user（保守处理最多漏提权，误标会让助手长期占槽）。
+console.log('=== 7f-4) 混合批来源 ===');
+{
+  let captured: DistilledItem[] = [];
+  const makeClient = (itemContent: string): unknown =>
+    ({
+      baseUrl: 'http://127.0.0.1:0',
+      distill: async () => ({
+        items: [{ content: itemContent, memory_type: 'fact', tags: ['conclusion'], importance: 6, source_turns: [0, 0] }],
+        count: 1,
+        indexLine: '',
+      }),
+      migrate: async (items: DistilledItem[]) => {
+        captured = items;
+        return { written: items.length, merged: 0 };
+      },
+    }) as unknown as Parameters<typeof Offloader.prototype.bind>[0];
+
+  // 混合批（用户任务 + 助手陈述）
+  const mixedOff = new Offloader(
+    makeClient('[结论] 音频已放到 assets/bgm.mp3 了'),
+    new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-mixed.json`)),
+    { snapshotItems: 3 },
+  );
+  await mixedOff.offload('s-mixed', [
+    { text: '帮我给这个视频配一段音乐，文件我稍后给你', origin: 'user' as const },
+    { text: '音频已放到 assets/bgm.mp3 了，接下来渲染', origin: 'assistant' as const },
+  ]);
+  console.log(`    混合批 origin=${JSON.stringify(captured.map((i) => i.origin))}`);
+  check('混合批不把条目标成 user', captured.every((i) => i.origin !== 'user'), captured.map((i) => i.origin));
+
+  // 纯用户批仍须标 user（不能因为收紧而漏提权）
+  captured = [];
+  const userOff = new Offloader(
+    makeClient('[结论] 音频在桌面'),
+    new CursorStore(join(tmpdir(), `lrc-test-${Date.now()}-pureuser.json`)),
+    { snapshotItems: 3 },
+  );
+  await userOff.offload('s-user', [
+    { text: '音频就在桌面上放着，你直接用那个文件就行，不要再下载了', origin: 'user' as const },
+  ]);
+  console.log(`    纯用户批 origin=${JSON.stringify(captured.map((i) => i.origin))}`);
+  check('纯用户批标为 user', captured.length > 0 && captured.every((i) => i.origin === 'user'), captured.map((i) => i.origin));
 }
 
 // ── 7g) 表格行 / 计数句不得冒充决策 ──

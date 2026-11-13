@@ -1139,8 +1139,9 @@ function hardFilter(text) {
     if (looksLikeNormalLog(line)) continue;
     const masked = maskPaths(line);
     const hasKeyword = hitsKeyword(masked);
-    if (line.length < MIN_CHARS && !hasKeyword) continue;
-    if (!hasKeyword && masked.replace(/\s+/g, "").length < MIN_BODY_CHARS) continue;
+    const isResourceLine = isKeyResourceLocation(line, true);
+    if (line.length < MIN_CHARS && !hasKeyword && !isResourceLine) continue;
+    if (!hasKeyword && !isResourceLine && masked.replace(/\s+/g, "").length < MIN_BODY_CHARS) continue;
     kept.push(line);
   }
   return kept.join("\n");
@@ -1210,8 +1211,13 @@ function isKeyResourceLocation(text, fromUser) {
   if (!fromUser) return false;
   const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
   if (ENGLISH_PROCESS.test(body)) return false;
-  if (MEDIA_FILE.test(body)) return true;
-  if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
+  const isBarePath = /^\s*[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]*[\\/][^\s]*$/.test(body);
+  if (!isBarePath) {
+    if (MEDIA_FILE.test(body)) return true;
+    if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
+  } else if (LEADING_PATH.test(body) && MEDIA_FILE.test(body) && /[，,。\s]/.test(body)) {
+    return true;
+  }
   const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
   const LOC = "(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)";
   const adjacent = new RegExp(`(?:${RES}.{0,2}${LOC})|(?:${LOC}.{0,2}${RES})`);
@@ -1428,16 +1434,22 @@ function pickDiverseSnapshot(items, maxItems) {
     cursor.set(r, i);
     return false;
   };
+  const takeMatching = (r, pred) => {
+    const list = groups.get(r) ?? [];
+    const idx = list.findIndex(pred);
+    if (idx < 0) return false;
+    const item = list[idx];
+    list.splice(idx, 1);
+    const body = bodyOf(item);
+    picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+    pickedKeys.push(keyOf(body));
+    return true;
+  };
   if (maxItems >= 2) {
-    const rank0 = groups.get(0) ?? [];
-    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content, i.origin === "user"));
-    if (idx >= 0) {
-      const resItem = rank0[idx];
-      rank0.splice(idx, 1);
-      const body = bodyOf(resItem);
-      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-      pickedKeys.push(keyOf(body));
-    }
+    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === "user"));
+  }
+  if (maxItems >= 3) {
+    takeMatching(0, (i) => i.origin === "user" && !isKeyResourceLocation(i.content, true));
   }
   const order = [...groups.keys()].sort((a, b) => a - b);
   const HIGH = order.filter((r) => r <= 1);
@@ -1798,7 +1810,8 @@ var Offloader = class {
         this.config.project,
         this.config.maxItems
       );
-      const batchOrigin = freshBlockOrigin.includes("user") ? "user" : freshBlockOrigin.includes("assistant") ? "assistant" : void 0;
+      const allUser = freshBlockOrigin.every((o) => o === "user");
+      const batchOrigin = allUser ? "user" : freshBlockOrigin.every((o) => o === "assistant") ? "assistant" : void 0;
       items = [
         ...items,
         ...distilled.items.map((item) => batchOrigin === void 0 ? item : { ...item, origin: batchOrigin })

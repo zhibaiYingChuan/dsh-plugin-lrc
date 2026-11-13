@@ -383,9 +383,21 @@ export function hardFilter(text: string): string {
     // 路径先挖掉：`见 docs/规范.md` 不该因为路径里的「规范」被留下。
     const masked = maskPaths(line);
     const hasKeyword = hitsKeyword(masked);
-    if (line.length < MIN_CHARS && !hasKeyword) continue;
+    // **短行豁免要包含「资源位置」形态**。
+    //
+    // 用户交代文件位置时往往极短：「音频在桌面」（5 字）、
+    // 「文件放在下载目录了」（9 字）。它们既没有命令式关键词，
+    // 也过不了 20 字门槛，于是被整条吞掉 —— 事故里模型缺的正是这条信息。
+    //
+    // 判据必须用**收窄**的 `isKeyResourceLocation(…, true)`（只认媒体文件 +
+    // 紧邻位置词），不能用宽松的 `carriesResourceLocation`：
+    // 后者会把 `materials/架构图.png`、`打开 G:\proj\端口.md` 这类纯指针行
+    // 当资源位置放行（实测 3/3 误收）。
+    const isResourceLine = isKeyResourceLocation(line, true);
+    if (line.length < MIN_CHARS && !hasKeyword && !isResourceLine) continue;
     // 路径/URL 之外几乎没剩正文 —— 纯指针行，不是结论。
-    if (!hasKeyword && masked.replace(/\s+/g, '').length < MIN_BODY_CHARS) continue;
+    // 但资源位置行本身就以路径为主，不能按「剩余正文长度」判死。
+    if (!hasKeyword && !isResourceLine && masked.replace(/\s+/g, '').length < MIN_BODY_CHARS) continue;
     kept.push(line);
   }
   return kept.join('\n');
@@ -752,8 +764,16 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   // ── 强判据：媒体文件扩展名 / 行首盘符路径 ──
   //
   // 这两个形态几乎不会误判，直接认。
-  if (MEDIA_FILE.test(body)) return true;
-  if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
+  // 但要先排除「整行就是一个裸路径」的指针行：
+  // `materials/架构图.png` 是「见这个文件」，不是「资源在哪」。
+  const isBarePath = /^\s*[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]*[\\/][^\s]*$/.test(body);
+  if (!isBarePath) {
+    if (MEDIA_FILE.test(body)) return true;
+    if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
+  } else if (LEADING_PATH.test(body) && MEDIA_FILE.test(body) && /[，,。\s]/.test(body)) {
+    // 行首盘符 + 媒体文件 + 还有别的说明（`D:\Desktop，score.wav，这是你要打音频`）
+    return true;
+  }
 
   // ── 弱判据：口语形态「音频在桌面」──
   //

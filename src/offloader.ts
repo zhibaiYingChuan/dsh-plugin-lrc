@@ -250,29 +250,44 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
     return false;
   };
 
-  // ── 第一步：给「资源位置」预留一个槽位 ──
+  /**
+   * 从指定类别里取一条**满足谓词**的候选并摘掉它。
+   *
+   * @returns 是否取到
+   */
+  const takeMatching = (r: number, pred: (i: DistilledItem) => boolean): boolean => {
+    const list = groups.get(r) ?? [];
+    const idx = list.findIndex(pred);
+    if (idx < 0) return false;
+    const item = list[idx] as DistilledItem;
+    // **必须从组里摘掉，不能只挪游标**：目标常常排在若干条目之后，
+    // 把游标设到 `idx + 1` 会把它前面那些条目一起跳过。
+    // 实测这样写导致「不要用 IDM 下载」被跳掉、反而注入了 rank2 的过程结论。
+    list.splice(idx, 1);
+    const body = bodyOf(item);
+    picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+    pickedKeys.push(keyOf(body));
+    return true;
+  };
+
+  // ── 第一步：给两类「用户亲口说的事实」各预留一个槽位 ──
   //
-  // 它和约束同为 rank 0，但触发的判据完全不同（结构特征 vs 情态词）。
-  // 若只靠轮转，池里一旦有多条同义约束排在前面，资源位置仍可能被挤掉。
-  // 所以先单独取一条，保证它一定露脸。
+  // 1. **资源位置**（`D:\Desktop，score.wav，这是你要打音频`）：
+  //    事故里模型缺的就是「源文件在哪」。LRC 把它归成 `code_context`，
+  //    不提权则永无机会。实测提权后从 1/16 升到 3/15。
   //
-  // **必须用 `isKeyResourceLocation`（收窄判据）**：用宽松的
-  // `carriesResourceLocation` 会把 `assets/score.wav 的 MD5 一致`
-  // 这类过程结论选中，反而不是用户交代的音频位置。
+  // 2. **用户纠正**（`不是告诉你音频在的位置了吗…`）：
+  //    只提权资源位置时，它被降为普通约束，只能轮转争第二槽位，
+  //    实测注入次数从 3/16 **回退到 1/15**（被大量助手约束挤掉）。
+  //    而「用户明确纠正过」恰恰是跨轮最该被记住的一类。
+  //
+  // 两个槽位都只在 `maxItems >= 3` 时预留，避免 `maxItems=2` 时
+  // 把约束全部挤光。默认 `snapshotItems=3`，正好各占一个。
   if (maxItems >= 2) {
-    const rank0 = groups.get(0) ?? [];
-    const idx = rank0.findIndex((i) => isKeyResourceLocation(i.content, i.origin === 'user'));
-    if (idx >= 0) {
-      const resItem = rank0[idx] as DistilledItem;
-      // **必须从组里摘掉，不能只挪游标**：资源位置常常排在约束**之后**，
-      // 把游标设到 `idx + 1` 会把它前面那几条真约束一起跳过。
-      // 实测这样写导致「不要用 IDM 下载」被跳掉、反而注入了 rank2 的
-      // `G:\loong 是仓库` —— 正是要避免的那种污染。
-      rank0.splice(idx, 1);
-      const body = bodyOf(resItem);
-      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-      pickedKeys.push(keyOf(body));
-    }
+    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === 'user'));
+  }
+  if (maxItems >= 3) {
+    takeMatching(0, (i) => i.origin === 'user' && !isKeyResourceLocation(i.content, true));
   }
 
   // 轮转取词：**只在前两类（约束、决策）之间轮转**，结论/事实仅用于填空位。
@@ -779,12 +794,27 @@ export class Offloader {
         this.config.project,
         this.config.maxItems,
       );
-      // **`distill` 返回的条目没有来源**（那是 LRC 侧的规则式提炼）。
-      // 按块级来源回填：只要这一批里有用户块，就按 `user` 算 ——
-      // 用户消息本来极少，误判代价远低于把用户的资源位置降级。
-      const batchOrigin: 'user' | 'assistant' | undefined = freshBlockOrigin.includes('user')
+      // **`distill` 返回的条目没有来源**（那是 LRC 侧的规则式提炼），
+      // 只能按块级来源回填。
+      //
+      // ## 必须取交集，不能取并集
+      //
+      // 上一版写「只要批内有 user 块就整批标 user」。这给助手开了一条
+      // 新的提权通道：
+      // ```
+      // 混合批：user「帮我给这个视频配一段音乐」
+      //       + assistant「音频已放到 assets/bgm.mp3 了」
+      //   ⇒ 蒸馏出的条目 origin=user ⇒ isKey=true ⇒ 抢 rank0
+      // ```
+      // 与前三轮修掉的假货是同一机制，只是入口从「文本形态」换成「来源误标」。
+      // 实测真实回放里已有一条助手正文被标成 user。
+      //
+      // 安全侧是**全部块都是 user 才标 user**：块级来源无法按条目切分，
+      // 保守处理最多是漏提权（少一次注入），而误标会让助手长期占槽。
+      const allUser = freshBlockOrigin.every((o) => o === 'user');
+      const batchOrigin: 'user' | 'assistant' | undefined = allUser
         ? 'user'
-        : freshBlockOrigin.includes('assistant')
+        : freshBlockOrigin.every((o) => o === 'assistant')
           ? 'assistant'
           : undefined;
       items = [
