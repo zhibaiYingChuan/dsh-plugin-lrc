@@ -718,6 +718,41 @@ console.log('=== 7f-1) 提权判据看来源 ===');
     check(`位置提问不误报「${s.slice(0, 24)}」`, !isKeyResourceLocation(s, true), s);
   }
 
+  // ★第十九轮 P1：**真位置 + 顺带被动/疑问**必须仍提权。
+  //
+  // 上一版把 `QUESTION_WORD` / `PASSIVE_VOICE` 作用在**整句**上，
+  // 于是同一句里的真位置被连带清掉（实测 8 条误杀，5 条两条路都死）。
+  // 这是六轮反复出现的同一失败形态 —— 每次都用「整句否否」修误报。
+  //
+  // 修法：判定范围降到「含位置短语的那一小句」。
+  const locWithClauseTail = [
+    '音频在桌面，被覆盖了',
+    '文件放在下载目录了，被清空了',
+    '音频在网盘里，被压缩过',
+    '素材位于 assets/score.wav，被删除了',
+    '音频在桌面，被我不小心删了',
+    '音频在桌面，你看下多少个文件',
+    '音频在 C 盘，有多少个版本你数一下',
+    '音频在桌面，什么格式都行',
+    '音频在桌面，检查一下有没有杂音',
+    '音频在桌面，是否有备份',
+  ];
+  for (const s of locWithClauseTail) {
+    check(`真位置+小句尾仍提权「${s.slice(0, 24)}」`, isKeyResourceLocation(s, true), s);
+  }
+
+  // 但「位置小句本身」含疑问/被动时仍须 false（不能因为降范围而全放过）
+  const questionInClause = [
+    '音频在网盘里的分享链接是什么',
+    '音频在本机占多少内存',
+    '音频在 build 产物里被压缩了',
+    '文件在 tmp 里被清掉了',
+    '音频在桌面上显示的是什么',
+  ];
+  for (const s of questionInClause) {
+    check(`位置小句内提问仍 false「${s.slice(0, 22)}」`, !isKeyResourceLocation(s, true), s);
+  }
+
   // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
   check('「音频在桌面」过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));
   check('「文件放在下载目录了」过 hardFilter', hardFilter('文件放在下载目录了').length > 0);

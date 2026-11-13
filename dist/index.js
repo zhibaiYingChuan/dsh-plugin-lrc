@@ -1263,9 +1263,17 @@ function isKeyResourceLocation(text, fromUser) {
   const REVERSE = new RegExp(
     `(?:位于|放在|放到|存在|来自|存到|拷到|复制到).{0,2}${RES}`
   );
-  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次)/;
-  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|打包|覆盖|处理|替换)/;
-  const strongLocation = (FORWARD.test(body) || REVERSE.test(body)) && !/(?:在|位于|放在|放到|存在|来自)的/.test(body) && !QUESTION_WORD.test(body) && !PASSIVE_VOICE.test(body);
+  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次|哪一个|有没有|是否|吗)/;
+  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|打包|覆盖|处理|替换|修改|重写|移除)/;
+  const clauseWithLocation = () => {
+    const clauses = body.split(/[，。；、！？,;!?]+/);
+    for (const c of clauses) {
+      if (FORWARD.test(c) || REVERSE.test(c)) return c;
+    }
+    return body;
+  };
+  const target = clauseWithLocation();
+  const strongLocation = (FORWARD.test(target) || REVERSE.test(target)) && !/(?:在|位于|放在|放到|存在|来自)的/.test(target) && !QUESTION_WORD.test(target) && !PASSIVE_VOICE.test(target);
   const hasLocationSignal = LEADING_PATH.test(body) || strongLocation;
   if (!hasLocationSignal && PROCESS_CONCLUSION_CN.test(body)) return false;
   const withoutFileToken = body.replace(

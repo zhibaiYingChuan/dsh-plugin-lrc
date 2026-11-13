@@ -851,31 +851,40 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   const REVERSE = new RegExp(
     `(?:位于|放在|放到|存在|来自|存到|拷到|复制到).{0,2}${RES}`,
   );
-  // 强信号：正向（`音频在`）或反向（`位于 assets/…`），且不是「…的位置」指代
+  // ## 判定范围：**位置短语所在的那一小句**，不是整句
   //
-  // ## 还要排除「关于该位置的提问/评价」
-  //
-  // 白名单只管「在 + 位置词」的形状，不管该短语是**状语**（在哪）还是
-  // **定语**（关于这个位置）。实测误报：
+  // 这是六轮反复踩坑的同一个错误：每次都用「整句 return false」修误报，
+  // 每次都会连带清掉同一句里的真位置。失败记录：
   // ```
-  // 文件在服务器上怎么部署            ← 问怎么部署，不是交代文件在哪
-  // 音频在项目里起什么作用            ← 问作用
-  // 音频在本机占多少内存              ← 问占用
-  // 音频在 build 产物里被压缩了        ← 说被处理，不是位置
+  // 音频在桌面，被覆盖了              ← 位置有效，被 PASSIVE_VOICE 整句否掉
+  // 音频在桌面，你看下多少个文件        ← 位置有效，被 QUESTION_WORD 整句否掉
+  // 音频在 C 盘，有多少个版本你数一下    ← 同上
+  // 音频在桌面，什么格式都行            ← 同上
   // ```
-  // 12 条误报里 9 条含疑问/评价词，加这一道闸门可拦 9/12 且 0 误伤真位置。
-  // 疑问/评价词：句中含「什么/多少/怎么/哪些/几个」⇒ 是在追问或评价该位置。
-  //
-  // **刻意不含「有没有 / 是否」**：它们常出现在派活句里
-  // （`音频在桌面，检查一下有没有杂音`），整句匹配会误杀真位置。
-  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次)/;
-  // 被动/受事形态：`…里被压缩了`、`…被清掉了` —— 说文件被处理，不是交代位置
-  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|打包|覆盖|处理|替换)/;
+  // 正确做法：先把句子按逗号/句读切成小句，只在**含位置短语的那一小句**里
+  // 检查疑问/被动。`音频在桌面 | 被覆盖了` 第二句不含位置，不影响判定。
+  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次|哪一个|有没有|是否|吗)/;
+  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|打包|覆盖|处理|替换|修改|重写|移除)/;
+
+  /**
+   * 取「位置短语所在的小句」：按逗号/句读切，返回第一个含位置词的小句。
+   *
+   * 若切不出（整句没有标点），退回整句。
+   */
+  const clauseWithLocation = (): string => {
+    const clauses = body.split(/[，。；、！？,;!?]+/);
+    for (const c of clauses) {
+      if (FORWARD.test(c) || REVERSE.test(c)) return c;
+    }
+    return body;
+  };
+
+  const target = clauseWithLocation();
   const strongLocation =
-    (FORWARD.test(body) || REVERSE.test(body)) &&
-    !/(?:在|位于|放在|放到|存在|来自)的/.test(body) &&
-    !QUESTION_WORD.test(body) &&
-    !PASSIVE_VOICE.test(body);
+    (FORWARD.test(target) || REVERSE.test(target)) &&
+    !/(?:在|位于|放在|放到|存在|来自)的/.test(target) &&
+    !QUESTION_WORD.test(target) &&
+    !PASSIVE_VOICE.test(target);
   const hasLocationSignal = LEADING_PATH.test(body) || strongLocation;
 
   // ## 过程词只在**没有位置信号**时否决
