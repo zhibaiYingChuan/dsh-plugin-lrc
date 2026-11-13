@@ -625,6 +625,25 @@ console.log('=== 7f-1) 提权判据看来源 ===');
     check(`真位置+派活仍提权「${s.slice(0, 22)}」`, isKeyResourceLocation(s, true), s);
   }
 
+  // ★第十五轮 P1：**真位置 + 时间副词**必须仍提权。
+  //
+  // 上一版加了 `正在|现在|别再|还在` 的整句否决，把「音频**现在在**桌面」
+  // 这类最高频的口语位置交代判死（实测 11/11 误杀），且 `hardFilter`
+  // 因字数门槛同时丢弃 ⇒ 两条路全死。
+  // 这是第二次犯「整句否决」的错（第一次是 ACTION_VERB），
+  // 正确做法是在**形态层**收窄：反向形态去掉裸「在」。
+  const locWithAdverb = [
+    '音频现在在桌面',
+    '音频还在桌面',
+    '现在音频在桌面',
+    '音频目前还在桌面',
+    '我现在告诉你，音频在桌面',
+    '我正在家，音频在桌面',
+  ];
+  for (const s of locWithAdverb) {
+    check(`真位置+时间副词仍提权「${s.slice(0, 22)}」`, isKeyResourceLocation(s, true), s);
+  }
+
   // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
   check('「音频在桌面」过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));
   check('「文件放在下载目录了」过 hardFilter', hardFilter('文件放在下载目录了').length > 0);
