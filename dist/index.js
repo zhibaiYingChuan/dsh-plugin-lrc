@@ -1204,13 +1204,16 @@ function carriesResourceLocation(text) {
   }
   return false;
 }
+var LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
 var ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
+var PROCESS_CONCLUSION_CN = /(?:MD5|哈希|一致|已确认|已验证|验证通过|已生成|已删除|已复制|已上传|已导入|处理完毕|测试通过|校验)/;
 var MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
 var LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
 function isKeyResourceLocation(text, fromUser) {
   if (!fromUser) return false;
   const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
   if (ENGLISH_PROCESS.test(body)) return false;
+  if (PROCESS_CONCLUSION_CN.test(body)) return false;
   const withoutFileToken = body.replace(
     /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)/gi,
     ""
@@ -1219,7 +1222,7 @@ function isKeyResourceLocation(text, fromUser) {
   const hasMediaFile = MEDIA_FILE.test(body);
   const isPointerOnly = hasMediaFile && residue.length <= 2;
   if (!isPointerOnly) {
-    if (hasMediaFile) return true;
+    if (hasMediaFile && (LOCATION_HINT.test(body) || LEADING_PATH.test(body))) return true;
     if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
   }
   const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
@@ -2075,6 +2078,8 @@ function normalizeMaxNodes(value) {
   if (value === void 0) return void 0;
   const asNumber = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   if (!Number.isFinite(asNumber) || asNumber <= 0) return DEFAULT_MAX_NODES_PER_RUN;
+  if (asNumber < 1) return DEFAULT_MAX_NODES_PER_RUN;
+  if (asNumber > 1e3) return DEFAULT_MAX_NODES_PER_RUN;
   return Math.max(1, Math.floor(asNumber));
 }
 function selectTrimRange(nodes, events, keepRecentNodes, maxNodes) {

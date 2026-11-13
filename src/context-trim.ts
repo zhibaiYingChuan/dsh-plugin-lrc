@@ -318,6 +318,17 @@ export function normalizeMaxNodes(value: unknown): number | undefined {
   const asNumber =
     typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
   if (!Number.isFinite(asNumber) || asNumber <= 0) return DEFAULT_MAX_NODES_PER_RUN;
+  // **(0,1) 退化为默认上限，不能退化为 1**。
+  //
+  // 上一版写 `Math.max(1, Math.floor(v))`，于是 `0.3 → 1`。
+  // 而真实增长节奏是「每步 append 均值 2.25 个节点、每 10 步裁一次」：
+  //   limit=40：141 → 122 → … → 11（收敛）
+  //   limit=1 ：141 → 161 → 181 → … → 341（**单调膨胀**）
+  // 即「配置误写」会被放大成事故 A 的观感（上下文一路涨）。
+  // 小数几乎只可能来自「单位写错」，正确处置是当作没配、用默认上限。
+  if (asNumber < 1) return DEFAULT_MAX_NODES_PER_RUN;
+  // 上界：超过 1000 等价于「不限制」，同样按非法值处理
+  if (asNumber > 1000) return DEFAULT_MAX_NODES_PER_RUN;
   return Math.max(1, Math.floor(asNumber));
 }
 

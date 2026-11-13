@@ -564,15 +564,30 @@ console.log('=== 7f-1) 提权判据看来源 ===');
   check('压力下用户纠正仍出现（不回退）', snapPressure.includes('IDM'), snapPressure);
 
   // ★第十一轮 P1：`maxItems=2` 不得被两个预留槽位吃光（必须留一条约束）
+  // 注意：不能用 `s2.includes('约束')` —— 条目正文含「约束」二字，
+  // 该断言恒真，会把「资源位置与纠正全被挤掉」这种错误结果掩盖掉。
+  // 必须断言**实际注入的是约束条目**（含「必须遵守规范」这类特有时段）。
   const s2 = buildSnapshot(pressure, 2);
   console.log(`    maxItems=2 → ${s2}`);
-  check('maxItems=2 时仍有一条约束', s2.includes('约束'), s2);
+  check('maxItems=2 时注入的是真约束', s2.includes('必须遵守'), s2);
 
   // ★第十一轮 P1：裸文件名/裸路径不得提权（否则独占槽位）
   check('裸文件名不提权', !isKeyResourceLocation('score-Dtle1HAU.wav', true));
   check('裸路径不提权', !isKeyResourceLocation('materials/架构图.png', true));
   check('裸盘符路径不提权', !isKeyResourceLocation('G:\\proj\\端口.md', true));
   check('带说明的真实交代仍提权', isKeyResourceLocation('D:\\Desktop，score-Dtle1HAU.wav，这是你要打音频', true));
+
+  // ★第十二轮 P1-1：**随口提到媒体文件**不得提权（缺位置词闸门时的误报）
+  const casualMentions = [
+    '帮我检查一下 assets/bgm.mp3 的音质',
+    'assets/bgm.mp3 的时长是 55 秒吗',
+    '我把 score.wav 换成了新的版本',
+    '封面.png 换成暗金色试试',
+    '桌面上的文件与 assets/score.wav 的 MD5 一致',
+  ];
+  for (const s of casualMentions) {
+    check(`随口提文件不提权「${s.slice(0, 22)}」`, !isKeyResourceLocation(s, true), s);
+  }
 
   // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
   check('「音频在桌面」过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));

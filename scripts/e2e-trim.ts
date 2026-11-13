@@ -730,13 +730,13 @@ console.log('=== 1b) 真实 surface 回归锁（141 节点，仅 surface 真实�
   check('limit=40 端点切点平衡', balancedAt(capped), capped);
   check('不限制端点切点平衡', balancedAt(unlimited), unlimited);
 
-  // ★第二次独立审查 P1-3：`positiveInt` 对 (0,1) 返回 0，被下游重新解释为
-  // 「不限制」⇒ 一次裁光。在真实 145 节点 surface 上验证才能区分「归一为 1」
-  // 与「退化成不限制」（后者会裁 130+）。
+  // ★第二次独立审查 P1-3：`positiveInt` 对 (0,1) 曾返回 0 被当成「不限制」；
+  // 第十一轮又发现 `0.3 → 1` 更糟：真实增长节奏是「每步 +2.25、每 10 步裁一次」，
+  // limit=1 ⇒ 141 → 161 → 181 → … → 341 **单调膨胀**（事故 A 的观感）。
+  // 所以 (0,1) 必须退化为默认上限 40。
   for (const v of [0.3, 0.5, 0.9]) {
     const r = selectTrimRange(realNodes, realEvents, 8, v);
-    const c = cntOf(r);
-    check(`小数 ${v} 归一为 1，不得退化成不限制`, r !== null && c <= 1, { v, c });
+    check(`小数 ${v} 退化为默认 40（不是 1）`, r !== null && cntOf(r) <= 40, { v, count: cntOf(r) });
   }
 
   // ★第三次独立审查 P1-1：上一版把 `'40'` 断言成「视为不限制」，

@@ -728,6 +728,17 @@ export function carriesResourceLocation(text: string): boolean {
  */
 const LOCATION_HINT = /(?:在|位于|放在|放到|存在|路径|目录|桌面|来自|下载目录|素材库)/;
 const ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
+/**
+ * 中文**过程结论**词：说明「对文件做了什么/校验结果」，不是「文件在哪」。
+ *
+ * 实测误报（第十二轮）：
+ * ```
+ * 桌面上的文件与 assets/score.wav 的 MD5 一致   ← 有「桌面」也命中 LOCATION_HINT
+ * 音频已经验证通过，位于 assets/bgm.mp3         ← 有「位于」
+ * ```
+ * 它们讲的是校验结果/状态，模型拿到它对「源文件在哪」毫无帮助。
+ */
+const PROCESS_CONCLUSION_CN = /(?:MD5|哈希|一致|已确认|已验证|验证通过|已生成|已删除|已复制|已上传|已导入|处理完毕|测试通过|校验)/;
 const MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
 /** 行首就是盘符路径（`D:\Desktop，score.wav`）—— 用户直接贴位置的最常见形态。 */
 const LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
@@ -760,6 +771,8 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   const body = text.replace(/\bhttps?:\/\/\S+/gi, ' ');
   // 英文推理过程句排除
   if (ENGLISH_PROCESS.test(body)) return false;
+  // 中文过程结论句排除（`MD5 一致`、`验证通过`、`已导入`…）
+  if (PROCESS_CONCLUSION_CN.test(body)) return false;
 
   // ── 强判据：媒体文件扩展名 / 行首盘符路径 ──
   //
@@ -784,7 +797,19 @@ export function isKeyResourceLocation(text: string, fromUser: boolean): boolean 
   const hasMediaFile = MEDIA_FILE.test(body);
   const isPointerOnly = hasMediaFile && residue.length <= 2;
   if (!isPointerOnly) {
-    if (hasMediaFile) return true;
+    // ## 有媒体文件还不够，必须**同时**有「交代位置」的信号
+    //
+    // 上一版这里只判 `hasMediaFile` ⇒ 任何「随口提到媒体文件」的句子都被
+    // 提升为资源位置并 pin 进池（最多 2 条），挤掉真正的约束。实测误报：
+    // ```
+    // 帮我检查一下 assets/bgm.mp3 的音质        ← 让我做事，不是交代位置
+    // assets/bgm.mp3 的时长是 55 秒吗           ← 在问问题
+    // 我把 score.wav 换成了新的版本             ← 说动作
+    // 封面.png 换成暗金色试试                   ← 说改动
+    // ```
+    // 真正的交代一定有位置指示：`D:\Desktop，score.wav，这是你要打音频`、
+    // `音频文件在 assets/bgm.mp3` —— 含盘符路径或 `在/位于/放到…`。
+    if (hasMediaFile && (LOCATION_HINT.test(body) || LEADING_PATH.test(body))) return true;
     if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
   }
 
