@@ -1254,7 +1254,6 @@ function isKeyResourceLocation(text, fromUser) {
     "子目录",
     "同目录",
     "子文件夹",
-    "子目录下",
     // 盘符（C 盘 / D盘 / D:\\ / C:/）
     "[A-Za-z]\\s*盘",
     "[A-Za-z]:[\\\\/]"
@@ -1264,7 +1263,9 @@ function isKeyResourceLocation(text, fromUser) {
   const REVERSE = new RegExp(
     `(?:位于|放在|放到|存在|来自|存到|拷到|复制到).{0,2}${RES}`
   );
-  const strongLocation = (FORWARD.test(body) || REVERSE.test(body)) && !/(?:在|位于|放在|放到|存在|来自)的/.test(body);
+  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次)/;
+  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|打包|覆盖|处理|替换)/;
+  const strongLocation = (FORWARD.test(body) || REVERSE.test(body)) && !/(?:在|位于|放在|放到|存在|来自)的/.test(body) && !QUESTION_WORD.test(body) && !PASSIVE_VOICE.test(body);
   const hasLocationSignal = LEADING_PATH.test(body) || strongLocation;
   if (!hasLocationSignal && PROCESS_CONCLUSION_CN.test(body)) return false;
   const withoutFileToken = body.replace(

@@ -696,6 +696,28 @@ console.log('=== 7f-1) 提权判据看来源 ===');
     check(`真实口语位置提权「${s}」`, isKeyResourceLocation(s, true), s);
   }
 
+  // ★第十八轮 P1：「关于该位置的提问/评价」不得当成交代位置。
+  //
+  // 白名单只管「在 + 位置词」的形状，不管该短语是**状语**（在哪）还是
+  // **定语**（关于这个位置）。端到端实测：这类条目会被 pin 进池并挤掉
+  // 真资源位置（与「随口提文件抢槽」同构）。
+  const locationQuestion = [
+    '文件在服务器上怎么部署',
+    '音频在项目里起什么作用',
+    '音频在网盘里的分享链接是什么',
+    '音频在电脑上的播放器是什么',
+    '音频在本机占多少内存',
+    '音频在桌面上显示的是什么',
+    '音频在目录结构里怎么组织',
+    '封面在工作区占多少空间',
+    '音频在 build 产物里被压缩了',
+    '文件在 tmp 里被清掉了',
+    '素材在 assets 目录里有多少个',
+  ];
+  for (const s of locationQuestion) {
+    check(`位置提问不误报「${s.slice(0, 24)}」`, !isKeyResourceLocation(s, true), s);
+  }
+
   // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
   check('「音频在桌面」过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));
   check('「文件放在下载目录了」过 hardFilter', hardFilter('文件放在下载目录了').length > 0);
