@@ -644,6 +644,26 @@ console.log('=== 7f-1) 提权判据看来源 ===');
     check(`真位置+时间副词仍提权「${s.slice(0, 22)}」`, isKeyResourceLocation(s, true), s);
   }
 
+  // ★第十六轮 P1：「资源名词 + 在 + **处所/时间副词**」必须 false。
+  //
+  // 这是四轮反复踩坑的同一根因：「在」是中文最高频虚词，
+  // 基于「在」的形状匹配必然漂移。修法是要求「在」后接**位置白名单**
+  // （桌面/目录/assets/盘符…），而不是用黑名单排除副词（补不完）。
+  const placeAdverb = [
+    '音频处理在后台排队',
+    '文件读取在队列里',
+    '封面生成在 3 秒后',
+    '音频处理好了在后台排队',
+    '文件读取完毕在队列里',
+    '视频渲染结束在明天',
+    '图片加载失败在第二步',
+    '脚本执行成功在子进程',
+    '素材下载完了在临时目录',
+  ];
+  for (const s of placeAdverb) {
+    check(`处所/时间副词不误报「${s.slice(0, 24)}」`, !isKeyResourceLocation(s, true), s);
+  }
+
   // 短口语必须能过 hardFilter（否则 flush 路径静默丢弃）
   check('「音频在桌面」过 hardFilter', hardFilter('音频在桌面').length > 0, hardFilter('音频在桌面'));
   check('「文件放在下载目录了」过 hardFilter', hardFilter('文件放在下载目录了').length > 0);

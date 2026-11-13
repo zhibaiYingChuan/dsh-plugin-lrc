@@ -1214,7 +1214,8 @@ function isKeyResourceLocation(text, fromUser) {
   if (ENGLISH_PROCESS.test(body)) return false;
   const hasMediaFile = MEDIA_FILE.test(body);
   const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
-  const LOC = "(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)";
+  const PLACE = "(?:桌面|下载目录|目录|文件夹|盘|assets|build|dist|public|tmp|temp|本地|工作区|[A-Za-z]:[\\\\/])";
+  const LOC = `(?:(?:位于|放在|放到|存在|来自|存到|拷到|复制到)|在[\\s]*(?=${PLACE})|在[\\s]*[^\\s，。；：]{0,40}\\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp))`;
   const FORWARD = new RegExp(`${RES}.{0,4}${LOC}`);
   const REVERSE = new RegExp(
     `(?:位于|放在|放到|存在|来自|存到|拷到|复制到).{0,2}${RES}`
