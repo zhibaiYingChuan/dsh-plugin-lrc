@@ -23,3 +23,7 @@ tmp-host/
 
 # 注意：dist/ 不忽略 —— 插件从 GitHub 直接安装（dsh plugin add github:...），
 # 宿主不会在安装时构建，因此必须提交构建产物。
+
+# 本地排查脚本（依赖 session-file.ts，后者属于本地勘查工具，不提交）
+scripts/audit-live.ts
+scripts/replay-session.ts
