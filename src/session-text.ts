@@ -16,7 +16,6 @@
  * 注意 `Session` **没有 `lines` 字段** —— 早期实现读 `agent.session.lines`
  * 恒为 `[]`，导致自动沉淀静默空转。
  */
-import { carriesResourceLocation, hasConstraintMarker } from './memory-filter.ts';
 import { classifyEvent, isRealUserEvent } from './event-classify.ts';
 
 /** 取 assistant 消息的 content（兼容 `data.message` 与旧版 `message`）。 */
@@ -158,21 +157,6 @@ export function isRealUserMessage(event: unknown): boolean {
 }
 
 /**
- * 用户消息里的**强约束词**。
- *
- * 用户消息是指令，不是结论。只有带约束信号的发言才值得进沉淀源 ——
- * 否则「根据这个文档配色」这类任务描述会被 distill 当成约束入库
- * （实测：文件名里的「规范」二字命中约定词表，整条指令被存成 `[约束]`）。
- *
- * 词表与路径预处理统一在 `memory-filter.ts`（`CONSTRAINT_WORDS` /
- * `hasConstraintMarker`）：先挖掉路径 token 再匹配，避免 `docs/禁止事项.md`
- * 里的「禁止」把纯任务指令放进门槛。
- */
-export function hasUserConstraint(text: string): boolean {
-  return hasConstraintMarker(text);
-}
-
-/**
  * 从 `agent.session.log` 投影出对话文本行。
  *
  * `log` 是 append-only 的事件数组，正好满足游标"按行号推进"的前提。
@@ -186,15 +170,18 @@ export function linesFromSession(session: unknown): string[] {
  *
  * ## 为什么需要来源
  *
- * 快照提权（资源位置）必须区分「谁在说」：用户交代「音频在桌面」
- * 与助手陈述「桌面上的文件与 assets/score.wav 的 MD5 一致」在文本形态上
- * 无法区分。早期版本靠词表区分，三代判据（宽松 / 黑名单 / 白名单）全部失败，
- * 真资源位置在真实回放里只命中 1/16。
+ * 快照提权与「资源位置只认用户说的」都必须区分谁在说话：用户交代
+ * 「音频在桌面」与助手陈述「桌面上的文件与 assets/score.wav 的 MD5 一致」
+ * 在文本形态上无法区分。靠词表区分试了三代（宽松 / 黑名单 / 白名单）
+ * 全部失败，真资源位置在真实回放里只命中 1/16。来源维度是唯一可靠的。
  *
- * 只有把来源一路带下去，`keepPriority` 才能正确只给用户条目提权。
+ * ## 为什么不再在这里做「值不值得沉淀」的筛选
  *
- * @param session - 宿主会话
- * @returns 每条对话文本 + 来源
+ * 旧实现用 `hasConstraintMarker` + `carriesResourceLocation` 决定用户消息
+ * 是否进入沉淀源 —— 那等于在**收集阶段**就做语义判断，而判断标准
+ * 与提取阶段又不一致，两处漂移必然漏。现在收集阶段只排除「肯定不是
+ * 用户说的话」（技能目录 / 运行时上下文），价值判断统一交给
+ * `memory-schema.ts` 的三元组契约。
  */
 export function linesWithOrigin(session: unknown): Array<{ text: string; origin: 'user' | 'assistant' }> {
   const log = (session as { log?: unknown })?.log;
@@ -213,22 +200,10 @@ export function linesWithOrigin(session: unknown): Array<{ text: string; origin:
     } else if (category === 'user') {
       // `user/message` 不只装用户说的话：DSH 会把技能目录、运行时上下文、
       // 时间上下文、模型切换通知都塞进同一个事件类型，靠 `data.source.kind` 区分。
-      // 不过滤的话，一份 12K 字符的技能目录会被当成用户发言送进 distill。
+      // 不过滤的话，一份 12K 字符的技能目录会被当成用户发言提取。
       if (!isRealUserMessage(event)) continue;
       const text = textBlocksOnly(event.data?.content);
       if (text.length === 0) continue;
-      // 用户消息是指令，不是结论。两条放行通道：
-      //   1. 含强约束词（`不要/必须/…`）
-      //   2. **携带具体资源位置**（`D:\Desktop，score-xxx.wav，这是你要打音频`）
-      //
-      // 第 2 条是事故留下的缺口：用户唯一交代音频位置的那条消息既没有
-      // 约束词，也不是纠正句式，于是 `hasConstraintMarker` 和
-      // `constraintsFromUser` 双双漏过 —— 「音频在桌面」这条最关键的事实
-      // 从未入库，模型只能去点下载链接。
-      //
-      // 判据只看「有没有具体的文件/路径 token」，不猜语义：路径类内容
-      // 被 `maskPaths` 挖掉后正文会很短，这里必须先判断原文。
-      if (!hasUserConstraint(text) && !carriesResourceLocation(text)) continue;
       lines.push({ text, origin: 'user' });
     }
   }

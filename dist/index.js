@@ -1,9 +1,9 @@
 // src/index.ts
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { dirname as dirname3, join as join3 } from "node:path";
 import { homedir as homedir2 } from "node:os";
-import { existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
+import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync4 } from "node:fs";
 
 // src/runtime.ts
 import { createHash } from "node:crypto";
@@ -685,15 +685,31 @@ function isConnectionError(error) {
 }
 
 // src/recall-injection.ts
+var INJECTION_HEADER = "[LRC 历史记忆（可能过时，与当前任务无关时请忽略）]";
 var DEFAULT_RECALL_INJECTION = {
   // 2 条足够覆盖"用户偏好 + 关键决定"这类最常见场景，再多就是噪音
   maxItems: 2,
   maxCharsPerItem: 80,
   // 与快照 220 字符同量级，避免单次注入就把上下文撑大
   maxTotalChars: 240,
-  // enrich 的 score_norm 是相对 top1 归一化的，低于 0.5 基本是"沾边"
-  minScore: 0.5
+  // 相对分只用于筛掉同批里的掉队项（top1 恒为 1.0，单靠它等于永远放行）
+  minScore: 0.85,
+  // RRF 分：单路 ≈0.0164 / 双路 ≈0.0301。0.025 等价于「要求至少两路命中」。
+  // 注意它是名次信号而非相关度，见字段注释里的实测数据。
+  minRawScore: 0.025
 };
+function isRelevant(memory, options) {
+  const norm = typeof memory.score_norm === "number" && Number.isFinite(memory.score_norm) ? memory.score_norm : 1;
+  if (norm < options.minScore) return false;
+  const raw = absoluteScore(memory);
+  if (raw === null) return true;
+  return raw >= options.minRawScore;
+}
+function absoluteScore(memory) {
+  const raw = memory.score;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  return null;
+}
 function normalizeRecallOptions(input) {
   const raw = input ?? {};
   const num = (value, fallback) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -708,34 +724,42 @@ function normalizeRecallOptions(input) {
       1,
       Math.floor(num(raw.maxTotalChars, DEFAULT_RECALL_INJECTION.maxTotalChars))
     ),
-    // 相关度必须落在 [0,1]，否则过滤条件会恒真或恒假
-    minScore: Math.min(1, Math.max(0, num(raw.minScore, DEFAULT_RECALL_INJECTION.minScore)))
+    // 相对分必须落在 [0,1]，否则过滤条件会恒真或恒假
+    minScore: Math.min(1, Math.max(0, num(raw.minScore, DEFAULT_RECALL_INJECTION.minScore))),
+    // 绝对分是 RRF 分（值域 (0, 2/61]），**不能**夹到 [0,1]：
+    // 夹上限到 1 会让所有候选都被判为不相关 ⇒ 永不注入。
+    // 夹下限到 0 则是「显式关闭绝对闸门」，这是合法配置，不做拦截。
+    minRawScore: Math.max(0, num(raw.minRawScore, DEFAULT_RECALL_INJECTION.minRawScore))
   };
 }
 function formatRecallInjection(memories, options = DEFAULT_RECALL_INJECTION) {
   if (options.maxItems <= 0) return "";
-  const picked = memories.filter((m) => typeof m.content === "string" && m.content.trim().length > 0).filter((m) => (m.score_norm ?? 1) >= options.minScore).slice(0, options.maxItems);
+  const picked = memories.filter((m) => typeof m.content === "string" && m.content.trim().length > 0).filter((m) => isRelevant(m, options)).sort((a, b) => sortScoreOf(b) - sortScoreOf(a)).slice(0, options.maxItems);
   if (picked.length === 0) return "";
-  const lines = picked.map((m) => {
-    const body = m.content.trim().replace(/\s+/g, " ");
-    const cut = body.length > options.maxCharsPerItem ? `${body.slice(0, options.maxCharsPerItem)}…` : body;
-    return `- ${cut}`;
-  });
-  let text = `[LRC 相关记忆]
+  const render = (list) => {
+    const lines = list.map((m) => {
+      const body = m.content.trim().replace(/\s+/g, " ");
+      const cut = body.length > options.maxCharsPerItem ? `${body.slice(0, options.maxCharsPerItem)}…` : body;
+      return `- ${cut}`;
+    });
+    return `${INJECTION_HEADER}
 ${lines.join("\n")}`;
+  };
+  let text = render(picked);
   while (text.length > options.maxTotalChars && picked.length > 1) {
     picked.pop();
-    const kept = picked.map((m) => {
-      const body = m.content.trim().replace(/\s+/g, " ");
-      return `- ${body.length > options.maxCharsPerItem ? `${body.slice(0, options.maxCharsPerItem)}…` : body}`;
-    });
-    text = `[LRC 相关记忆]
-${kept.join("\n")}`;
+    text = render(picked);
   }
   if (text.length > options.maxTotalChars) {
     text = `${text.slice(0, options.maxTotalChars - 1)}…`;
   }
   return text;
+}
+function sortScoreOf(memory) {
+  const raw = absoluteScore(memory);
+  if (raw !== null) return raw;
+  const norm = memory.score_norm;
+  return typeof norm === "number" && Number.isFinite(norm) ? norm : 0;
 }
 var CONTINUATION_HINTS = [
   "继续",
@@ -1029,6 +1053,32 @@ function isOptionLabel(line) {
   if (/^\|.*\|/.test(t)) return true;
   return false;
 }
+function looksLikeMachineOutput(line) {
+  const t = line.trim();
+  if (t.length === 0) return false;
+  if (/^[{\[]/.test(t)) {
+    if (t.includes('"')) return true;
+    if (/^\[[\w\s,.-]*\]$/.test(t)) return true;
+  }
+  if (/"[^"]{1,40}"\s*:/.test(t)) return true;
+  const kv = /^[A-Za-z_$][\w$.-]*\s*[:=]\s*([\s\S]*)$/.exec(t);
+  if (kv !== null) {
+    const value = (kv[1] ?? "").trim();
+    const maskedValue = maskPaths(value);
+    const cjk = (maskedValue.match(/[\u4e00-\u9fa5]/g) ?? []).length;
+    if (cjk >= 3 && /[，。；！？]/.test(maskedValue)) return false;
+    if (/(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律|不要|别用|别再|改用|换成|改成|定为|决定)/.test(
+      maskedValue
+    )) {
+      return false;
+    }
+    if (/(?:上限|下限|不超过|不低于|不少于|不大于|不小于|压到|降到|控制在|限制在)\s*[0-9]/.test(maskedValue)) {
+      return false;
+    }
+    if (cjk < 6) return true;
+  }
+  return false;
+}
 var PATH_BOUNDARY = "[^\\s，。；：、！？\"'`（）()【】\\[\\]{}<>《》「」]";
 var PATH_PATTERNS = [
   /\bhttps?:\/\/[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+/gi,
@@ -1038,7 +1088,6 @@ var PATH_PATTERNS = [
   //
   // 不能用 `${PATH_BOUNDARY}*[\\/]${PATH_BOUNDARY}*` —— PATH_BOUNDARY 含 CJK，
   // 会把 `禁止使用3099/3111` 整段挖成空格，真实约束直接丢失（实测回归）。
-  // CJK 文件名由下面的扩展名规则兜住（`docs/规范.md` 仍会被完整挖掉）。
   /(?:[A-Za-z0-9_.~-]+[\\/])+[A-Za-z0-9_.~-]*/g,
   new RegExp(
     `${PATH_BOUNDARY}+\\.(?:md|markdown|txt|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|ini|cfg|conf|png|jpe?g|gif|svg|webp|bmp|pdf|docx?|xlsx?|pptx?|csv|log|exe|dll|so|dylib|lock|html?|css|scss|less|py|rs|go|java|kt|sh|ps1|bat|cmd|zip|tar|gz|7z|mp4|mp3|wav)\\b`,
@@ -1049,341 +1098,6 @@ function maskPaths(text) {
   let out = text;
   for (const pattern of PATH_PATTERNS) {
     out = out.replace(pattern, (token) => " ".repeat(token.length));
-  }
-  return out;
-}
-var CONSTRAINT_WORDS = [
-  "必须",
-  "禁止",
-  "严禁",
-  "切勿",
-  "不得",
-  "不能",
-  "不要",
-  "不会",
-  "不用",
-  "无需",
-  "不需要",
-  "不允许",
-  "不许",
-  "不准",
-  "禁用",
-  "杜绝",
-  "一律",
-  "统一",
-  "统一为",
-  "默认",
-  "只允许",
-  "只能",
-  "务必",
-  "一定要",
-  "请用",
-  "记得",
-  "别忘",
-  "下次",
-  "别用",
-  "别再",
-  "别动",
-  "别改",
-  "别删",
-  "别碰",
-  "别连",
-  "别把",
-  "别写",
-  "别存",
-  "别加",
-  "改用",
-  "换成",
-  "改成",
-  "以后都",
-  "今后都"
-];
-var ENGLISH_CONSTRAINT = /\b(?:never|always|must(?:\s+not)?|should\s+not|do\s+not|don'?t|dont|avoid|forbidden|prohibited|not\s+allowed|only\s+use|required\s+to)\b/i;
-var SHORT_LINE_KEYWORDS = [
-  .../* @__PURE__ */ new Set([
-    ...CONSTRAINT_WORDS,
-    "严禁",
-    "决定",
-    "决策",
-    "结论",
-    "约束",
-    "规范",
-    "约定",
-    "原则",
-    "端口",
-    "架构"
-  ])
-];
-var MIN_CHARS = 20;
-var MIN_BODY_CHARS = 8;
-function hitsKeyword(body) {
-  if (ENGLISH_CONSTRAINT.test(body)) return true;
-  return SHORT_LINE_KEYWORDS.some((k) => body.includes(k));
-}
-function hasConstraintMarker(text) {
-  return hitsKeyword(maskPaths(text));
-}
-function hardFilter(text) {
-  const tag = extractMemoryTag(text);
-  if (tag !== null) {
-    if (isNoUpdate(tag)) return "";
-    return stripCodeFences(tag).trim();
-  }
-  const body = stripCodeFences(stripMemoryTag(text));
-  const kept = [];
-  for (const raw of body.split("\n")) {
-    const line = raw.trim();
-    if (line.length === 0) continue;
-    if (isSmallTalk(line)) continue;
-    if (isOptionLabel(line)) continue;
-    if (looksLikeNormalLog(line)) continue;
-    const masked = maskPaths(line);
-    const hasKeyword = hitsKeyword(masked);
-    const isResourceLine = isKeyResourceLocation(line, true);
-    if (line.length < MIN_CHARS && !hasKeyword && !isResourceLine) continue;
-    if (!hasKeyword && !isResourceLine && masked.replace(/\s+/g, "").length < MIN_BODY_CHARS) continue;
-    kept.push(line);
-  }
-  return kept.join("\n");
-}
-var DECISION_MARKERS = /决定|决策|采用|改用|换成|改成|改到|换到|换为|换了|切成|设为|设成|调成|调为|定为|选型|就用/;
-var NOMINAL_DECISION = /(?:\d+\s*[条个项]\s*(?:关键)?决策)|(?:(?:需要|要|待|待定|未)\s*决定)|(?:的决策)|(?:决策[到的])|(?:["'「"][^"'」"]*决策[^"'」"]*["'」"])/;
-function looksLikeChineseProse(text) {
-  if (/^\s*[A-Za-z_][A-Za-z0-9_]*\s*[=:]\s*/.test(text)) return false;
-  const cjk = (text.match(/[\u4e00-\u9fa5]/g) ?? []).length;
-  const englishWords = (text.match(/\b[A-Za-z]{3,}\b/g) ?? []).length;
-  if (cjk === 0) return false;
-  return !(englishWords >= 4 && englishWords > cjk);
-}
-var PROSE_NARRATION = /^(?:我(?:先|来|去|再|正在|会先)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:检查|查看|读取|尝试|运行)(?:一下|下)/;
-var PAST_OR_PLANNING = (
-  // 仅「动词 + 过」且后接句读（排除 过滤/过程/过度 等构词）
-  /(?:试|用|碰|去|做|改|见|跑|查|看|读|写|装|删|加|调|测|验)过(?:[，。；\s]|$)|(?:刚刚|刚才)(?:试|装|跑|执行|验证|看了?)|(?:正在)|(?:目前|已经)(?:完成|安装|验证|确认|试过)/
-);
-var STRONG_CONSTRAINT = /(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律)|(?:请勿|勿)(?:使用|用|走|通过|点击|下载)|(?:不要|不会|不用|别|不能|禁止)(?:再|再次|再一次|重复|继续)?(?:直接)?(?:使用|使|去|用|走|通过|把|在|连|写|加|改|删|碰|跳|绕|省|忽|下载|调用|点)/;
-function constraintsFromProse(text, maxLines = 4) {
-  const out = [];
-  const seen = /* @__PURE__ */ new Set();
-  const source = text.replace(/^\s*\|.*\|\s*$/gm, " ").replace(/^\s*#{1,6}\s.*$/gm, " ");
-  const body = stripMemoryTag(stripCodeFences(source));
-  for (const raw of body.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
-    const line = raw.trim().replace(/^[-*+\d.)\s]+/, "").trim();
-    if (line.length > 200) continue;
-    if (isSmallTalk(line) || isOptionLabel(line) || looksLikeNormalLog(line)) continue;
-    if (/^\s{4,}|^(?:const|let|var|function|class|import|export|def|fn)\s/.test(line)) continue;
-    if (PROSE_NARRATION.test(line)) continue;
-    const masked = maskPaths(line);
-    const strongHit = STRONG_CONSTRAINT.test(masked);
-    if (line.length < (strongHit ? 4 : 8)) continue;
-    const isDecision = DECISION_MARKERS.test(masked) && !NOMINAL_DECISION.test(masked);
-    const isConstraint = STRONG_CONSTRAINT.test(masked);
-    if (!isDecision && !isConstraint) continue;
-    if (isDecision && !isConstraint && !looksLikeChineseProse(line)) continue;
-    if (!isConstraint && PAST_OR_PLANNING.test(masked)) continue;
-    const kind = isDecision && !isConstraint ? "决策" : "约束";
-    const body2 = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, "").trim();
-    if (body2.length < (strongHit ? 4 : 6)) continue;
-    const key = body2.replace(/\s+/g, "");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(`${kind}：${body2}`);
-    if (out.length >= maxLines) break;
-  }
-  return out;
-}
-function carriesResourceLocation(text) {
-  const withoutUrls = text.replace(/\bhttps?:\/\/\S+/gi, " ");
-  if (/(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(withoutUrls)) return true;
-  if (/[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp|svg|pdf|docx?|xlsx?|pptx?)\b/i.test(
-    text
-  )) {
-    return true;
-  }
-  if (/(?:桌面|downloads?|下载目录|文档目录|视频目录)/i.test(text) && /(?:音频|视频|文件|素材|图片|脚本)/.test(text)) {
-    return true;
-  }
-  return false;
-}
-var ENGLISH_PROCESS = /\b(?:fail|error|unsupported|unrecognized|too\s+large|hmm|let\s+me|maybe|tries?\s+to)\b/i;
-var PROCESS_CONCLUSION_CN = /(?:MD5|哈希|一致|已确认|已验证|验证通过|已生成|已删除|已复制|已上传|已导入|处理完毕|测试通过|校验)/;
-var MEDIA_FILE = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
-var LEADING_PATH = /^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]:[\\/]|\\\\)/;
-function isKeyResourceLocation(text, fromUser) {
-  if (!fromUser) return false;
-  const body = text.replace(/\bhttps?:\/\/\S+/gi, " ");
-  if (ENGLISH_PROCESS.test(body)) return false;
-  const hasMediaFile = MEDIA_FILE.test(body);
-  const RES = "(?:音频|视频|文件|素材|图片|脚本|封面|成片|录音|音乐)";
-  const PLACE = [
-    // 目录 / 介质
-    "桌面",
-    "下载目录",
-    "目录",
-    "文件夹",
-    "盘",
-    "硬盘",
-    "网盘",
-    "云盘",
-    "U\\s*盘",
-    "移动硬盘",
-    "本地",
-    "本机",
-    "电脑",
-    "服务器",
-    "共享",
-    "onedrive",
-    "素材库",
-    // 工程目录
-    "assets",
-    "build",
-    "dist",
-    "public",
-    "tmp",
-    "temp",
-    "项目",
-    "工程",
-    "工作区",
-    // 指示位置
-    "当前",
-    "上级",
-    "这里",
-    "这儿",
-    "那儿",
-    "路径",
-    "根目录",
-    "子目录",
-    "同目录",
-    "子文件夹",
-    // 盘符（C 盘 / D盘 / D:\\ / C:/）
-    "[A-Za-z]\\s*盘",
-    "[A-Za-z]:[\\\\/]"
-  ].join("|");
-  const LOC = `(?:(?:位于|放在|放到|存在|来自|存到|拷到|复制到)|在[\\s]*(?:我的|这个|那个|本地|本机)?[\\s]*(?:${PLACE})|在[\\s]*[^\\s，。；：]{0,40}\\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp))`;
-  const FORWARD = new RegExp(`${RES}.{0,4}${LOC}`);
-  const REVERSE = new RegExp(
-    `(?:位于|放在|放到|存在|来自|存到|拷到|复制到).{0,2}${RES}`
-  );
-  const QUESTION_WORD = /(?:什么|多少|怎么|哪些|几个|几次|哪一个|有没有|是否|吗|还是|哪里|哪儿)/;
-  const PASSIVE_VOICE = /(?:被|遭到|受到)(?:压缩|清掉|清空|删除|删了|打包|覆盖|处理|替换|修改|重写|移除)/;
-  const clauseWithLocation = () => {
-    const clauses = body.split(/[，。；、！？,;!?]+/);
-    for (const c of clauses) {
-      if (FORWARD.test(c) || REVERSE.test(c)) return c;
-    }
-    return body;
-  };
-  const target = clauseWithLocation();
-  const strongLocation = (FORWARD.test(target) || REVERSE.test(target)) && !/(?:在|位于|放在|放到|存在|来自)的/.test(target) && !QUESTION_WORD.test(target) && !PASSIVE_VOICE.test(target);
-  const hasLocationSignal = LEADING_PATH.test(body) || strongLocation;
-  if (!hasLocationSignal && PROCESS_CONCLUSION_CN.test(body)) return false;
-  const withoutFileToken = body.replace(
-    /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)/gi,
-    ""
-  );
-  const residue = withoutFileToken.replace(/[\s，。；：、！？,.;:!?"'`（）()【】\[\]{}<>《》「」\\/-]/g, "");
-  const isPointerOnly = hasMediaFile && residue.length <= 2;
-  if (!isPointerOnly) {
-    if (hasMediaFile && hasLocationSignal) return true;
-    if (LEADING_PATH.test(body) && /(?:音频|视频|文件|素材|图片|脚本|封面|成片)/.test(body)) return true;
-  }
-  if (!strongLocation) return false;
-  return true;
-}
-var USER_CORRECTION = (
-  // 必须**有第二人称指向 + 完成态**（你）或「说过 N 次」的明确重申。
-  //
-  // ## 收得多紧，为什么
-  //
-  // `index.ts` 里这条路径直接 migrate 进长期记忆，**无法撤回**，
-  // 且 `recall` 会把它当「用户约束」反复召回。而用户消息量远大于
-  // assistant 正文，误收代价不对称。
-  //
-  // 两次收紧的实测依据：
-  // 1. 裸 `不是说` → 「不是 X，是 Y」解释句 4/4 误收（见 `NEGATION_EXPLANATION`）。
-  // 2. 裸 `我跟你说` → 寒暄/开场白 4/4 误收：
-  //    「我跟你说一下，这个视频还要改」「我跟你说，这个音频就在桌面」
-  //    「你再说一次刚才那个命令」「我说过两次了，你怎么还这样」
-  //    因此 `我跟你说` 必须带**完成/指向**后缀（说过 / 的是），
-  //    `再说一次` 必须后接否定或更正，不能是「请再说一遍」。
-  /(?:不是(?:已经)?(?:告诉|跟|给|对)(?:过)?你)|(?:我(?:已经|早就)?(?:跟你说过|告诉过你|讲过|强调过|说的是|要的是))|(?:说(?:过|了)(?:两|三|好几|\d+)次)|(?:强调|重申)(?:过|一?次)/
-);
-function isBehaviorCorrection(text) {
-  if (!/你/.test(text)) return false;
-  const hasHarm = /(?:就会|会(?:调起|调取|触发|下载|覆盖|删)|不知(?:道|会)|别再|不要|不能|禁止|必须|改用)/.test(text);
-  return hasHarm;
-}
-var NEGATION_EXPLANATION = /不是[^。！？；\n]{0,30}(?:，|,)?\s*(?:而是|是)[^。！？；\n]*/;
-function constraintsFromUser(text, maxLines = 3) {
-  const out = [];
-  const seen = /* @__PURE__ */ new Set();
-  const sentences = stripCodeFences(text).split(/[。！？；\n]+/).map((s) => s.trim().replace(/^[-*+\d.)\s]+/, "").trim()).filter((s) => s.length >= 6 && s.length <= 200);
-  for (let i = 0; i < sentences.length; i += 1) {
-    const line = sentences[i];
-    if (isSmallTalk(line) || looksLikeNormalLog(line)) continue;
-    const masked = maskPaths(line);
-    if (!USER_CORRECTION.test(masked)) continue;
-    const next = sentences[i + 1];
-    const nextUsable = next !== void 0 && next.length >= 6 && next.length <= 120 && !isSmallTalk(next);
-    const window = nextUsable ? `${line}；${next}` : line;
-    const maskedWindow = maskPaths(window);
-    if (NEGATION_EXPLANATION.test(maskedWindow) && !STRONG_CONSTRAINT.test(maskedWindow)) continue;
-    if (!isBehaviorCorrection(maskedWindow)) continue;
-    const body = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, "").trim();
-    const merged = nextUsable ? `${body}；${next}` : body;
-    const cleaned = merged.replace(/[？?]+$/, "").trim();
-    if (cleaned.length < 6) continue;
-    const key = cleaned.replace(/\s+/g, "");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(`约束：${cleaned}`);
-    if (out.length >= maxLines) break;
-  }
-  return out;
-}
-var CONCLUSION_MARKERS = [
-  "结论",
-  "因此",
-  "所以",
-  "决定",
-  "必须",
-  "不能",
-  "应该",
-  "最终",
-  "综上",
-  "关键是",
-  "根因",
-  "原因",
-  "方案",
-  "改用",
-  "采用",
-  "确认",
-  "发现",
-  "注意"
-];
-var ENGLISH_STRONG = /\b(?:therefore|thus|hence|conclusion|concluded|decided|decision|root\s+cause)\b/i;
-var ENGLISH_WEAK = /\b(?:must|should|need\s+to|because)\b/i;
-var PROCESS_NARRATION = /^(?:(?:I|We)\s+(?:should|need\s+to|will|am|are|'ll|'re)\s+(?:check|look|read|see|try|start|begin|open|run|search|find|verify|inspect|edit|update|fix|add|remove|change)\b|Let\s+me\b|Now\b|First\b|Next\b|Then\b|Okay\b|OK\b|Hmm\b|Wait\b|Looking\b|Checking\b|Reading\b|Let's\b)/i;
-function conclusionsFromReasoning(text, maxLines = 5, maxChars = 300) {
-  const out = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const raw of text.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/)) {
-    const line = raw.trim();
-    if (line.length < 8 || line.length > maxChars) continue;
-    if (isSmallTalk(line) || isOptionLabel(line) || looksLikeNormalLog(line)) continue;
-    if (stripCodeFences(line) !== line) continue;
-    const masked = maskPaths(line);
-    const chineseHit = CONCLUSION_MARKERS.some((marker) => masked.includes(marker));
-    const englishStrong = ENGLISH_STRONG.test(masked);
-    const englishWeak = ENGLISH_WEAK.test(masked);
-    if (!chineseHit && !englishStrong && !englishWeak) continue;
-    if (!chineseHit && !englishStrong && englishWeak) {
-      if (line.length < 20 || PROCESS_NARRATION.test(line)) continue;
-    }
-    const key = line.replace(/\s+/g, "");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(line);
-    if (out.length >= maxLines) break;
   }
   return out;
 }
@@ -1399,8 +1113,7 @@ function jaccard(a, b) {
 function valueTokens(text) {
   const out = [];
   for (const m of text.matchAll(/[A-Za-z][A-Za-z0-9_.\-/\\]*|\d+/g)) {
-    const t = m[0].toLowerCase();
-    if (t.length >= 1) out.push(t);
+    out.push(m[0].toLowerCase());
   }
   return out;
 }
@@ -1442,6 +1155,852 @@ function isDuplicate(text, recent, threshold = DEFAULT_DEDUP_THRESHOLD) {
   return recent.some((r) => areNearDuplicate(r, t, threshold));
 }
 
+// src/memory-schema.ts
+var KIND_LABEL = {
+  constraint: "约束",
+  decision: "决策",
+  conclusion: "结论",
+  goal: "约束",
+  location: "事实",
+  artifact: "工件",
+  statement: "事实",
+  fact: "事实"
+};
+var MIN_VALUE_CHARS = 2;
+var MIN_STATEMENT = 6;
+var MAX_STATEMENT = 300;
+var MAX_JUDGED_STATEMENT = 500;
+var MIN_CONFIDENCE = 0.6;
+var PREDICATES = {
+  constraint: [
+    "只允许",
+    "不允许",
+    "统一为",
+    "一定要",
+    "只支持",
+    "仅支持",
+    "只兼容",
+    "仅兼容",
+    "不需要",
+    "不用",
+    "无需",
+    "不要",
+    "不能",
+    "不得",
+    "必须",
+    "务必",
+    "禁止",
+    "严禁",
+    "切勿",
+    "杜绝",
+    "只能",
+    "一律",
+    "别再",
+    "别用",
+    "别碰",
+    "别动",
+    "别改",
+    "别删",
+    "别写",
+    "别加",
+    "别存",
+    "别把",
+    "别连",
+    "别忘",
+    "请用",
+    "请勿",
+    "记得"
+  ],
+  decision: [
+    "方案是",
+    "最终选",
+    "选定",
+    "选用",
+    "改用",
+    "换成",
+    "改成",
+    "改到",
+    "换到",
+    "换为",
+    "切成",
+    "设为",
+    "设成",
+    "调成",
+    "调为",
+    "定为",
+    "采用",
+    "选型",
+    "就用",
+    "决定",
+    // 单字「选」：`数据库选 PostgreSQL` 是最常见的选型表达。
+    // 它靠 `deriveClaim` 里的单字谓词约束（取值须为 ASCII 专名）把
+    // `我选择看一下` 这类误收挡掉。
+    "选"
+  ],
+  conclusion: [
+    "根本原因是",
+    "原因在于",
+    "问题在于",
+    "问题出在",
+    "最终确认",
+    "结论是",
+    "结论为",
+    "结论：",
+    "结论:",
+    "定位到",
+    "查明",
+    "根因是"
+  ],
+  goal: [
+    "不超过",
+    "不低于",
+    "不少于",
+    "不大于",
+    "不小于",
+    "目标是",
+    "压到",
+    "降到",
+    "控制到",
+    "限制到"
+  ],
+  /**
+   * **陈述性谓词**：回答「这是什么 / 包含什么 / 怎么用」。
+   *
+   * ## 为什么必须有这一类（★2026-11-14 真实测试暴露）
+   *
+   * 此前词表里只有**规范性**谓词（必须/不要/改用/根因是）。于是用户问
+   * 「这个仓库是什么」，模型的答案整类进不了记忆库 —— 实测 4/4 全漏：
+   * ```
+   * MISS awesome-code-animation 是一个收录代码动画项目的聚合仓库。
+   * MISS 这个仓库收录了 443 个代码动画项目。
+   * MISS 使用方法是把仓库里的 demo 目录直接用浏览器打开。
+   * MISS 这个仓库不需要安装，克隆下来直接看 examples 目录。
+   * ```
+   * 后果：压缩完上下文后，接手方只知道「不要改 README」「商用前必须核对」，
+   * 却不知道**这个仓库到底是什么** —— 而后者才是用户问题的答案。
+   *
+   * ## 为什么必须带严格约束
+   *
+   * 「是」是中文最高频的系词，裸用会把整类垃圾收进来：
+   * ```
+   * 是的，我明白了。            ← 应答
+   * 这个是刚才那个文件。        ← 指代
+   * 问题是我还不知道能不能跑。    ← 疑问
+   * ```
+   * 约束见 `deriveFromClause` 里的 `STATEMENT_*` 判据组：
+   * 主语含具体名词、取值 ≥4 字、排除疑问/否定/应答/指代。
+   */
+  statement: [
+    "的用法是",
+    "的定位是",
+    "的作用是",
+    "的本质是",
+    "基于",
+    "收录了",
+    "包含了",
+    "提供了",
+    "属于",
+    "是一个",
+    "是一套",
+    "是一款",
+    "是一种",
+    "支持",
+    "是"
+  ]
+};
+var OBSERVATIONAL_GOAL_VERB = /^(?:降|减)到$/;
+var GOAL_QUANTITY = /[0-9]|以内|以下|之内|不超过|不低于|不少于|不大于|不小于|上限|下限/;
+var GOAL_BOUND_SUFFIX = /(?:以内|以下|之内|不超过|不低于|不少于|不大于|不小于)/;
+var EMPTY_POINTER = /^(?:如下|见下|见上|原因如下|理由如下|具体如下|以下|略|待定|待补|同上|详见|稍后|具体见|后述|前述)[：:，,。\s]*$/;
+var MAX_VALUE_CHARS = 30;
+var LEADING_CONJUNCTION = /^(?:而|且|并|但|却|也|还|就|才|则|另外|此外|再者|反之|不过|然而|那)/;
+var LEADING_CAUSAL = /^(?:所以|因此|于是|由此|故而|从而|进而|因而)/;
+var TIME_ADVERB_ONLY = /^(?:现在|接下来|然后|之后|随后|接着|下面|下一步|刚才|刚刚|目前|当前|此时|眼下|如今|当时|此前|这时|那时|随即)$/;
+var CLAUSE_TEMPORAL = /[，,。；;！!]\s*(?:接下来|然后|接着|下一步|随后|之后)\s*(?:改|换|做|写|跑|试|看|查|读|补|删|加|去掉|重跑|调整|修|执行)/;
+var CLAUSE_ACTION = new RegExp(
+  [
+    // 分句首的单数「我」+ 动作：与 `AGENT_EXECUTION` 里那条完全同构
+    "[，,。；;！!]\\s*我(?!们)(?!(?:认为|觉得|建议|推荐|倾向|估计|猜|怀疑|同意|反对|注意到|发现))[\\u4e00-\\u9fa5]",
+    // 分句后「于是/然后/接着」+ 可选「直接」+ 处置式 ⇒ 我刚做/正在做的事
+    "[，,。；;！!]\\s*(?:于是|然后就?|接着就?|随后就?)\\s*(?:直接|干脆)?[把将]",
+    // 分句后「开始/继续/着手」+ 单字动作 ⇒ 执行步骤
+    "[，,。；;！!]\\s*(?:开始|继续|着手|接着)\\s*(?:读|写|改|查|看|跑|试|做|补|删|加|执行|访问|克隆|搜|扫|装|跑)"
+  ].join("|")
+);
+var DEMONSTRATIVE_TAIL = /^(?:个|些|款|套|种|位|类|份|条|张|组)?/;
+var SPECIFIC_NOUN = /^(?:仓库|项目|工具|文件|目录|脚本|配置|方案|方法|代码|引擎|库|框架|接口|服务|模型|插件|提示词|流程|结构|数据|字段|参数|版本|端口|缓存|日志|文档|测试|命令|变量|函数|模块|组件|页面|问题|结论|决策|约束|目标|任务|步骤|环节|阶段|部分|章节|表格|图片|音频|视频|素材|配置项|依赖|环境|分支|提交|改动|差异)/;
+function startsWithBareDemonstrative(text) {
+  const head = DEMONSTRATIVE_HEAD.exec(text);
+  if (head === null) return false;
+  const afterHead = text.slice(head[0].length);
+  const tail = DEMONSTRATIVE_TAIL.exec(afterHead);
+  const rest = afterHead.slice(tail === null ? 0 : tail[0].length).trim();
+  if (SPECIFIC_NOUN.test(rest)) return false;
+  if (rest.replace(/[\s，。；：、！？]/g, "").length < 2) return true;
+  return false;
+}
+var DEPENDENT_CLAUSE = /^(?:如果|若|假如|倘若|一旦|除非|虽然|尽管|即使|即便|哪怕|纵使|纵然|无论|不管|因为|由于|要?不然|或者?|还是|把|将|给|被|有件事|顺便|另外说|不是|并非|而不是)/;
+var IMPERATIVE_PREDICATE = /^(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律|只支持|仅支持|只兼容|仅兼容|不要|别用|别再|别碰|别动|别改|别删|别写|别加|别存|别把|别连|别忘|请用|请勿|记得)$/;
+var COMMENT_MARKER = /^(?:TODO|FIXME|NOTE|HACK|XXX|注意|备注|提醒)\s*[：:]\s*/i;
+function stripCommentMarker(text) {
+  return text.replace(COMMENT_MARKER, "");
+}
+var ORDERED_PREDICATES = Object.entries(PREDICATES).flatMap(([kind, words]) => words.map((word) => ({ kind, word }))).sort((a, b) => b.word.length - a.word.length);
+var ENGLISH_PREDICATES = [
+  { kind: "constraint", word: "must not" },
+  { kind: "constraint", word: "should not" },
+  { kind: "constraint", word: "do not" },
+  { kind: "constraint", word: "only use" },
+  { kind: "constraint", word: "must use" },
+  { kind: "constraint", word: "must" },
+  { kind: "constraint", word: "never" },
+  { kind: "constraint", word: "always" },
+  { kind: "decision", word: "decided to" },
+  { kind: "decision", word: "switched to" },
+  { kind: "decision", word: "chose" },
+  { kind: "conclusion", word: "root cause is" },
+  { kind: "conclusion", word: "the conclusion is" },
+  { kind: "goal", word: "at most" },
+  { kind: "goal", word: "no more than" }
+].sort((a, b) => b.word.length - a.word.length);
+var ALL_PREDICATES = [...ORDERED_PREDICATES, ...ENGLISH_PREDICATES];
+var COPYULA_SINGLE = ["是"];
+var PROCESS_NARRATION = /^(?:我(?:先|来|去|再|正在|会先|要|得|需要)|让我|接下来我|下面我|现在(?:我)?(?:来|去)|先(?:看|查|读|试|跑))|(?:那我?得|我需要先|我还得|得先|还要先|我要先|让我先)|(?:得|要|需要|待|准备)(?:确认|核实|梳理|查一下|看看|确认一下)/;
+var AGENT_EXECUTION = new RegExp(
+  [
+    // 时间 / 顺序副词开头
+    "^(?:接下来|下面|然后|接着|下一步|随后|之后)",
+    // 时间副词 + 处置式（`现在把 X 改成 Y`）
+    "^现在(?:就)?[把将]",
+    // 并列副词 + 处置式（`同时把 X 改成 Y` / `并把它换成`）
+    //
+    // ## 为什么单独处理「把」开头的祈使句（★2026-11-14）
+    //
+    // `把` 既可能是**处置式动作**（我要把 X 改成 Y），也可能是**祈使规则**
+    // （把音频放到桌面 —— 让人照做）。区别在「把」后面的宾语：
+    // ```
+    // 同时把 `base.css` 那段改成…   ← 宾语是具体文件 + 有「改成」（执行）
+    // 把缓存放在工作区之外            ← 祈使交付指令，必须保留
+    // ```
+    // 判据：只有「把」前面有并列/时间副词时才按执行叙述拒；
+    // 裸「把」开头不在此列（交给三元组与祈使判据决定）。
+    "^(?:同时|顺便|一并|并且|然后)[把将]",
+    "^[并也再就又][把将]",
+    // ## 单数「我」+ 动作谓词 ⇒ 执行叙述（★2026-11-14 真实会话）
+    //
+    // 实测残留：`我会补上两个图标` / `我改用点击` / `我用 foldSurface 验证`
+    // 原先靠枚举「我先/我来/我去…」覆盖，但动词是开放集合，枚举永远漏。
+    //
+    // 反向的判据更稳：**助手说「我」+ 具体动作，就是在讲自己做了什么**。
+    // 而下面这些「我」开头的句子必须保留，它们是判断不是动作：
+    // ```
+    // 我们必须完整经历五屏引导     ← 复数「我们」= 产品规则
+    // 我建议用 pnpm 替代 npm       ← 建议（情态动词，不是动作）
+    // 我认为这个方案更好           ← 认为（认知动词，是判断）
+    // ```
+    // 所以只排除两类：复数主语、以及认知/建议类情态动词。
+    "^我(?!们)(?!(?:认为|觉得|建议|推荐|倾向|估计|猜|怀疑|同意|反对|注意到|发现))[\\u4e00-\\u9fa5]",
+    // 省略主语的执行动作
+    "^换(?:到|成|一个|个)|^重(?:跑|来|做)|^删掉|^加上|^去掉",
+    // ## 完成时态「全部/都/已 + 换成/改成」⇒ 刚做完的动作（★2026-11-15）
+    //
+    // ```
+    // 全部换成了真正绘制的线条        ← 我刚做完的事
+    // 都改成 SVG 了                  ← 我刚做完的事
+    // ```
+    // 判据是**完成标记 + 变更动词**的组合：`全部/都/已/已经` 修饰
+    // `换成/改成/改为` 时，句子在报告一次已完成的操作，而不是留一条约定。
+    // 真正的决策不会带「全部」「都」这类范围副词 —— 那是已完成动作的总结。
+    "^(?:全部|全都|都|已|已经|均已|现已)[^，。]{0,6}(?:换成|改成|改为|换作|改作)",
+    // ## 建议式 + 变更动词 ⇒ 待定方案（★2026-11-15）
+    //
+    // ```
+    // 建议改成墨底 + 朱边          ← 我提议的改法（尚未拍板）
+    // 建议收集用户反馈             ← 产品层面的建议（有价值，保留）
+    // 改用 --stdin 传入 JSON       ← 已定的做法（保留）
+    // ```
+    // 只拦「建议 + 改/换/调」这种**改动方案**，不拦一般性建议。
+    "^(?:建议|推荐|不妨|可以考虑|不如)[^，。]{0,4}(?:改|换|调|替换)",
+    // ## 征询/自荐句式 ⇒ 执行意图，不是结论（★2026-11-14）
+    //
+    // ```
+    // 需要我把它改成方印的形状        ← 征询下一步动作（过程）
+    // 我来帮你补上这两个图标          ← 自荐（过程）
+    // ```
+    // 这类句子主语被前置的「需要/要」挡住，逃过了上面「我」开头的判据。
+    "^(?:需要|要|是否要|要不要)我"
+  ].join("|")
+);
+var DEMONSTRATIVE_HEAD = /^(?:这|那|它|其|该|此)(?:个|些|样|种)?/;
+var TEMPORARY_MARKER = /(?:这次|本次|本轮|临时|先这么|暂时|这个任务|当前任务|做一?个)/;
+var PLANNING_AFTER_DECLARATION = /(?:目标|结论)\s*(?:是|为|：|:)\s*(?:先|再|准备|打算|将要|待|接下来|下一步|后续)|(?:下一步|接下来|后续|然后|下面|接着)\s*目标/;
+var QUESTION_TAIL = /[？?]\s*$|(?:吗|呢)\s*$/;
+var QUESTION_WORD = /为什么|为何|怎么|如何|是否|有没有|是不是|能不能|可不可以|哪里|哪儿|哪个|哪些|多少|请问/;
+var A_NOT_A_QUESTION = /(?:要不要|是不是|能不能|能否|会不会|该不该|可不可以|应不应该|可否)/;
+var A_NOT_A_HAS = /有无(?:$|[？?，,。；;])|有无(?:更|其|任|何|哪)/;
+var EXPLANATION_VERB = /(?:说明|解释|讲清楚?|搞清楚?|查清楚?|弄清楚?|写明|记录|分析|确认|判断|理解)$/;
+var REBUTTAL = /不是(?:已经)?(?:告诉|跟|给|对)(?:过)?你|我(?:已经|早就)?(?:跟你说过|告诉过你|讲过|强调过|说的是|要的是)|(?:跟|和|对)你说(?:过)?(?:多少|几)(?:遍|次)|说(?:过|了)(?:两|三|好几|\d+)(?:遍|次)|(?:强调|重申)(?:过|一?次)/;
+function deriveRebuttal(text) {
+  const t = text.trim();
+  if (!REBUTTAL.test(t)) return null;
+  const body = t.replace(/[？?]+$/, "").trim();
+  if (body.length < MIN_STATEMENT) return null;
+  return { subject: "", value: body };
+}
+function isPlannedNarration(text) {
+  return PLANNING_AFTER_DECLARATION.test(text.trim());
+}
+function isQuestion(text) {
+  const t = text.trim();
+  if (REBUTTAL.test(t)) return false;
+  if (QUESTION_TAIL.test(t)) return true;
+  const m = QUESTION_WORD.exec(t);
+  const anotA = A_NOT_A_QUESTION.exec(t) ?? A_NOT_A_HAS.exec(t);
+  const hit = m !== null ? m : anotA;
+  if (hit === null) return false;
+  const before = t.slice(0, hit.index).trim().replace(/[，,：:\s]+$/, "");
+  if (EXPLANATION_VERB.test(before)) return false;
+  return true;
+}
+function isProcessNarration(text, origin = "assistant") {
+  const t = text.trim();
+  if (PROCESS_NARRATION.test(t)) return true;
+  if (origin !== "assistant") return false;
+  if (AGENT_EXECUTION.test(t)) return true;
+  if (CLAUSE_TEMPORAL.test(t)) return true;
+  if (CLAUSE_ACTION.test(t)) return true;
+  return false;
+}
+var POSITIONAL_SUBJECT = /^的?(?:旁边|左侧|右侧|左边|右边|上方|下方|上面|下面|里面|内部|外面|周围|中间|后面|前面|身边|身上|底下|对面|两侧|两端|四周|附近|隔壁|顶部|底部)\s*(?:是|为|在|有|放|装|摆)/;
+function isSelfContained(text) {
+  const t = text.trim();
+  const head = DEMONSTRATIVE_HEAD.exec(t);
+  if (head === null) return true;
+  const rest = t.slice(head[0].length).trim();
+  if (POSITIONAL_SUBJECT.test(rest)) return false;
+  if (rest.replace(/[\s，。；：、！？]/g, "").length < 6) return false;
+  return true;
+}
+var PATH_TOKEN = /\bhttps?:\/\/[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+|[A-Za-z]:[\\/][^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]*|\\\\[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]*|(?:[A-Za-z0-9_.~-]+[\\/])+[A-Za-z0-9_.~-]*|[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:md|txt|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|ini|png|jpe?g|gif|svg|webp|pdf|docx?|xlsx?|pptx?|csv|log|mp4|mp3|wav|sh|ps1|zip)\b/gi;
+function maskPathTokens(text) {
+  return text.replace(PATH_TOKEN, (token) => " ".repeat(token.length));
+}
+var QUOTED_SEGMENT = /`[^`]*`|「[^」]*」|『[^』]*』|“[^”]*”|"[^"]*"/g;
+function maskQuotedSegments(text) {
+  return text.replace(QUOTED_SEGMENT, (segment) => " ".repeat(segment.length));
+}
+function deriveClaim(statement, hint) {
+  const text = statement.trim();
+  if (text.length < MIN_STATEMENT) return null;
+  if (/^[{\[]/.test(text) && text.includes('"')) return null;
+  if (/"[^"]{1,40}"\s*:/.test(text)) return null;
+  const clauses = text.split(/[，,；;]/).map((c) => c.trim()).filter((c) => c.length > 0);
+  const candidates = clauses.length > 1 ? clauses : [text];
+  for (const clause of candidates) {
+    const claim = deriveFromClause(clause, hint);
+    if (claim !== null) return claim;
+  }
+  return null;
+}
+function deriveFromClause(clause, hint) {
+  const text = clause.trim();
+  if (text.length < MIN_STATEMENT) return null;
+  const masked = maskQuotedSegments(maskPathTokens(text));
+  let best = null;
+  for (const { kind, word } of ALL_PREDICATES) {
+    if (hint !== void 0 && hint !== kind && !(hint === "constraint" && kind === "goal")) continue;
+    const at = masked.indexOf(word);
+    if (at < 0) continue;
+    if (word.length === 1 && !COPYULA_SINGLE.includes(word)) {
+      const after = masked[at + 1] ?? "";
+      if (/[\u4e00-\u9fa5]/.test(after)) continue;
+    }
+    if (best === null || at < best.at || at === best.at && word.length > best.word.length) {
+      best = { kind, word, at };
+    }
+  }
+  if (best === null) return null;
+  if (LEADING_CONJUNCTION.test(text)) return null;
+  if (startsWithBareDemonstrative(text)) return null;
+  if (DEPENDENT_CLAUSE.test(text)) return null;
+  const leadingPredicate = best.at === 0;
+  if (leadingPredicate && !IMPERATIVE_PREDICATE.test(best.word)) {
+    const declarative = (best.kind === "decision" || best.kind === "conclusion" || best.kind === "goal") && best.word.length >= 2;
+    const english = /^[A-Za-z ]+$/.test(best.word);
+    if (!declarative && !english) return null;
+  }
+  const rawSubject = text.slice(0, best.at).trim();
+  const subjectIsCausalOnly = LEADING_CAUSAL.test(rawSubject) && rawSubject.length <= 4;
+  const subject = subjectIsCausalOnly ? rawSubject : rawSubject.replace(/[，,；;：:]?\s*(?:并|且|而|但|却|也|还|就|才|则)\s*$/, "").trim();
+  if (subjectIsCausalOnly && !(best.kind === "decision" || best.kind === "conclusion" || best.kind === "goal")) {
+    return null;
+  }
+  if (TIME_ADVERB_ONLY.test(subject) && !IMPERATIVE_PREDICATE.test(best.word)) {
+    if (!/^(?:不再|无需|无需再|已经|仍然|仍)/.test(best.word)) return null;
+  }
+  const value = text.slice(best.at + best.word.length).trim().replace(/^[：:，,\s]+/, "").replace(/[：:，,。；;！!？?\s]+$/, "").trim();
+  if (/(?:的|了|过|过的|了的)$/.test(value)) return null;
+  if (hasUnpairedQuote(`${subject}${value}`)) return null;
+  if (value.replace(/[\s，。；：、！？"'`]/g, "").length < MIN_VALUE_CHARS) return null;
+  if (EMPTY_POINTER.test(value)) return null;
+  if (value.length > MAX_VALUE_CHARS) return null;
+  if (/你/.test(subject) && /我/.test(subject)) return null;
+  const subjectNoPronoun = subject.replace(/^(?:那么|所以|但是|而且|另外|其实|然后)?\s*(?:我|我们|你|你们|他|她|它)\s*(?:们)?/g, "").trim();
+  if (subject.length > 0 && subjectNoPronoun.replace(/[\s，。；：、！？"'`]/g, "").length === 0) {
+    if (!/^(?:必须|务必|一定要|禁止|严禁|切勿|不得|不允许|不准|不许|杜绝|只能|只允许|一律|不要)$/.test(best.word)) {
+      return null;
+    }
+  }
+  if (subject.length > 0 && !isSelfContained(subject + best.word + value)) return null;
+  const subjectShape = stripCommentMarker(subject).trim();
+  if (subjectShape.length > 0) {
+    if (/的$/.test(subjectShape)) return null;
+    if (/[：:]/.test(subjectShape)) return null;
+    if (/[。！!？?]/.test(subjectShape)) return null;
+    if (hasUnpairedBracket(subjectShape)) return null;
+    if (/^(?:一款|一个|一种|一套|一份|一条|一项|这个|那个|这些|那些|其|该|此)$/.test(subjectShape)) {
+      return null;
+    }
+  }
+  const finalSubject = subjectIsCausalOnly ? "" : subject;
+  if (best.kind === "goal" && !GOAL_QUANTITY.test(value)) return null;
+  if (OBSERVATIONAL_GOAL_VERB.test(best.word) && !GOAL_BOUND_SUFFIX.test(value)) return null;
+  if (best.word.length === 1 && !/[A-Za-z0-9]/.test(value)) return null;
+  if ((best.word === "只能" || best.word === "只允许") && !hasConcreteValue(value)) return null;
+  if (/(?:一个|一下|这个|那个|一次|一项|一条|一种)$/.test(value)) return null;
+  if (best.kind === "statement" && !passesStatementGate(best.word, subject, value)) return null;
+  return { kind: best.kind, subject: finalSubject, predicate: best.word, value };
+}
+function passesStatementGate(word, rawSubject, value) {
+  const subject = rawSubject.trim();
+  const subjectBody = subject.replace(/[\s，。；：、！？"'`（）()]/g, "");
+  if (subjectBody.length < 2) return false;
+  const withoutDemonstrative = subjectBody.replace(/^(?:这|那|它|其|该|此)(?:个|些|样|种|位|款)?/, "");
+  if (withoutDemonstrative.length === 0) return false;
+  if (withoutDemonstrative.length < 2) return false;
+  if (/^(?:是的?|不是|并非|就是)$/.test(subjectBody)) return false;
+  if (/^(?:可能|似乎|应该|大概|也许|或许|好像)/.test(subjectBody)) return false;
+  const valueBody = value.replace(/[\s，。；：、！？"'`（）()]/g, "");
+  if (valueBody.length < 4) return false;
+  if (/^(?:吗|呢|吧|了|的|啊|呀|嘛)$/.test(valueBody)) return false;
+  if (/[？?]/.test(value)) return false;
+  if (/(?:吗|呢)\s*$/.test(value)) return false;
+  if (word === "是") {
+    const hasProperNoun = /[A-Za-z0-9]/.test(subject);
+    if (!hasProperNoun && subjectBody.length < 4) return false;
+  }
+  return true;
+}
+function hasUnpairedQuote(text) {
+  const pairs = [
+    ["「", "」"],
+    ["『", "』"],
+    ["“", "”"],
+    ["（", "）"],
+    ["(", ")"],
+    ["《", "》"]
+  ];
+  for (const [open, close] of pairs) {
+    const opens = text.split(open).length - 1;
+    const closes = text.split(close).length - 1;
+    if (opens !== closes) return true;
+  }
+  if (text.includes("——")) return true;
+  return false;
+}
+function hasUnpairedBracket(text) {
+  const pairs = [
+    ["（", "）"],
+    ["(", ")"],
+    ["【", "】"],
+    ["[", "]"]
+  ];
+  for (const [open, close] of pairs) {
+    const opens = text.split(open).length - 1;
+    const closes = text.split(close).length - 1;
+    if (opens !== closes) return true;
+  }
+  return false;
+}
+function hasConcreteValue(value) {
+  if (/[A-Za-z0-9]/.test(value)) return true;
+  return /(?:端口|目录|文件夹|路径|工作区|缓存|配置|文件|音频|视频|图片|脚本|密钥|参数|环境|分支|提交|首页|封面|字体|配色|版式|动效)/.test(
+    value
+  );
+}
+var PLACE_NOUN = /(?:桌面|下载目录|文档目录|视频目录|目录|文件夹|盘|硬盘|网盘|云盘|U\s*盘|移动硬盘|本地|本机|电脑|服务器|共享|onedrive|素材库|assets|build|dist|public|temp|tmp|工作区|项目|工程|当前目录|根目录|子目录|同目录|上级目录|这里|这儿|那儿|路径)/;
+var LOCATION_VERB = /(?:位于|放在|放到|存在|来自|存到|拷到|复制到|在)/;
+function deriveLocation(text) {
+  const t = text.trim();
+  const m = LOCATION_VERB.exec(t);
+  if (m === null) return null;
+  const verb = m[0];
+  const at = m.index;
+  const subject = t.slice(0, at).trim();
+  const value = t.slice(at + verb.length).trim().replace(/^[：:，,\s]+/, "");
+  if (subject.replace(/[\s，。；：、！？]/g, "").length < 2) return null;
+  if (value.replace(/[\s，。；：、！？"'`]/g, "").length < 2) return null;
+  if (/[：:]/.test(subject)) return null;
+  const valueAtFirstComma = value.split(/[，,；;]/)[0].trim();
+  if (valueAtFirstComma.length === 0) return null;
+  const hasPlace = PLACE_NOUN.test(valueAtFirstComma) || /^[A-Za-z]:[\\/]/.test(valueAtFirstComma) || /\.(?:wav|mp3|mp4|mov|png|jpe?g|gif|webp|md|txt|json|ts|js)\b/i.test(valueAtFirstComma) || /[\\/]/.test(valueAtFirstComma);
+  if (!hasPlace) return null;
+  return { subject, predicate: "位于", value: valueAtFirstComma };
+}
+function validateFact(fact) {
+  const statement = fact.statement.trim();
+  if (fact.kind === "artifact") {
+    if (fact.value.trim().length === 0) return { ok: false, reason: "no_value" };
+    if (!/^[0-9a-f]{8,64}$/i.test(fact.value.trim())) return { ok: false, reason: "bad_artifact_hash" };
+    if (fact.predicate.trim().length === 0) return { ok: false, reason: "no_predicate" };
+    if (statement.length < MIN_STATEMENT) return { ok: false, reason: "statement_too_short" };
+    return { ok: true };
+  }
+  if (statement.length < MIN_STATEMENT) return { ok: false, reason: "statement_too_short" };
+  if (statement.length > MAX_STATEMENT) return { ok: false, reason: "statement_too_long" };
+  if (/\*\*|__|`{2,}|^\s*[-*+]\s/.test(statement)) return { ok: false, reason: "markup_fragment" };
+  if (fact.predicate.trim().length === 0) return { ok: false, reason: "no_predicate" };
+  if (fact.value.trim().length === 0) return { ok: false, reason: "no_value" };
+  if (!isSelfContained(statement)) return { ok: false, reason: "not_self_contained" };
+  if (isProcessNarration(statement, fact.origin)) return { ok: false, reason: "process_narration" };
+  if (fact.confidence < MIN_CONFIDENCE) return { ok: false, reason: "low_confidence" };
+  if (isPlannedNarration(statement)) return { ok: false, reason: "planned_narration" };
+  if (isQuestion(statement)) return { ok: false, reason: "question" };
+  if (/^[{\[]/.test(statement) && statement.includes('"')) return { ok: false, reason: "machine_output" };
+  if (/"[^"]{1,40}"\s*:/.test(statement)) return { ok: false, reason: "machine_output" };
+  return { ok: true };
+}
+function validateJudgedFact(fact) {
+  const statement = fact.statement.trim();
+  if (fact.kind === "artifact") return validateFact(fact);
+  if (statement.length < MIN_STATEMENT) return { ok: false, reason: "statement_too_short" };
+  if (statement.length > MAX_JUDGED_STATEMENT) return { ok: false, reason: "statement_too_long" };
+  if (/\*\*|__|`{2,}|^\s*[-*+]\s/.test(statement)) return { ok: false, reason: "markup_fragment" };
+  if (/^\s*\|.*\|\s*$/.test(statement)) return { ok: false, reason: "markup_fragment" };
+  if (/^[{\[]/.test(statement) && statement.includes('"')) return { ok: false, reason: "machine_output" };
+  if (/"[^"]{1,40}"\s*:/.test(statement)) return { ok: false, reason: "machine_output" };
+  if (isQuestion(statement)) return { ok: false, reason: "question" };
+  if (isPlannedNarration(statement)) return { ok: false, reason: "planned_narration" };
+  return { ok: true };
+}
+function makeArtifactFact(input) {
+  const preview = input.preview.trim();
+  return {
+    kind: "artifact",
+    subject: input.kindLabel,
+    predicate: "位于工件库",
+    value: input.hash,
+    statement: `${input.kindLabel}已存入工件库（${input.chars} 字符，hash=${input.hash}）${preview.length > 0 ? `：${preview}` : ""}`,
+    scope: "session",
+    origin: input.origin,
+    confidence: 0.95,
+    source: { sessionId: input.sessionId, turn: input.turn },
+    status: "active"
+  };
+}
+function makeFact(input) {
+  const raw = input.statement.trim().replace(/^[-*+\d.)\s]+/, "");
+  if (raw.length === 0) return null;
+  const loc = input.asLocation === true ? deriveLocation(raw) : null;
+  const claim = loc !== null ? { kind: "location", ...loc } : deriveClaim(raw, input.hint);
+  if (claim === null) {
+    const scope2 = TEMPORARY_MARKER.test(raw) ? "session" : "project";
+    return {
+      kind: input.hint ?? "statement",
+      subject: "",
+      predicate: "",
+      value: "",
+      statement: raw,
+      scope: scope2,
+      origin: input.origin,
+      confidence: input.confidence ?? 0.8,
+      source: { sessionId: input.sessionId, turn: input.turn },
+      status: "active",
+      enriched: false
+    };
+  }
+  const join4 = (left, right) => {
+    if (left.length === 0) return right;
+    const needSpace = /[A-Za-z0-9]$/.test(left) || /^[A-Za-z0-9]/.test(right);
+    return needSpace ? `${left} ${right}` : `${left}${right}`;
+  };
+  const head = join4(claim.subject, claim.predicate === "位于" ? "位于" : claim.predicate);
+  const statement = join4(head, claim.value);
+  const scope = TEMPORARY_MARKER.test(raw) ? "session" : "project";
+  return {
+    kind: claim.kind,
+    subject: claim.subject,
+    predicate: claim.predicate,
+    value: claim.value,
+    statement: statement.trim(),
+    scope,
+    origin: input.origin,
+    confidence: input.confidence ?? 0.8,
+    source: { sessionId: input.sessionId, turn: input.turn },
+    status: "active",
+    enriched: true
+  };
+}
+function renderFact(fact) {
+  return `[${KIND_LABEL[fact.kind]}] ${fact.statement}`;
+}
+function factKey(fact) {
+  const norm = (s) => s.replace(/[\s，。；：、！？"'`（）()]/g, "").toLowerCase();
+  const kind = fact.kind === "goal" ? "constraint" : fact.kind;
+  if (fact.predicate.length === 0) {
+    return `${kind}|statement|${norm(fact.statement ?? "")}`;
+  }
+  return `${kind}|${norm(fact.subject)}|${norm(fact.predicate)}`;
+}
+var MEMORY_TYPE = {
+  constraint: "preference",
+  goal: "preference",
+  decision: "decision",
+  conclusion: "fact",
+  location: "fact",
+  artifact: "fact",
+  statement: "fact",
+  fact: "fact"
+};
+var IMPORTANCE_BASE = {
+  constraint: 7,
+  goal: 7,
+  decision: 7,
+  location: 8,
+  artifact: 8,
+  conclusion: 6,
+  statement: 6,
+  fact: 5
+};
+function importanceOf(fact) {
+  let score = IMPORTANCE_BASE[fact.kind];
+  if (fact.origin === "user") score += 1;
+  if (fact.scope === "session") score -= 2;
+  if (fact.enriched === true) score += 1;
+  return Math.max(1, Math.min(10, score));
+}
+function factsToItems(facts) {
+  return facts.map((fact) => ({
+    content: renderFact(fact),
+    memory_type: MEMORY_TYPE[fact.kind],
+    tags: [fact.kind, "distilled", "lrc_schema", `scope:${fact.scope}`],
+    importance: importanceOf(fact),
+    source_turns: [fact.source.turn ?? 0, fact.source.turn ?? 0],
+    origin: fact.origin
+  }));
+}
+
+// src/memory-extract.ts
+var MAX_CLAUSE = 200;
+var ABS_PATH = /(?:^|[^A-Za-z0-9])((?:[A-Za-z]:[\\/]|\\\\)[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]*)/;
+var MEDIA_TOKEN = /[^\s，。；：、！？"'`（）()【】\[\]{}<>《》「」]+\.(?:wav|mp3|mp4|mov|avi|mkv|flac|m4a|aac|png|jpe?g|gif|webp|bmp)\b/i;
+var RESOURCE_NOUN = /(?:音频|视频|文案|脚本|素材|图片|封面|成片|录音|音乐|文件|目录)/;
+var TAG_KIND = /^(决策|约束|结论|决定|事实)\s*[：:]\s*/;
+function hintOf(head) {
+  switch (head) {
+    case "决策":
+      return "decision";
+    case "约束":
+      return "constraint";
+    case "结论":
+      return "conclusion";
+    case "事实":
+      return "statement";
+    default:
+      return "fact";
+  }
+}
+function splitClauses(text) {
+  const source = text.replace(/^\s*\|.*\|\s*$/gm, " ").replace(/^\s*#{1,6}\s.*$/gm, " ");
+  return source.split(/[。！？；\n]+|(?<=[A-Za-z0-9])\.\s+/).map((raw) => raw.trim().replace(/^[-*+\d.)\s]+/, "").trim()).filter((line) => line.length > 0 && line.length <= MAX_CLAUSE);
+}
+function isStructuralNoise(line) {
+  if (isSmallTalk(line)) return true;
+  if (isOptionLabel(line)) return true;
+  if (looksLikeNormalLog(line)) return true;
+  if (looksLikeMachineOutput(line)) return true;
+  if (/^\s{4,}|^(?:const|let|var|function|class|import|export|def|fn)\s/.test(line)) return true;
+  return false;
+}
+function pathLocations(text) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const m of text.matchAll(new RegExp(ABS_PATH.source, "g"))) {
+    const token = (m[1] ?? "").trim().replace(/[，。；：、]+$/, "");
+    if (token.length < 3) continue;
+    if (seen.has(token)) continue;
+    const after = text.slice((m.index ?? 0) + token.length, (m.index ?? 0) + token.length + 24);
+    const noun = RESOURCE_NOUN.exec(after);
+    if (noun === null) continue;
+    seen.add(token);
+    out.push({ subject: noun[0], value: token });
+  }
+  const media = MEDIA_TOKEN.exec(text);
+  if (media !== null && out.length === 0 && !seen.has(media[0])) {
+    const at = media.index ?? 0;
+    const window = text.slice(Math.max(0, at - 24), at + media[0].length + 24);
+    const noun = RESOURCE_NOUN.exec(window);
+    if (noun === null) return out;
+    out.push({ subject: noun[0], value: media[0] });
+  }
+  return out;
+}
+function extractFacts(input) {
+  const facts = [];
+  const rejected = [];
+  const pending = [];
+  const body0 = input.text.trim();
+  if (body0.length === 0) return { facts, rejected, pending };
+  const base = {
+    origin: input.origin,
+    sessionId: input.sessionId,
+    turn: input.turn
+  };
+  const tag = extractMemoryTag(body0);
+  if (tag !== null && !isNoUpdate(tag)) {
+    for (const raw of stripCodeFences(tag).split("\n")) {
+      const line = raw.trim().replace(/^[-*+]\s*/, "").trim();
+      if (line.length === 0) continue;
+      const head = TAG_KIND.exec(line);
+      const hint = head !== null ? hintOf(head[1]) : void 0;
+      const statement = head !== null ? line.slice(head[0].length).trim() : line;
+      const fact = makeFact({ statement, ...base, hint, confidence: 0.95 });
+      if (fact === null) {
+        rejected.push({ text: line, reason: "no_claim" });
+        continue;
+      }
+      const verdict = validateFact(fact);
+      if (!verdict.ok) {
+        rejected.push({ text: line, reason: verdict.reason });
+        continue;
+      }
+      facts.push(fact);
+    }
+  }
+  const body = stripMemoryTag(stripCodeFences(body0));
+  if (input.origin === "user") {
+    for (const loc of pathLocations(body)) {
+      const statement = `${loc.subject}位于 ${loc.value}`;
+      const fact = makeFact({ statement, ...base, asLocation: true, confidence: 0.9 });
+      if (fact === null) {
+        rejected.push({ text: statement, reason: "no_claim" });
+        continue;
+      }
+      const verdict = validateFact(fact);
+      if (!verdict.ok) {
+        rejected.push({ text: statement, reason: verdict.reason });
+        continue;
+      }
+      facts.push(fact);
+    }
+  }
+  for (const line of splitClauses(body)) {
+    if (isStructuralNoise(line)) {
+      rejected.push({ text: line, reason: "structural_noise" });
+      continue;
+    }
+    if (isProcessNarration(line, input.origin)) {
+      rejected.push({ text: line, reason: "process_narration" });
+      continue;
+    }
+    if (!isSelfContained(line)) {
+      rejected.push({ text: line, reason: "not_self_contained" });
+      continue;
+    }
+    let fact = null;
+    if (input.origin === "user") {
+      const loc = deriveLocation(line);
+      if (loc !== null) {
+        fact = makeFact({ statement: line, ...base, asLocation: true, confidence: 0.85 });
+      }
+      if (fact === null) {
+        const rebuttal = deriveRebuttal(line);
+        if (rebuttal !== null) {
+          fact = {
+            kind: "constraint",
+            subject: rebuttal.subject,
+            predicate: "已明确要求",
+            value: rebuttal.value,
+            statement: rebuttal.value,
+            scope: "project",
+            origin: "user",
+            confidence: 0.9,
+            source: { sessionId: input.sessionId, turn: input.turn },
+            status: "active",
+            enriched: true
+          };
+        }
+      }
+    }
+    if (fact === null) {
+      fact = makeFact({ statement: line, ...base, confidence: input.origin === "user" ? 0.9 : 0.85 });
+    }
+    if (fact === null) {
+      rejected.push({ text: line, reason: "no_claim" });
+      continue;
+    }
+    const verdict = validateFact(fact);
+    if (!verdict.ok) {
+      if (verdict.reason === "no_predicate" || verdict.reason === "no_value") {
+        pending.push(line);
+        continue;
+      }
+      rejected.push({ text: line, reason: verdict.reason });
+      continue;
+    }
+    facts.push(fact);
+  }
+  return { facts, rejected, pending };
+}
+function extractFactsFromReasoning(input) {
+  const result = extractFacts(input);
+  return {
+    facts: result.facts.map((fact) => ({ ...fact, confidence: Math.min(fact.confidence, 0.8) })),
+    rejected: result.rejected,
+    pending: result.pending
+  };
+}
+function factsFromLlmLines(lines, base) {
+  const facts = [];
+  const rejected = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.length === 0) continue;
+    const head = TAG_KIND.exec(line);
+    const hint = head !== null ? hintOf(head[1]) : void 0;
+    const statement = head !== null ? line.slice(head[0].length).trim() : line;
+    const fact = makeFact({ statement, ...base, hint, confidence: 0.7 });
+    if (fact === null) {
+      rejected.push({ text: line, reason: "no_claim" });
+      continue;
+    }
+    const verdict = validateJudgedFact(fact);
+    if (!verdict.ok) {
+      rejected.push({ text: line, reason: verdict.reason });
+      continue;
+    }
+    facts.push(fact);
+  }
+  return { facts, rejected, pending: [] };
+}
+function dedupeKey(fact) {
+  return maskPaths(fact.statement).replace(/\s+/g, "");
+}
+function dedupeFacts(incoming, existing, isNear) {
+  const fresh = [];
+  let dropped = 0;
+  for (const fact of incoming) {
+    const key = dedupeKey(fact);
+    const dup = fresh.some((f) => dedupeKey(f) === key || isNear(f.statement, fact.statement)) || existing.some((f) => dedupeKey(f) === key || isNear(f.statement, fact.statement));
+    if (dup) {
+      dropped += 1;
+      continue;
+    }
+    fresh.push(fact);
+  }
+  return { fresh, dropped };
+}
+
 // src/offloader.ts
 var DEFAULT_OFFLOAD_CONFIG = {
   turnsThreshold: 8,
@@ -1453,131 +2012,93 @@ var DEFAULT_OFFLOAD_CONFIG = {
   dedupThreshold: DEFAULT_DEDUP_THRESHOLD,
   recentWindow: 50
 };
-function buildSnapshot(items, maxItems) {
-  if (items.length === 0) return "";
-  const picked = pickDiverseSnapshot(items, maxItems);
+function keepPriority(fact) {
+  switch (fact.kind) {
+    case "location":
+    case "constraint":
+    case "goal":
+      return 0;
+    case "artifact":
+      return 0;
+    case "decision":
+      return 1;
+    case "conclusion":
+      return 2;
+    default:
+      return 3;
+  }
+}
+function buildSnapshot(facts, maxItems) {
+  if (facts.length === 0) return "";
+  const picked = pickDiverseSnapshot(facts, maxItems);
   if (picked.length === 0) return "";
   return `[LRC 状态] ${picked.join("；")}。细节在 LRC，需要时 recall。`;
 }
-function keepPriority(item) {
-  if (item.memory_type === "preference" || item.tags?.includes("constraint")) return 0;
-  if (isKeyResourceLocation(item.content, item.origin === "user")) return 0;
-  if (item.memory_type === "decision" || item.tags?.includes("decision")) return 1;
-  if (item.tags?.includes("conclusion")) return 2;
-  return 3;
-}
-function pickDiverseSnapshot(items, maxItems) {
-  if (items.length === 0 || maxItems <= 0) return [];
-  const rank = keepPriority;
+function pickDiverseSnapshot(facts, maxItems) {
+  if (facts.length === 0 || maxItems <= 0) return [];
   const groups = /* @__PURE__ */ new Map();
-  for (const item of items) {
-    const r = rank(item);
-    const list = groups.get(r) ?? [];
-    list.push(item);
-    groups.set(r, list);
+  for (const fact of facts) {
+    const rank = keepPriority(fact);
+    const list = groups.get(rank) ?? [];
+    list.push(fact);
+    groups.set(rank, list);
   }
-  const bodyOf = (item) => item.content.replace(/^\[[^\]]+\]\s*/, "").trim();
+  const bodyOf = (fact) => fact.statement.trim();
   const keyOf = (s) => s.replace(/[\s，。；：、！？（）()"'`*]/g, "");
   const picked = [];
   const pickedKeys = [];
   const cursor = /* @__PURE__ */ new Map();
-  const takeNext = (r) => {
-    const list = groups.get(r) ?? [];
-    let i = cursor.get(r) ?? 0;
+  const push = (fact) => {
+    const body = bodyOf(fact);
+    picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+    pickedKeys.push(keyOf(body));
+  };
+  const takeNext = (rank) => {
+    const list = groups.get(rank) ?? [];
+    let i = cursor.get(rank) ?? 0;
     while (i < list.length) {
-      const body = bodyOf(list[i]);
-      const key = keyOf(body);
+      const fact = list[i];
+      const key = keyOf(bodyOf(fact));
       i += 1;
       if (key.length === 0) continue;
       if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
-      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-      pickedKeys.push(key);
-      cursor.set(r, i);
+      push(fact);
+      cursor.set(rank, i);
       return true;
     }
-    cursor.set(r, i);
+    cursor.set(rank, i);
     return false;
   };
-  const takeMatching = (r, pred) => {
-    const list = groups.get(r) ?? [];
+  const takeMatching = (rank, pred) => {
+    const list = groups.get(rank) ?? [];
     const idx = list.findIndex(pred);
     if (idx < 0) return false;
-    const item = list[idx];
+    push(list[idx]);
     list.splice(idx, 1);
-    const body = bodyOf(item);
-    picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-    pickedKeys.push(keyOf(body));
     return true;
   };
   if (maxItems >= 3) {
-    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === "user"));
-    takeMatching(0, (i) => i.origin === "user" && !isKeyResourceLocation(i.content, true));
+    takeMatching(0, (f) => f.kind === "location");
+    takeMatching(0, (f) => f.kind === "artifact");
+    takeMatching(0, (f) => f.origin === "user" && f.kind !== "location" && f.kind !== "artifact");
   }
-  const order = [...groups.keys()].sort((a, b) => a - b);
-  const HIGH = order.filter((r) => r <= 1);
-  const LOW = order.filter((r) => r > 1);
+  const order2 = [...groups.keys()].sort((a, b) => a - b);
+  const HIGH = order2.filter((r) => r <= 1);
+  const LOW = order2.filter((r) => r > 1);
   let progress = true;
   while (picked.length < maxItems && progress) {
     progress = false;
-    for (const r of HIGH) {
+    for (const rank of HIGH) {
       if (picked.length >= maxItems) break;
-      if (takeNext(r)) progress = true;
+      if (takeNext(rank)) progress = true;
     }
   }
-  for (const r of [...LOW, ...HIGH]) {
+  for (const rank of [...LOW, ...HIGH]) {
     if (picked.length >= maxItems) break;
-    while (picked.length < maxItems && takeNext(r)) {
+    while (picked.length < maxItems && takeNext(rank)) {
     }
   }
   return picked;
-}
-var PROCESS_NARRATION2 = /接下来|下一步|我要|待确认|待验证|还需要|准备|打算|将要/;
-var COMPLETION_WORDS = /已完成|已确认|已验证|已修复|结论是|因此|所以|说明|表明/;
-function isProcessNarration(body) {
-  return PROCESS_NARRATION2.test(body) && !COMPLETION_WORDS.test(body);
-}
-function classifyTagLine(line) {
-  const head = /^(决策|约束|结论)\s*[：:]/.exec(line);
-  if (head !== null) {
-    const body2 = line.slice(head[0].length).trim();
-    switch (head[1]) {
-      case "约束":
-        return { kind: "约束", memoryType: "preference", tag: "constraint", importance: 7 };
-      case "决策":
-        return { kind: "决策", memoryType: "decision", tag: "decision", importance: 7 };
-      default:
-        if (isProcessNarration(body2)) {
-          return { kind: "事实", memoryType: "fact", tag: "fact", importance: 5 };
-        }
-        return { kind: "结论", memoryType: "fact", tag: "conclusion", importance: 6 };
-    }
-  }
-  const body = maskPaths(line);
-  if (/禁止|严禁|不得|不要|不能|切勿|杜绝|不允许|必须|约束|一律|统一为/.test(body)) {
-    return { kind: "约束", memoryType: "preference", tag: "constraint", importance: 7 };
-  }
-  if (/决策|决定|采用|改用|选型|定为|换成|改成/.test(body)) {
-    return { kind: "决策", memoryType: "decision", tag: "decision", importance: 7 };
-  }
-  return { kind: "结论", memoryType: "fact", tag: "conclusion", importance: 6 };
-}
-function itemsFromTag(tag) {
-  const items = [];
-  const lines = tag.split("\n");
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim().replace(/^[-*+]\s*/, "").trim();
-    if (line.length === 0) continue;
-    const { kind, memoryType, tag: tagName, importance } = classifyTagLine(line);
-    const body = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, "").trim();
-    items.push({
-      content: `[${kind}] ${body.length > 0 ? body : line}`,
-      memory_type: memoryType,
-      tags: [tagName, "distilled", "lrc_memory"],
-      importance,
-      source_turns: [i, i]
-    });
-  }
-  return items;
 }
 var Offloader = class {
   /**
@@ -1586,8 +2107,6 @@ var Offloader = class {
    * 为什么不是构造时写死：插件可能在 LRC 还没起来时加载（实测桌面端晚 20 分钟），
    * 此前的做法是整个 Offloader 都不创建 —— 连 `observe()` 的计数都不做，
    * 于是 LRC 恢复后，之前那些轮次的内容已经不在待沉淀队列里了。
-   *
-   * 现在计数器先跑起来，连接一旦就绪只需 `bind()`，不丢历史累计。
    */
   client;
   cursors;
@@ -1596,46 +2115,24 @@ var Offloader = class {
   pendingTurns = 0;
   pendingChars = 0;
   pendingSteps = 0;
-  /** 最近已发送的块，用于本地查重（跨会话共享，避免重复入库） */
+  /** 最近已发送的内容，用于本地查重（跨会话共享，避免重复入库） */
   recent = [];
   /**
    * 快照候选池（**跨批累积**，上限 20）。
    *
-   * ## 为什么必须跨批累积
-   *
-   * 实测（session-e1419190 回放，完全按真实调用时序）：
-   * ```
-   * 第 1 批 items=1 → [LRC 状态] 缓存必须放在工作区之外
-   * 第 2 批 items=1 → [LRC 状态] 网络直连失败，改用搜索      ← 第 1 批被覆盖
-   * 第 3 批 items=1 → [LRC 状态] 改用 --stdin 传入          ← 第 2 批被覆盖
-   * 第 4 批 items=1 → [LRC 状态] 改用 --file 传入
-   * ```
-   *
-   * `buildSnapshot` 只对**传入的那一批**排序。而真实调用每次都只传
-   * 当前这一条消息抽出的 1~2 条 —— 此时「按约束优先排序」在数学上
-   * 等于「原序」，与修复前的 `slice(0, maxItems)` 完全等价。
-   * 整场会话结束时，5 条关键约束全部丢失，只剩最后一条当轮内容。
-   *
-   * 累积后排序才真正有意义：约束能长期占据快照槽位，而不是被
-   * 下一条无关的过程记录顶掉。
+   * `buildSnapshot` 只对**传入的那一批**排序，而真实调用每次只传
+   * 当前这一条消息抽出的 1~2 条 —— 此时「按类别优先排序」在数学上
+   * 等于「原序」，整场会话结束时关键约束全被下一条过程记录顶掉。
    */
   snapshotPool = [];
-  /** 快照池上限：够覆盖「跨轮有效的约束」，又不至于让注入文本无限增长 */
   snapshotPoolMax = 20;
   /**
    * 池代次：会话切换时递增，用于丢弃**在飞**的旧会话沉淀结果。
    *
-   * ## 为什么光有 `snapshotGeneration` 不够
-   *
-   * 那个闸门在 `index.ts` 的 `.then` 回调里，只拦住 `saveSnapshot`。
-   * 但 `offloadItems()` **内部**就已经 `snapshotPool.push(...)` 了 ——
-   * 等闸门返回时池子早被改脏，无法撤销。
-   *
-   * 实测：A 发起 prose（migrate 200ms）→ 50ms 后切到 B 并 reset 池 →
-   * B 攒自己的约束 → A 的请求返回 ⇒ **B 的快照里混入 A 的私有约束**。
+   * 光有 `snapshotGeneration` 不够：那个闸门在 `index.ts` 的 `.then` 回调里，
+   * 而 `buildPooledSnapshot()` **内部**就改池子 —— 等闸门返回时池子早已被改脏。
    */
   poolEpoch = 0;
-  /** 累计统计（`lrc_status` 用） */
   flushCount = 0;
   totalWritten = 0;
   totalMerged = 0;
@@ -1650,28 +2147,16 @@ var Offloader = class {
     this.recentStore = recentStore;
     this.recent = recentStore?.load() ?? [];
   }
-  /** 连接是否已就绪。 */
   get connected() {
     return this.client !== null;
   }
-  /**
-   * 当前池代次（发起异步请求时先取一份，返回时比对）。
-   *
-   * 调用方必须在 `await` **之前**读它，否则读到的已是新代次，闸门形同虚设。
-   */
+  /** 当前池代次（发起异步请求时先取一份，返回时比对）。 */
   get epoch() {
     return this.poolEpoch;
   }
-  /**
-   * 注入 / 替换客户端。
-   *
-   * 传 `null` 表示连接已断：保留所有计数器与游标，
-   * 只停止发起 HTTP —— 恢复后可以接着从断点继续，不会重复也不会丢失。
-   */
   bind(client) {
     this.client = client;
   }
-  /** 取客户端（未连接时抛错，调用方负责先判 `connected`）。 */
   requireClient() {
     if (this.client === null) {
       throw new Error("LRC 尚未连接");
@@ -1680,10 +2165,9 @@ var Offloader = class {
   }
   /** 记录一轮新增文本（由 index.ts 在 assistant/message 事件里调用）。 */
   observe(text) {
-    const cleaned = hardFilter(text);
-    if (cleaned.trim().length === 0) return;
+    if (text.trim().length === 0) return;
     this.pendingTurns += 1;
-    this.pendingChars += cleaned.length;
+    this.pendingChars += text.length;
   }
   /**
    * 记录一步。
@@ -1694,7 +2178,6 @@ var Offloader = class {
   observeStep() {
     this.pendingSteps += 1;
   }
-  /** 是否达到卸载阈值。 */
   shouldOffload() {
     return this.pendingTurns >= this.config.turnsThreshold || this.pendingChars >= this.config.charsThreshold || this.pendingSteps >= this.config.stepsThreshold;
   }
@@ -1702,13 +2185,11 @@ var Offloader = class {
    * 是否有待沉淀内容（turn/end 兜底用）。
    *
    * 必须包含 `pendingSteps`：长任务里可能只有工具调用、没有正文，
-   * 此时步数阈值已经触发，但 turns/chars 都是 0。漏掉步数会让
-   * "88 步兜底"恰好在这类任务上失效。
+   * 此时步数阈值已经触发，但 turns/chars 都是 0。
    */
   hasPending() {
     return this.pendingTurns > 0 || this.pendingChars > 0 || this.pendingSteps > 0;
   }
-  /** 重置计数器（卸载成功或会话切换时调用）。 */
   resetCounters() {
     this.pendingTurns = 0;
     this.pendingChars = 0;
@@ -1727,40 +2208,45 @@ var Offloader = class {
   /**
    * 把新条目并入池子，再用**整个池子**生成快照。
    *
-   * 为什么不能只对新条目排序：真实调用每次只传 1~2 条，
-   * 此时排序退化为原序，约束照样被下一批过程记录顶掉（见 `snapshotPool`）。
-   *
-   * @param items - 本批新条目
-   * @param epoch - 发起请求时的池代次；与当前不一致说明会话已切换，
-   *                这批结果属于旧会话，**不得写入池子**（见 `poolEpoch`）
+   * @param facts - 本批新记忆
+   * @param epoch - 发起请求时的池代次；与当前不一致说明已切会话，
+   *                这批结果属旧会话，**不得写入池子**
    */
-  buildPooledSnapshot(items, epoch = this.poolEpoch) {
+  buildPooledSnapshot(facts, epoch = this.poolEpoch) {
     if (epoch !== this.poolEpoch) return "";
-    const seen = new Set(this.snapshotPool.map((i) => i.content.replace(/\s+/g, "")));
-    for (const item of items) {
-      const key = item.content.replace(/\s+/g, "");
+    const seen = new Set(this.snapshotPool.map((f) => f.statement.replace(/\s+/g, "")));
+    for (const fact of facts) {
+      const key = fact.statement.replace(/\s+/g, "");
       if (key.length === 0 || seen.has(key)) continue;
       seen.add(key);
-      this.snapshotPool.push(item);
+      this.snapshotPool.push(fact);
     }
     if (this.snapshotPool.length > this.snapshotPoolMax) {
-      const isHigh = (i) => keepPriority(i) <= 1;
+      const isHigh = (f) => keepPriority(f) <= 1;
       const pinned = [];
       const rest = [];
-      for (const item of this.snapshotPool) {
-        if (pinned.length < 2 && isKeyResourceLocation(item.content, item.origin === "user")) pinned.push(item);
-        else rest.push(item);
+      let pinnedLoc = 0;
+      let pinnedArtifact = 0;
+      for (const fact of this.snapshotPool) {
+        if (fact.kind === "location" && pinnedLoc < 2) {
+          pinned.push(fact);
+          pinnedLoc += 1;
+        } else if (fact.kind === "artifact" && pinnedArtifact < 1) {
+          pinned.push(fact);
+          pinnedArtifact += 1;
+        } else {
+          rest.push(fact);
+        }
       }
       const high = rest.filter(isHigh);
-      const low = rest.filter((i) => !isHigh(i));
+      const low = rest.filter((f) => !isHigh(f));
       const budget = Math.max(0, this.snapshotPoolMax - pinned.length);
-      const highKept = high.slice(-budget);
+      const highKept = budget > 0 ? high.slice(-budget) : [];
       const room = Math.max(0, budget - highKept.length);
       this.snapshotPool = room > 0 ? [...pinned, ...highKept, ...low.slice(-room)] : [...pinned, ...highKept];
     }
     return buildSnapshot([...this.snapshotPool].reverse(), this.config.snapshotItems);
   }
-  /** 累计沉淀统计（`lrc_status` 用）。 */
   stats() {
     return {
       flushCount: this.flushCount,
@@ -1773,7 +2259,6 @@ var Offloader = class {
       recentWindow: this.recent.length
     };
   }
-  /** 记录一次沉淀结果（只统计真正有产出的批次）。 */
   record(result) {
     this.totalDeduped += result.deduped;
     if (result.written === 0 && result.merged === 0) return;
@@ -1785,11 +2270,10 @@ var Offloader = class {
     this.lastFlushMerged = result.merged;
   }
   /**
-   * 执行一次卸载。
+   * 执行一次卸载：从 transcript 的新增切片提取记忆并落库。
    *
    * @param sessionId 会话 ID（游标按会话分槽）
    * @param lines 当前 transcript 的全部行
-   * @returns 卸载结果；没有新增内容时返回 null
    */
   async offload(sessionId, lines) {
     const epoch = this.poolEpoch;
@@ -1797,61 +2281,45 @@ var Offloader = class {
     const plain = lines.map((l) => typeof l === "string" ? l : l.text);
     const originOf = (i) => {
       const l = lines[i];
-      return typeof l === "string" ? void 0 : l.origin;
+      return typeof l === "string" ? "assistant" : l.origin ?? "assistant";
     };
     const slice = sliceByCursor(plain, state);
     if (slice.text.trim().length === 0) {
       this.resetCounters();
       return null;
     }
-    const newLines = plain.slice(slice.fromLine);
-    const taggedItems = [];
-    const untagged = [];
-    const untaggedOrigin = [];
-    for (let i = 0; i < newLines.length; i += 1) {
-      const message = newLines[i];
-      const origin = originOf(slice.fromLine + i);
-      const tag = extractMemoryTag(message);
-      if (tag !== null) {
-        if (!isNoUpdate(tag)) {
-          taggedItems.push(...itemsFromTag(tag).map((item) => origin === void 0 ? item : { ...item, origin }));
-        }
-        continue;
-      }
-      const cleaned = hardFilter(message);
-      if (cleaned.trim().length > 0) {
-        untagged.push(cleaned);
-        untaggedOrigin.push(origin);
-      }
+    const collected = [];
+    let charsSent = 0;
+    for (let i = slice.fromLine; i < plain.length; i += 1) {
+      const message = plain[i];
+      if (message.trim().length === 0) continue;
+      charsSent += message.length;
+      const result2 = extractFacts({
+        text: message,
+        origin: originOf(i),
+        sessionId,
+        turn: i
+      });
+      collected.push(...result2.facts);
     }
-    const freshTagged = [];
-    const freshBlocks = [];
-    const freshBlockOrigin = [];
-    let deduped = 0;
-    for (const item of taggedItems) {
-      const sameInBatch = freshTagged.some(
-        (f) => areNearDuplicate(f.content, item.content, this.config.dedupThreshold)
-      );
-      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+    const { fresh, dropped } = dedupeFacts(
+      collected,
+      [],
+      (a, b) => areNearDuplicate(a, b, this.config.dedupThreshold)
+    );
+    const kept = [];
+    let deduped = dropped;
+    for (const fact of fresh) {
+      if (isDuplicate(fact.statement, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
-      freshTagged.push(item);
+      kept.push(fact);
     }
-    for (let i = 0; i < untagged.length; i += 1) {
-      const block = untagged[i];
-      const sameInBatch = freshBlocks.some((f) => areNearDuplicate(f, block, this.config.dedupThreshold));
-      if (sameInBatch || isDuplicate(block, this.recent, this.config.dedupThreshold)) {
-        deduped += 1;
-        continue;
-      }
-      freshBlocks.push(block);
-      freshBlockOrigin.push(untaggedOrigin[i]);
-    }
-    if (freshTagged.length === 0 && freshBlocks.length === 0) {
+    if (kept.length === 0) {
       this.commitCursor(sessionId, plain, slice.fromLine);
       const empty = {
-        charsSent: 0,
+        charsSent,
         distilled: 0,
         written: 0,
         merged: 0,
@@ -1862,75 +2330,52 @@ var Offloader = class {
       this.record(empty);
       return empty;
     }
-    let items = [...freshTagged];
-    let charsSent = freshTagged.reduce((sum, item) => sum + item.content.length, 0);
-    if (freshBlocks.length > 0) {
-      const text = freshBlocks.join("\n");
-      charsSent += text.length;
-      const distilled = await this.requireClient().distill(
-        text,
-        this.config.project,
-        this.config.maxItems
-      );
-      const allUser = freshBlockOrigin.every((o) => o === "user");
-      const batchOrigin = allUser ? "user" : freshBlockOrigin.every((o) => o === "assistant") ? "assistant" : void 0;
-      items = [
-        ...items,
-        ...distilled.items.map((item) => batchOrigin === void 0 ? item : { ...item, origin: batchOrigin })
-      ];
-    }
-    let written = 0;
-    let merged = 0;
-    if (items.length > 0) {
-      const migrated = await this.requireClient().migrate(items, this.config.project);
-      written = migrated.written;
-      merged = migrated.merged;
-    }
+    const migrated = await this.requireClient().migrate(factsToItems(kept), this.config.project);
     this.commitCursor(sessionId, plain, slice.fromLine);
-    this.recent.push(...freshTagged.map((item) => item.content), ...freshBlocks);
+    this.recent.push(...kept.map((f) => f.statement));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
     }
     this.recentStore?.save(this.recent);
     const result = {
       charsSent,
-      distilled: items.length,
-      written,
-      merged,
+      distilled: kept.length,
+      written: migrated.written,
+      merged: migrated.merged,
       deduped,
-      snapshot: this.buildPooledSnapshot(items, epoch),
+      snapshot: this.buildPooledSnapshot(kept, epoch),
       reset: slice.reset
     };
     this.record(result);
     return result;
   }
   /**
-   * 直接沉淀一批已提炼的条目（**不走行游标**）。
+   * 直接沉淀一批已提取的记忆（**不走行游标**）。
    *
-   * 用于推理结论兜底：这些句子来自 reasoning 流，不在 transcript 行流里，
-   * 无法用行号游标追踪，只能按内容查重。查重窗口与主路径共用。
+   * 用于推理兜底与 LLM 补全：这些内容不在 transcript 行流里，
+   * 无法用行号游标追踪，只能按内容查重。
    *
-   * @param items 已分类的记忆条目
-   * @param options.intoPool - 是否把条目并入快照池。
-   *   **补写旧会话时必须传 `false`**：补写发生在切会话之后，
-   *   此时池子已经属于新会话，把旧会话的私有约束 push 进去会让
-   *   新会话下一次注入出现「B 的约束；A 会话私有：不要用 IDM」。
-   *   记忆本身仍要写进 LRC（`migrate`），只是不参与当前会话的快照。
-   * @returns 卸载结果；全部被查重拦下时返回零值结果
+   * @param options.intoPool - 是否并入快照池。**补写旧会话时必须传 `false`**：
+   *   补写发生在切会话之后，此时池子已属于新会话，push 进去会让新会话
+   *   下一次注入出现「B 的约束；A 会话私有：…」。
    */
-  async offloadItems(items, options = {}) {
+  async offloadFacts(facts, options = {}) {
     const epoch = this.poolEpoch;
-    const fresh = [];
-    let deduped = 0;
-    for (const item of items) {
-      const sameInBatch = fresh.some((f) => areNearDuplicate(f.content, item.content, this.config.dedupThreshold));
-      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+    const { fresh, dropped } = dedupeFacts(
+      facts,
+      [],
+      (a, b) => areNearDuplicate(a, b, this.config.dedupThreshold)
+    );
+    const kept = [];
+    let deduped = dropped;
+    for (const fact of fresh) {
+      if (isDuplicate(fact.statement, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
-      fresh.push(item);
+      kept.push(fact);
     }
-    if (fresh.length === 0) {
+    if (kept.length === 0) {
       const empty = {
         charsSent: 0,
         distilled: 0,
@@ -1943,19 +2388,19 @@ var Offloader = class {
       this.record(empty);
       return empty;
     }
-    const migrated = await this.requireClient().migrate(fresh, this.config.project);
-    this.recent.push(...fresh.map((item) => item.content));
+    const migrated = await this.requireClient().migrate(factsToItems(kept), this.config.project);
+    this.recent.push(...kept.map((f) => f.statement));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
     }
     this.recentStore?.save(this.recent);
     const result = {
-      charsSent: fresh.reduce((sum, item) => sum + item.content.length, 0),
-      distilled: fresh.length,
+      charsSent: kept.reduce((sum, f) => sum + f.statement.length, 0),
+      distilled: kept.length,
       written: migrated.written,
       merged: migrated.merged,
       deduped,
-      snapshot: options.intoPool === false ? "" : this.buildPooledSnapshot(fresh, epoch),
+      snapshot: options.intoPool === false ? "" : this.buildPooledSnapshot(kept, epoch),
       reset: false
     };
     this.record(result);
@@ -2037,9 +2482,6 @@ function userMessageText(event) {
 function isRealUserMessage(event) {
   return isRealUserEvent(event);
 }
-function hasUserConstraint(text) {
-  return hasConstraintMarker(text);
-}
 function linesWithOrigin(session) {
   const log = session?.log;
   if (!Array.isArray(log)) return [];
@@ -2054,7 +2496,6 @@ function linesWithOrigin(session) {
       if (!isRealUserMessage(event)) continue;
       const text = textBlocksOnly(event.data?.content);
       if (text.length === 0) continue;
-      if (!hasUserConstraint(text) && !carriesResourceLocation(text)) continue;
       lines.push({ text, origin: "user" });
     }
   }
@@ -2213,9 +2654,16 @@ function oneLine(text, max) {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
-function collect(target, seen, line, limit) {
-  if (target.length >= limit) return;
+function splitSentences(text) {
+  return text.split(/[\n。！？；]+/).map((line) => line.trim().replace(/^[-*+\d.)\s|#]+/, "").trim()).filter((line) => line.length > 0);
+}
+function collect(target, seen, line, limit, options = {}) {
   if (line.length === 0 || seen.has(line)) return;
+  if (target.length >= limit) {
+    if (options.keepNewest !== true) return;
+    const evicted = target.shift();
+    if (evicted !== void 0) seen.delete(evicted);
+  }
   seen.add(line);
   target.push(line);
 }
@@ -2237,6 +2685,16 @@ var NOISE_PREFIXES = [
   // 每轮 prepare 时宿主采样时间并注入，同样伪装成 role:'user'
   "Time sampled while preparing",
   "Browser time zone for this request:",
+  // ## 后台任务通知（`source.kind === 'tool-jobs'`）不是用户发言（★2026-11-15）
+  //
+  // 实测最新摘要的「用户请求」首条是：
+  // ```
+  // - background job pwsh-2b002cc2420941a9 (pwsh: cd H:\xjz; node server/src/index.js) finished …
+  // ```
+  // 这是宿主报告后台命令结束的注入，与用户意图无关，却占了仅有的
+  // 12 个请求槽位之一。`source.kind` 已能识别，但摘要采集只看内容，
+  // 所以这里补前缀兜底（两条通道都要拦，不能只靠 kind）。
+  "background job ",
   "## 已裁剪的历史",
   "### 用户请求",
   "### 工具调用与结果",
@@ -2252,9 +2710,9 @@ function isNoiseText(text) {
   return NOISE_PREFIXES.some((p) => head.startsWith(p));
 }
 function isProcessNarration2(text) {
-  if (!/接下来|下一步|我要|待确认|待验证|还需要|准备|打算|将要/.test(text)) return false;
-  return !/已完成|已确认|已验证|已修复|结论是|因此|所以|说明|表明/.test(text);
+  return isProcessNarration(text, "assistant");
 }
+var ASSISTANT_PROSE_MARKER = /!\[[^\]]*\]\([^)]*\)/;
 function absorbPriorSummary(text, buckets, seen) {
   const limits = { requests: 8, calls: 20, errors: 10, conclusions: 10 };
   let section;
@@ -2275,26 +2733,35 @@ function absorbPriorSummary(text, buckets, seen) {
     if (!line.startsWith("- ")) continue;
     const body = line.slice(2);
     if (isNoiseText(body)) continue;
+    if (section === "requests" && ASSISTANT_PROSE_MARKER.test(body)) continue;
     collect(buckets[section], seen, `- ${body}`, limits[section]);
   }
 }
 function isConversationRole(role) {
   return role === "user" || role === "assistant" || role === void 0;
 }
+var CONCLUSION_SLOTS = 15;
+var PRUNE_CONCLUSION_LIMIT = 10;
 function isConclusionRole(role) {
   return role === "assistant" || role === void 0;
 }
-function buildDeterministicSummary(messages, maxChars, realCounts) {
+function buildDeterministicSummary(messages, maxChars, realCounts, facts) {
+  const max = typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars > 0 ? maxChars : 4e3;
   const requests = [];
   const calls = [];
   const errors = [];
   const conclusions = [];
+  const pruneConclusions = [];
+  const pruneSeen = /* @__PURE__ */ new Set();
   const seen = /* @__PURE__ */ new Set();
+  const requestSeen = /* @__PURE__ */ new Set();
   const priorSummaries = [];
   for (const raw of messages) {
     const message = raw;
     const content = message?.content;
     if (!Array.isArray(content)) continue;
+    const prunedByLrc = message.source?.kind === "lrc-prune";
+    if (message.source?.kind === "tool-jobs") continue;
     if (message.role === "tool") {
       const text2 = textOf(content);
       if (text2.length > 0) {
@@ -2311,12 +2778,24 @@ function buildDeterministicSummary(messages, maxChars, realCounts) {
           priorSummaries.push(b.text);
           continue;
         }
-        if (isNoiseText(b.text)) continue;
+        if (!prunedByLrc && isNoiseText(b.text)) continue;
         if (!isConversationRole(message.role)) continue;
         const line = oneLine(b.text, 300);
-        if (message.role === "user") collect(requests, seen, `- ${line}`, 12);
-        else if (isConclusionRole(message.role) && !isProcessNarration2(b.text)) {
-          collect(conclusions, seen, `- ${line}`, 15);
+        if (message.role === "user" && !prunedByLrc) {
+          collect(requests, requestSeen, `- ${line}`, 12, { keepNewest: true });
+        } else if ((isConclusionRole(message.role) || prunedByLrc) && (facts === void 0 || prunedByLrc)) {
+          const bucket = prunedByLrc ? pruneConclusions : conclusions;
+          const limit = prunedByLrc ? PRUNE_CONCLUSION_LIMIT : CONCLUSION_SLOTS;
+          const seenForBucket = prunedByLrc ? pruneSeen : seen;
+          if (!prunedByLrc) {
+            if (isProcessNarration2(b.text)) continue;
+            collect(bucket, seenForBucket, `- ${line}`, limit);
+          } else {
+            for (const clause of splitSentences(b.text)) {
+              if (isProcessNarration2(clause)) continue;
+              collect(bucket, seenForBucket, `- ${oneLine(clause, 300)}`, limit, { keepNewest: true });
+            }
+          }
         }
       } else if (b?.type === "tool-call") {
         const name2 = typeof b.name === "string" ? b.name : "tool";
@@ -2330,6 +2809,20 @@ function buildDeterministicSummary(messages, maxChars, realCounts) {
       }
     }
   }
+  if (facts !== void 0) {
+    for (let i = facts.length - 1; i >= 0; i -= 1) {
+      const fact = facts[i];
+      if (fact.status !== void 0 && fact.status !== "active") continue;
+      if (fact.kind !== "constraint" && fact.kind !== "decision" && fact.kind !== "conclusion" && fact.kind !== "statement") {
+        continue;
+      }
+      collect(conclusions, seen, `- ${oneLine(fact.statement, 300)}`, CONCLUSION_SLOTS);
+    }
+  }
+  for (let i = pruneConclusions.length - 1; i >= 0; i -= 1) {
+    if (conclusions.length >= CONCLUSION_SLOTS) break;
+    collect(conclusions, seen, pruneConclusions[i], CONCLUSION_SLOTS);
+  }
   if (realCounts !== void 0) {
     realCounts.requests = requests.length;
     realCounts.conclusions = conclusions.length;
@@ -2338,6 +2831,10 @@ function buildDeterministicSummary(messages, maxChars, realCounts) {
   }
   for (let i = priorSummaries.length - 1; i >= 0; i -= 1) {
     absorbPriorSummary(priorSummaries[i], { requests, calls, errors, conclusions }, seen);
+  }
+  if (conclusions.length === 0) {
+    const cutCount = Array.isArray(messages) ? messages.length : 0;
+    conclusions.push(`（本段无可用结论：已裁 ${cutCount} 条消息）`);
   }
   const all = [
     { title: "### 用户请求", lines: requests, weight: 3 },
@@ -2351,16 +2848,16 @@ function buildDeterministicSummary(messages, maxChars, realCounts) {
     return out.join("\n");
   };
   let text = render(all);
-  if (text.length <= maxChars) return text;
+  if (text.length <= max) return text;
   const working = all.map((s) => ({ ...s, lines: [...s.lines] }));
-  while (text.length > maxChars) {
+  while (text.length > max) {
     const target = working.filter((s) => s.lines.length > 0).sort((a, b) => a.weight - b.weight)[0];
     if (!target) break;
     target.lines.pop();
     text = render(working.filter((s) => s.lines.length > 0));
   }
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars - 1)}…`;
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
 }
 function summaryStats(text, realCounts) {
   const counts = { requests: 0, conclusions: 0, errors: 0, calls: 0 };
@@ -2378,7 +2875,11 @@ function summaryStats(text, realCounts) {
     }
     if (section !== void 0 && line.startsWith("- ")) counts[section] += 1;
   }
-  const part = (label, total, real) => real !== void 0 && real !== total ? `${label} ${total}（真实 ${real}）` : `${label} ${total}`;
+  const part = (label, total, real) => {
+    if (real === void 0 || real === total) return `${label} ${total}`;
+    if (real > total) return `${label} ${total}(截断自 ${real})`;
+    return `${label} ${total}(${real}新+${total - real}继承)`;
+  };
   return `${part("请求", counts.requests, realCounts?.requests)} / ${part("结论", counts.conclusions, realCounts?.conclusions)} / ${part("错误", counts.errors, realCounts?.errors)} / ${part("调用", counts.calls, realCounts?.calls)}`;
 }
 function meterOf(engine, ctx) {
@@ -2647,7 +3148,7 @@ async function trimContext(deps) {
       }
     }
     const cap = Math.max(200, Math.min(options.maxSummaryChars, Math.floor(sourceChars / 4)));
-    const text = buildDeterministicSummary(list, cap, summaryRealCounts);
+    const text = buildDeterministicSummary(list, cap, summaryRealCounts, options.facts);
     summaryChars = text.length;
     summaryText = text;
     return {
@@ -2808,8 +3309,513 @@ async function createHandoffSession(deps) {
   return { ok: false, mode: "text-only", text, reason: "sessions-unavailable" };
 }
 
-// src/capabilities.ts
+// src/handoff-projection.ts
+var MAX_PER_SECTION = 12;
+var MAX_LINE = 160;
+function weightOf(fact) {
+  switch (fact.kind) {
+    case "constraint":
+      return 0;
+    case "goal":
+      return 1;
+    case "decision":
+      return 2;
+    case "conclusion":
+      return 3;
+    case "location":
+      return 4;
+    case "artifact":
+      return 5;
+    default:
+      return 6;
+  }
+}
+function oneLine2(text) {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > MAX_LINE ? `${flat.slice(0, MAX_LINE)}…` : flat;
+}
+function unique(lines) {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const line of lines) {
+    const key = line.replace(/[\s，。；：、]/g, "");
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+  }
+  return out;
+}
+function order(facts) {
+  const indexed = facts.map((fact, index) => ({ fact, index }));
+  indexed.sort((a, b) => {
+    const byWeight = weightOf(a.fact) - weightOf(b.fact);
+    if (byWeight !== 0) return byWeight;
+    return b.index - a.index;
+  });
+  return indexed.map((entry) => entry.fact);
+}
+function buildHandoffSections(input) {
+  const ordered = order(input.facts.filter((f) => f.status === "active"));
+  const confirmed = unique(
+    ordered.filter((f) => f.kind === "constraint" || f.kind === "decision" || f.kind === "conclusion").map((f) => `${KIND_LABEL[f.kind]}：${oneLine2(f.statement)}`)
+  ).slice(0, MAX_PER_SECTION);
+  const progress = unique(
+    ordered.filter((f) => f.kind === "location" || f.kind === "artifact").map((f) => oneLine2(f.statement))
+  ).slice(0, MAX_PER_SECTION);
+  const next = unique(
+    ordered.filter((f) => f.kind === "goal" || f.kind === "constraint").map((f) => oneLine2(f.statement))
+  ).slice(0, MAX_PER_SECTION);
+  return {
+    task: oneLine2(input.task),
+    confirmed,
+    progress,
+    next,
+    note: (input.note ?? "").trim()
+  };
+}
+function renderHandoff(sections) {
+  const out = ["# 会话交接", ""];
+  out.push("## 当前任务");
+  out.push(sections.task.length > 0 ? sections.task : "（未记录）");
+  out.push("");
+  const list = (title, lines) => {
+    out.push(`## ${title}`);
+    if (lines.length === 0) out.push("（无）");
+    else for (const line of lines) out.push(`- ${line}`);
+    out.push("");
+  };
+  list("已确认事实", sections.confirmed);
+  list("当前进展", sections.progress);
+  list("下一步意图", sections.next);
+  if (sections.note.length > 0) {
+    out.push("## 补充说明");
+    out.push(sections.note);
+    out.push("");
+  }
+  out.push("---");
+  out.push("原文与长文档在 LRC / 工件库，需要时用 `lrc_recall` 或 `lrc_fetch_artifact` 取回。");
+  return out.join("\n");
+}
+function projectHandoff(input) {
+  const sections = buildHandoffSections(input);
+  return { text: renderHandoff(sections), sections };
+}
+
+// src/artifact-store.ts
+import { createHash as createHash3 } from "node:crypto";
+import { existsSync as existsSync3, mkdirSync as mkdirSync3, readdirSync, readFileSync as readFileSync3, statSync as statSync2, unlinkSync, utimesSync as utimesSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname2, join as join2 } from "node:path";
+var MIN_ARTIFACT_CHARS = 8e3;
+var MAX_ARTIFACT_CHARS = 2e6;
+var DEFAULT_QUOTA_BYTES = 200 * 1024 * 1024;
+function hashContent(text) {
+  return createHash3("sha256").update(text, "utf8").digest("hex").slice(0, 16);
+}
+function isArtifactWorthy(text, minChars = MIN_ARTIFACT_CHARS) {
+  return text.trim().length >= minChars;
+}
+function previewOf(text) {
+  const firstLine = text.split("\n").map((l) => l.replace(/^[#>\-*+\s]+/, "").trim()).find((l) => l.length > 0) ?? "";
+  const flat = firstLine.replace(/\s+/g, " ").trim();
+  return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
+}
+var ArtifactStore = class {
+  root;
+  quotaBytes;
+  index = null;
+  constructor(root, quotaBytes = DEFAULT_QUOTA_BYTES) {
+    this.root = root;
+    this.quotaBytes = typeof quotaBytes === "number" && Number.isFinite(quotaBytes) && quotaBytes > 0 ? Math.floor(quotaBytes) : DEFAULT_QUOTA_BYTES;
+  }
+  indexPath() {
+    return join2(this.root, "index.json");
+  }
+  bodyPath(hash) {
+    return join2(this.root, `${hash}.txt`);
+  }
+  /** 载入索引（文件损坏时按空索引处理，不阻断主流程）。 */
+  load() {
+    if (this.index !== null) return this.index;
+    try {
+      if (existsSync3(this.indexPath())) {
+        const parsed = JSON.parse(readFileSync3(this.indexPath(), "utf8"));
+        this.index = parsed !== null && typeof parsed === "object" ? parsed : {};
+      } else {
+        this.index = {};
+      }
+    } catch {
+      this.index = {};
+    }
+    return this.index;
+  }
+  persist() {
+    try {
+      mkdirSync3(dirname2(this.indexPath()), { recursive: true });
+      writeFileSync3(this.indexPath(), JSON.stringify(this.load(), null, 2), "utf8");
+    } catch {
+    }
+  }
+  /**
+   * 落盘一份工件。
+   *
+   * @param text - 原文
+   * @returns 元数据；`reused` 为 true 表示 hash 已存在、未重复写盘
+   */
+  store(text) {
+    const body = text.length > MAX_ARTIFACT_CHARS ? text.slice(0, MAX_ARTIFACT_CHARS) : text;
+    const hash = hashContent(body);
+    const index = this.load();
+    const existing = index[hash];
+    if (existing !== void 0) {
+      this.touch(hash);
+      return { meta: existing, reused: true };
+    }
+    const meta = {
+      hash,
+      chars: body.length,
+      preview: previewOf(body),
+      createdAt: Date.now()
+    };
+    try {
+      mkdirSync3(this.root, { recursive: true });
+      writeFileSync3(this.bodyPath(hash), body, "utf8");
+    } catch {
+    }
+    index[hash] = meta;
+    this.persist();
+    this.evictIfNeeded();
+    return { meta, reused: false };
+  }
+  /** 取回原文；不存在或已被淘汰时返回 null。 */
+  fetch(hash) {
+    const index = this.load();
+    if (index[hash] === void 0) return null;
+    try {
+      const body = readFileSync3(this.bodyPath(hash), "utf8");
+      this.touch(hash);
+      return body;
+    } catch {
+      return null;
+    }
+  }
+  /** 是否存在。 */
+  has(hash) {
+    return this.load()[hash] !== void 0;
+  }
+  /** 元数据（不存在返回 null）。 */
+  meta(hash) {
+    return this.load()[hash] ?? null;
+  }
+  /** 全部工件（按写入时间从新到旧）。 */
+  list() {
+    return Object.values(this.load()).sort((a, b) => b.createdAt - a.createdAt);
+  }
+  /** 刷新访问时间（LRU 用）。失败静默。 */
+  touch(hash) {
+    try {
+      const path = this.bodyPath(hash);
+      if (existsSync3(path)) {
+        const now = /* @__PURE__ */ new Date();
+        utimesSync2(path, now, now);
+      }
+    } catch {
+    }
+  }
+  /** 当前占用字节数（按实际文件大小，不是字符数）。 */
+  usageBytes() {
+    try {
+      if (!existsSync3(this.root)) return 0;
+      let total = 0;
+      for (const name2 of readdirSync(this.root)) {
+        if (!name2.endsWith(".txt")) continue;
+        try {
+          total += statSync2(join2(this.root, name2)).size;
+        } catch {
+        }
+      }
+      return total;
+    } catch {
+      return 0;
+    }
+  }
+  /**
+   * 超额时按**最旧访问时间**淘汰，直到回到配额内。
+   *
+   * 用访问时间而不是写入时间：一个很早写入、但今天还在被取回的工件，
+   * 比上周写入、再也没碰过的更值得保留。
+   */
+  evictIfNeeded() {
+    let usage = this.usageBytes();
+    if (usage <= this.quotaBytes) return;
+    const index = this.load();
+    const candidates = Object.values(index).map((meta) => {
+      let atimeMs = meta.createdAt;
+      try {
+        atimeMs = statSync2(this.bodyPath(meta.hash)).atimeMs;
+      } catch {
+      }
+      return { meta, atimeMs };
+    }).sort((a, b) => a.atimeMs - b.atimeMs);
+    for (const { meta } of candidates) {
+      if (usage <= this.quotaBytes) break;
+      try {
+        const path = this.bodyPath(meta.hash);
+        const size = existsSync3(path) ? statSync2(path).size : 0;
+        if (existsSync3(path)) unlinkSync(path);
+        delete index[meta.hash];
+        usage -= size;
+      } catch {
+      }
+    }
+    this.persist();
+  }
+};
+
+// src/llm-extract.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
+var MAX_INPUT_CHARS = 6e3;
+var MAX_OUTPUT_TOKENS = 1200;
+var MAX_JUDGE_CANDIDATES = 200;
+var CALL_TIMEOUT_MS = 45e3;
+var SYSTEM_PROMPT = [
+  "你是记忆提取器。从用户提供的对话片段中挑出「值得跨会话复用」的信息，只输出 JSON。",
+  "",
+  "## 判断标准（这是唯一标准）",
+  "",
+  "问自己一个问题：**一个完全没看过这段对话的人，读到这句话能获得有用信息吗？**",
+  "",
+  "能 ⇒ 记。不能 ⇒ 不记。",
+  "",
+  "值得记的典型形态（不限于这些，措辞可以任意）：",
+  "- 对某事物的判断、评价、定性",
+  "- 已经查清的原因、机制、结果",
+  "- 已定下来的做法、选型、约定",
+  "- 对后续有强制力的规则",
+  "- 可验收的量化目标",
+  "- 某对象是什么 / 包含什么 / 在哪",
+  "",
+  "不值得记的：",
+  "- 应答与确认（是的、明白了、好的）",
+  "- 讲自己刚才/接下来在做什么（我先看一下、已经读完了、下面开始）",
+  "- 指代不明、脱离上下文看不懂的句子（这个是刚才那个文件、这样的话就只能重写了）",
+  "- 代码、表格行、JSON、日志",
+  "- 纯粹的过渡句与章节标题",
+  "",
+  "## 输出格式（严格）",
+  "",
+  '{"items":[{"kind":"<类别>","text":"<一句话陈述>"}]}',
+  "",
+  "类别取值（选最贴合的一个）：",
+  "- constraint：有强制力的规则",
+  "- decision：定下来的做法",
+  "- conclusion：查清的原因/结果",
+  "- goal：量化目标",
+  "- scope：范围约定",
+  "- statement：定义、属性、构成、位置",
+  "",
+  "## 硬性要求",
+  "",
+  "1. text 必须自足：把这句话单独发给别人，他能看懂在说什么。",
+  "2. text 保留原文的**判断与限定**（「比多数开源 agent 认真」这样的程度词不要丢）。",
+  "3. 不要加「结论：」这类前缀，只写内容本身。",
+  '4. 没有值得记的就输出 {"items":[]}。',
+  "5. 最多 12 条，按重要性排序。"
+].join("\n");
+var JUDGE_PROMPT = [
+  "你是记忆筛选器。用户会给出一批**从对话里切出的候选句**，你只判断哪些值得保留。",
+  "",
+  "## 唯一的判断标准",
+  "",
+  "问自己：**一个完全没看过这段对话的人，读到这句话能获得有用信息吗？**",
+  "",
+  "能 ⇒ 保留。不能 ⇒ 丢掉。",
+  "",
+  "## 保留（true）",
+  "- 判断、评价、定性：`分层极其干净，改造成本低`",
+  "- 查清的原因、机制、结果：`根因是旧进程没有随会话退出`",
+  "- 定下来的做法：`改用 --stdin 传入 JSON`",
+  "- 有强制力的规则：`以后都不要碰 3099`",
+  "- 量化目标：`握手耗时压到 200ms 以内`",
+  "- 对象的定义、属性、构成：`这个仓库收录了 443 个项目`",
+  "",
+  "## 丢弃（false）",
+  "- 应答确认：`是的，我明白了` / `好的`",
+  "- 自述步骤：`我先看一下这个文件` / `代码已全部读完，结论如下`",
+  "- 指代不明、脱离上下文看不懂：`这个是刚才那个文件` / `这样的话就只能重写了`",
+  "- 过渡与标题：`## 二、优点` / `下面分三点说`",
+  "- 代码、表格行、JSON、日志片段",
+  "",
+  "## 输出格式（严格）",
+  "",
+  "只保留判为 true 的句子，**原样复制**，一个字都不要改：",
+  '{"items":[{"kind":"statement","text":"<原句>"}]}',
+  "",
+  "kind 取值：constraint / decision / conclusion / goal / scope / statement",
+  "",
+  "## 硬性要求",
+  "1. text 必须与候选句**完全一致**（不改写、不缩写、不补全）。",
+  '2. 没有值得保留的就输出 {"items":[]}。',
+  "3. 最多 12 条，优先保留信息密度高的。"
+].join("\n");
+var KIND_PREFIX = {
+  constraint: "约束",
+  decision: "决策",
+  conclusion: "结论",
+  goal: "约束",
+  scope: "约束",
+  // ## 必须与 `memory-extract.ts` 的 `TAG_KIND` 对齐
+  //
+  // 这里只是「行前缀」，真正决定类别的是 `factsFromLlmLines` 里的
+  // `hintOf`。若两边不一致（例如这里给「事实」而 TAG_KIND 不认识），
+  // 前缀会被当成正文，hint 丢失 ⇒ 陈述句退化成「随便命中的第一个谓词」。
+  statement: "事实"
+};
+var CHARS_PER_EXPECTED_ITEM = 1200;
+var ABSOLUTE_MIN_CHARS = 24;
+var CAUSAL_SIGNAL = /根因|根本原因|原因在于|问题出在|问题在于|定位到|最终确认|结论是|结论为|确定为|查明|真相是/;
+var DECISION_SIGNAL = /决定|决策|采用|改用|换成|改成|定为|选型|就用|方案是|最终选/;
+var GOAL_SIGNAL = /(?:压|降|控制|限制)(?:到|至)\s*[0-9]|(?:不超过|不低于|不少于|不大于|不小于)\s*[0-9]|[0-9][0-9.]*\s*(?:ms|毫秒|秒|分钟|元|块|%|％|倍|MB|GB|KB|TB)\s*(?:以下|以内|内)/;
+function missingKinds(text, extracted, extractedKinds) {
+  const missing = [];
+  const hasOf = (kind, prefix) => extractedKinds !== void 0 ? extractedKinds.includes(kind) : extracted.some((line) => line.startsWith(prefix));
+  if (CAUSAL_SIGNAL.test(text) && !hasOf("conclusion", "结论：")) missing.push("结论");
+  if (DECISION_SIGNAL.test(text) && !hasOf("decision", "决策：")) missing.push("决策");
+  const goalCovered = (extractedKinds?.includes("goal") ?? false) || extracted.some((line) => GOAL_SIGNAL.test(line));
+  if (GOAL_SIGNAL.test(text) && !goalCovered) {
+    missing.push("目标");
+  }
+  return missing;
+}
+function shouldFallbackToLlm(input) {
+  if (!input.enabled) return false;
+  const pendingCount = input.pending?.length ?? 0;
+  const chars = pendingCount > 0 ? input.pending.reduce((sum, line) => sum + line.length, 0) : input.text.trim().length;
+  const materialChars = Math.max(chars, input.text.trim().length);
+  const extractedCount = input.extracted.length;
+  if (materialChars < ABSOLUTE_MIN_CHARS) return false;
+  if (input.maxCalls > 0 && input.usedCalls >= input.maxCalls) return false;
+  if (input.minIntervalMs > 0 && input.sinceLastMs < input.minIntervalMs) return false;
+  const globalMax = input.globalMaxCalls ?? 0;
+  if (globalMax > 0 && (input.globalCalls ?? 0) >= globalMax) return false;
+  if (pendingCount > 0) return true;
+  if (missingKinds(input.text, input.extracted, input.extractedKinds).length > 0) return true;
+  if (chars < Math.max(1, input.minChars)) return false;
+  if (extractedCount === 0) return true;
+  const expected = Math.ceil(chars / CHARS_PER_EXPECTED_ITEM);
+  return extractedCount < expected;
+}
 function safeGet3(ctx, name2) {
+  try {
+    return ctx?.get?.(name2);
+  } catch {
+    return void 0;
+  }
+}
+function collectText(chunks) {
+  const byIndex = /* @__PURE__ */ new Map();
+  let finishKind = "unknown";
+  for (const raw of chunks) {
+    const chunk = raw;
+    if (chunk.type === "text-delta" && typeof chunk.text === "string") {
+      const index = typeof chunk.index === "number" ? chunk.index : 0;
+      byIndex.set(index, (byIndex.get(index) ?? "") + chunk.text);
+    } else if (chunk.type === "block-end" && chunk.block?.type === "text") {
+      const index = typeof chunk.index === "number" ? chunk.index : 0;
+      if (!byIndex.has(index) && typeof chunk.block.text === "string") {
+        byIndex.set(index, chunk.block.text);
+      }
+    } else if (chunk.type === "finish") {
+      finishKind = typeof chunk.reason?.kind === "string" ? chunk.reason.kind : "unknown";
+    }
+  }
+  const text = [...byIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, value]) => value).join("");
+  return { text, finishKind };
+}
+function parseItems(raw) {
+  const withoutFence = raw.replace(/```(?:json)?/gi, "");
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+  if (start < 0 || end <= start) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(withoutFence.slice(start, end + 1));
+  } catch {
+    return [];
+  }
+  const items = parsed?.items;
+  if (!Array.isArray(items)) return [];
+  const out = [];
+  for (const item of items) {
+    const rec = item;
+    const kind = typeof rec.kind === "string" ? rec.kind.trim().toLowerCase() : "";
+    const text = typeof rec.text === "string" ? rec.text.trim() : "";
+    if (text.length < 4 || text.length > 500) continue;
+    out.push({ kind: KIND_PREFIX[kind] === void 0 ? "conclusion" : kind, text });
+  }
+  return out;
+}
+async function extractWithLlm(ctx, session, text, options = {}) {
+  const maxInputChars = options.maxInputChars ?? MAX_INPUT_CHARS;
+  const timeoutMs = options.timeoutMs ?? CALL_TIMEOUT_MS;
+  const body = text.trim();
+  if (body.length === 0) return [];
+  const config = session?.requestHeader?.()?.config;
+  const provider = typeof config?.provider === "string" ? config.provider : "";
+  const model = typeof config?.model === "string" ? config.model : "";
+  if (provider.length === 0 || model.length === 0) return [];
+  const llm = safeGet3(ctx, "llm");
+  if (typeof llm?.stream !== "function") return [];
+  const body2 = body.length > maxInputChars ? body.slice(-maxInputChars) : body;
+  const candidates = options.candidates ?? [];
+  const useJudge = candidates.length > 0;
+  const input = useJudge ? candidates.slice(0, MAX_JUDGE_CANDIDATES).map((line, index) => `${index + 1}. ${line}`).join("\n") : body2;
+  const system = useJudge ? JUDGE_PROMPT : SYSTEM_PROMPT;
+  const messages = [
+    {
+      id: randomUUID2(),
+      role: "user",
+      content: [{ type: "text", text: input }],
+      source: { kind: "plugin", plugin: "dsh-plugin-lrc" }
+    }
+  ];
+  const collected = [];
+  try {
+    const stream = llm.stream({
+      provider,
+      model,
+      messages,
+      system,
+      maxTokens: MAX_OUTPUT_TOKENS,
+      temperature: 0,
+      // `purpose` 只接受宿主已声明的枚举值（compaction / session-title），
+      // 传未知值可能被适配器拒绝，故不设。
+      signal: AbortSignal.timeout(timeoutMs),
+      sessionId: session?.id
+    });
+    for await (const chunk of stream) collected.push(chunk);
+  } catch (error) {
+    options.onFailure?.(error instanceof Error ? error.message : String(error));
+    return [];
+  }
+  const { text: rawText, finishKind } = collectText(collected);
+  if (finishKind === "error" || finishKind === "aborted") return [];
+  const parsed = parseItems(rawText);
+  const lines = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const item of parsed) {
+    const prefix = KIND_PREFIX[item.kind] ?? "结论";
+    const flat = item.text.replace(/\s*\r?\n\s*/g, " ").trim();
+    if (flat.length === 0) continue;
+    const key = flat.replace(/\s+/g, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(`${prefix}：${flat}`);
+  }
+  return lines;
+}
+
+// src/capabilities.ts
+function safeGet4(ctx, name2) {
   try {
     return ctx?.get?.(name2);
   } catch {
@@ -2840,7 +3846,7 @@ function probeSurfaceOpShape(session) {
   return "unknown";
 }
 function probeCapabilities(ctx, agent) {
-  const presets = safeGet3(ctx, "agentPresets");
+  const presets = safeGet4(ctx, "agentPresets");
   let engine;
   let engineError = "";
   try {
@@ -2852,12 +3858,12 @@ function probeCapabilities(ctx, agent) {
     available: hasFn(engine, "compactRegion"),
     detail: engineError !== "" ? `serviceFor 抛错：${engineError}` : engine === void 0 ? "serviceFor 返回 undefined" : `引擎=${engine?.constructor?.name ?? "unknown"}`
   };
-  const meter = fromEngine(engine, "tokenMeter") ?? safeGet3(ctx, "tokenMeter");
+  const meter = fromEngine(engine, "tokenMeter") ?? safeGet4(ctx, "tokenMeter");
   const tokenMeter = {
     available: hasFn(meter, "measure"),
     detail: meter === void 0 ? "tokenMeter 不可达" : "measure 可用"
   };
-  const pruner = safeGet3(ctx, "toolResultPruner") ?? (() => {
+  const pruner = safeGet4(ctx, "toolResultPruner") ?? (() => {
     try {
       return presets?.serviceFor?.(agent, "toolResultPruner");
     } catch {
@@ -2868,9 +3874,9 @@ function probeCapabilities(ctx, agent) {
     available: hasFn(pruner, "pruneSession"),
     detail: pruner === void 0 ? "toolResultPruner 不可达" : "pruneSession 可用"
   };
-  const sessions = safeGet3(ctx, "sessions");
-  const agents = safeGet3(ctx, "agents");
-  const systemPrompt = safeGet3(ctx, "systemPrompt");
+  const sessions = safeGet4(ctx, "sessions");
+  const agents = safeGet4(ctx, "agents");
+  const systemPrompt = safeGet4(ctx, "systemPrompt");
   return {
     compaction,
     tokenMeter,
@@ -2914,7 +3920,7 @@ var MIN_TRIM_TOKENS = 8e3;
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
-function safeGet4(ctx, name2) {
+function safeGet5(ctx, name2) {
   try {
     return ctx?.get?.(name2);
   } catch {
@@ -2955,7 +3961,7 @@ async function resolveBudget(deps) {
       source: "fallback"
     };
   }
-  const llm = safeGet4(ctx, "llm");
+  const llm = safeGet5(ctx, "llm");
   if (typeof llm?.resolveModelInfo !== "function") {
     return {
       windowTokens: 0,
@@ -3221,7 +4227,7 @@ var Config = Schema.object({
   baseUrl: Schema.string().default(""),
   token: Schema.string().default(""),
   project: Schema.string().default("dsh"),
-  offloadTurns: Schema.number().default(8),
+  offloadTurns: Schema.number().default(4),
   offloadChars: Schema.number().default(6e3),
   // 20 步对工具密集型轮次太晚：实测 16 步的会话一次都没触发，
   // 快照始终为空。降到 8 步，让中途也能沉淀出 `[LRC 状态]`。
@@ -3277,23 +4283,90 @@ var Config = Schema.object({
   budgetRecheckSteps: Schema.number().default(20),
   // ── 主动召回注入 ──
   // 实测（2026-11-12，379 步真实会话）：模型从未想起调用 lrc_recall，
-  // 系统提示写了也没用。改为由插件主动把相关记忆推进上下文。
-  // 默认关闭：先让用户按需开启并观察缓存命中率，确认无副作用再改默认值。
+  // 系统提示写了也没用。改为由插件把**相关**记忆推进上下文。
+  //
+  // 默认仍关闭：这是会改动系统提示的路径，需用户在自己的 patch 里显式开启。
+  // 是否启用由 `cordis.patch.yml` 决定（真正生效的是 profile 层那份）。
   /** 是否主动注入相关记忆 */
   recallInjectEnabled: Schema.boolean().default(false),
   /** 最多注入几条 */
   recallInjectMaxItems: Schema.number().default(2),
-  /** 低于该相关度不注入（0–1） */
-  recallInjectMinScore: Schema.number().default(0.5),
+  /** 相对分下限（top1 恒为 1.0，单靠它等于永远放行一条） */
+  recallInjectMinScore: Schema.number().default(0.85),
+  /**
+   * 绝对分下限（RRF 融合分，**名次信号而非语义相关度**）。
+   *
+   * RRF = Σ1/(60+rank)，值域 `(0, 2/61]`。实测三个离散簇：单路 0.0164 /
+   * 双路 0.0301 / 双路靠前 0.0328，无中间值。0.025 等价于「要求至少两路命中」。
+   * 实测区分力：项目内查询 12/12 过线，生活类无关查询 2/12 过线。
+   */
+  recallInjectMinRawScore: Schema.number().default(0.025),
   /** 单条截断字符数 */
-  recallInjectMaxCharsPerItem: Schema.number().default(80)
+  recallInjectMaxCharsPerItem: Schema.number().default(80),
+  // ── LLM 兜底提取 ──
+  // 规则层（正则）只能覆盖「见过的措辞」，而模型表达是开放的。
+  // 实测真实日志 214 句含信号句，规则抽出 113 句，边界外仍有真结论。
+  // 兜底路径用**一次独立模型调用**补足 —— 这是结构约束，不是提示词。
+  //
+  // ★默认关闭：这是唯一会额外产生模型请求的路径，必须用户显式开启。
+  // 开启后受「仅规则落空时触发 + 长度下限 + 会话额度 + 最小间隔」四重约束。
+  /** 是否启用 LLM 兜底提取 */
+  llmExtractEnabled: Schema.boolean().default(false),
+  /**
+   * 会话级最大调用次数（0 = 不限制）。
+   *
+   * ## 为什么是 200 而不是 40（★2026-11-14）
+   *
+   * 40 是按「类型缺口偶尔触发」估的。改成「有待裁决句子就触发」后，
+   * 长正文几乎每轮都有待裁决句（实测 7258 字符报告里 79/82 句是待裁决），
+   * 40 次会在一次长任务内用完，之后**静默关闭** —— 表现为「用着用着就不
+   * 提炼了」，用户完全不知道发生了什么。
+   *
+   * 200 的量级：一次长任务约 30–60 次真实调用。压缩侧已经很省（trim 只在
+   * 超阈值时触发），这部分成本换的是信息质量 —— 用户明确要求「既然已经
+   * 节省了，就要保证信息质量」。
+   */
+  llmExtractMaxCalls: Schema.number().default(200),
+  /**
+   * 进程级最大调用次数（0 = 不限制），滑动窗口 1 小时。
+   *
+   * 会话配额按桶独立，多窗口下总量会成倍放大。这是最终硬上限。
+   * 默认 500：约合 2.5 个满额会话/小时，足够单人常驻使用。
+   */
+  llmExtractGlobalMaxCalls: Schema.number().default(500),
+  /**
+   * 两次调用的最小间隔（毫秒）。
+   *
+   * 从 30 秒降到 5 秒：待裁决句是逐条消息产的，30 秒间隔会让同一轮里
+   * 连续几条消息只有第一条能兜底，其余静默跳过。5 秒只用于防异常循环
+   * （真正的总量控制由上面两个配额负责）。
+   */
+  llmExtractMinIntervalMs: Schema.number().default(5e3),
+  /** 正文短于此长度不触发（默认 120 字符，短碎片不值得单独问） */
+  llmExtractMinChars: Schema.number().default(120),
+  /** 单次发送的正文上限（默认 6000 字符，超出取尾部） */
+  llmExtractMaxInputChars: Schema.number().default(6e3),
+  // ── 工件库（长文本落盘）──
+  //
+  // 用户粘贴的几百页文档 / 超长代码若留在对话里，会直接吃满窗口；
+  // 若塞进 LRC，`recall` 会把长文档片段召回来，等于把上下文重新灌满。
+  // 所以单独落盘，只在 LRC 留一条指针 Fact，按 hash 取回。
+  /** 是否启用长文本落盘（默认开启：这是纯收益，无模型调用） */
+  artifactEnabled: Schema.boolean().default(true),
+  /** 超过多少字符才落盘 */
+  artifactMinChars: Schema.number().default(8e3),
+  /** 工件库磁盘配额（MB），超额按最久未访问淘汰 */
+  artifactQuotaMb: Schema.number().default(200)
 });
 var PROMPT_SECTION = "lrc:memory-capture";
+var ARTIFACT_CHUNK_CHARS = 8e3;
 function buildPromptText(recallInjected) {
   const recallRule = recallInjected ? [
-    "上下文里可能已出现 `[LRC 相关记忆]` 段落，那是插件按当前话题**自动检索**的结果，",
-    "直接当事实使用，不需要再调 `lrc_recall` 确认。",
-    "只有当该段落缺失、或明显不足以回答（例如需要更早的细节）时，才调 `lrc_recall` 补充检索；",
+    "上下文里可能出现 `[LRC 历史记忆（可能过时，与当前任务无关时请忽略）]` 段落，",
+    "那是插件按当前话题自动检索出来的历史记录。**用不用、信不信由你判断**：",
+    "与当前任务相关就参考；明显无关或与已验证事实冲突时直接忽略，不要为了迎合它改变做法。",
+    "若某条记忆与你已知的事实冲突，以**你能当场验证的**为准，并可用 `lrc_recall` 复核。",
+    "遇到需要更早的细节、或该段落缺失时，再调 `lrc_recall` 补充检索；",
     "检索为空时回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。"
   ] : [
     "涉及项目历史、用户偏好、之前做过的决定、上次怎么改的，**先调 `lrc_recall` 工具**，",
@@ -3307,10 +4380,24 @@ function buildPromptText(recallInjected) {
     "发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），",
     "不要让它继续污染后续对话。",
     "",
+    "## 长文档与工件",
+    "",
+    "超长输入（整份文档、几百行代码）会由插件落盘为「工件」，上下文里只留一条",
+    "`[工件] …（hash=xxxx）` 指针。需要看原文时调 `lrc_fetch_artifact(hash)`，",
+    "它单次返回上限 8000 字符，更长的用 `offset` 分段读。",
+    "**不要凭预览句臆测原文内容**，需要细节就取回。",
+    "",
     "## 长期记忆沉淀",
     "",
-    '插件会自动从你的回答里提取**约束**（"不要用 X"、"必须 Y"）和**决策**（"改用 X"），',
+    "插件会自动从你的回答里提取**约束**、**决策**、**结论**、**目标**、**范围限定**，",
     "所以不需要额外格式化输出。只要在回答里把结论说清楚即可。",
+    "",
+    "**最有价值的是这几类**（会被长期保留、跨会话复用）：",
+    "- 约束：必须 / 禁止 / 只能 / 只支持 / 不要",
+    "- 决策：改用 / 采用 / 定为 / 选型",
+    "- 结论：根因 / 排查结论 / 定位到",
+    "- 目标：压到 N 以下 / 降到 N 以内 / 不超过 N",
+    "- 范围：这次只做什么、明确不做什么",
     "",
     "如果你愿意显式标注，可用下面的块（可选，不是必须）：",
     "",
@@ -3326,8 +4413,25 @@ function buildPromptText(recallInjected) {
   ].join("\n");
 }
 function apply(ctx, config) {
-  const cacheDir = join2(process.env.DSH_HOME ?? join2(homedir2(), ".dsh"), "cache", "lrc-plugin");
-  const snapshotPath = join2(cacheDir, "snapshot.json");
+  const cacheDir = join3(process.env.DSH_HOME ?? join3(homedir2(), ".dsh"), "cache", "lrc-plugin");
+  const snapshotPath = join3(cacheDir, "snapshot.json");
+  const quotaMb = typeof config.artifactQuotaMb === "number" && Number.isFinite(config.artifactQuotaMb) && config.artifactQuotaMb > 0 ? config.artifactQuotaMb : 200;
+  const artifactStore = new ArtifactStore(join3(cacheDir, "artifacts"), Math.floor(quotaMb * 1024 * 1024));
+  const artifactEnabled = config.artifactEnabled !== false;
+  const artifactMinChars = typeof config.artifactMinChars === "number" && config.artifactMinChars > 0 ? Math.floor(config.artifactMinChars) : 8e3;
+  const sessionFacts = [];
+  const SESSION_FACTS_MAX = 200;
+  function recordSessionFacts(facts) {
+    for (const fact of facts) {
+      const key = factKey(fact);
+      const at = sessionFacts.findIndex((prev) => factKey(prev) === key);
+      if (at >= 0) sessionFacts.splice(at, 1);
+      sessionFacts.push(fact);
+    }
+    if (sessionFacts.length > SESSION_FACTS_MAX) {
+      sessionFacts.splice(0, sessionFacts.length - SESSION_FACTS_MAX);
+    }
+  }
   function recheckInterval(value) {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
     return Math.floor(value);
@@ -3338,8 +4442,8 @@ function apply(ctx, config) {
   function loadSnapshot() {
     const empty = { text: "", sessionId: "" };
     try {
-      if (!existsSync3(snapshotPath)) return empty;
-      const raw = JSON.parse(readFileSync3(snapshotPath, "utf8"));
+      if (!existsSync4(snapshotPath)) return empty;
+      const raw = JSON.parse(readFileSync4(snapshotPath, "utf8"));
       return {
         text: typeof raw.text === "string" ? raw.text : "",
         sessionId: typeof raw.sessionId === "string" ? raw.sessionId : ""
@@ -3366,8 +4470,8 @@ function apply(ctx, config) {
       latestSnapshot = text;
     }
     try {
-      mkdirSync3(cacheDir, { recursive: true });
-      writeFileSync3(
+      mkdirSync4(cacheDir, { recursive: true });
+      writeFileSync4(
         snapshotPath,
         JSON.stringify({ text, sessionId, updatedAt: Date.now() }),
         "utf8"
@@ -3414,11 +4518,24 @@ function apply(ctx, config) {
     maxItems: config.recallInjectMaxItems,
     maxCharsPerItem: config.recallInjectMaxCharsPerItem,
     maxTotalChars: 240,
-    minScore: config.recallInjectMinScore
+    minScore: config.recallInjectMinScore,
+    minRawScore: config.recallInjectMinRawScore
   });
   let turnHits = 0;
   let turnMisses = 0;
   let proseTurns = 0;
+  let llmExtractCalls = 0;
+  let llmExtractHits = 0;
+  let llmExtractFailures = 0;
+  const LLM_EXTRACT_GLOBAL_WINDOW_MS = 60 * 60 * 1e3;
+  const llmExtractGlobalStamps = [];
+  function globalWindowCount(now) {
+    const cutoff = now - LLM_EXTRACT_GLOBAL_WINDOW_MS;
+    while (llmExtractGlobalStamps.length > 0 && llmExtractGlobalStamps[0] <= cutoff) {
+      llmExtractGlobalStamps.shift();
+    }
+    return llmExtractGlobalStamps.length;
+  }
   const proseBacklog = /* @__PURE__ */ new Map();
   const PROSE_BACKLOG_MAX = 30;
   function proseBacklogSize() {
@@ -3464,6 +4581,7 @@ function apply(ctx, config) {
       recallGeneration += 1;
     }
     offloader.resetSnapshotPool();
+    sessionFacts.length = 0;
     snapshotGeneration += 1;
     if (snapshotOwner !== sessionId) {
       if (storedSnapshot.text.length > 0) {
@@ -3520,7 +4638,7 @@ ${latestSnapshot}`;
   );
   offloader = new Offloader(
     null,
-    new CursorStore(join2(cacheDir, "cursor.json")),
+    new CursorStore(join3(cacheDir, "cursor.json")),
     {
       turnsThreshold: config.offloadTurns,
       charsThreshold: config.offloadChars,
@@ -3528,7 +4646,7 @@ ${latestSnapshot}`;
       project: config.project,
       maxItems: config.maxItems
     },
-    new RecentStore(join2(cacheDir, "recent.json"))
+    new RecentStore(join3(cacheDir, "recent.json"))
   );
   function attachOffloader(client) {
     offloader?.bind(client);
@@ -3540,7 +4658,7 @@ ${latestSnapshot}`;
       proseBacklog.delete(owner);
       const pending = list;
       const ownerSessionId = owner.length > 0 ? owner : currentSessionId;
-      void offloader.offloadItems(pending, { intoPool: owner === currentSessionId }).then((result) => {
+      void offloader.offloadFacts(pending, { intoPool: owner === currentSessionId }).then((result) => {
         if (result.distilled > 0) {
           if (result.snapshot.length > 0 && ownerSessionId.length > 0) {
             saveSnapshot(result.snapshot, ownerSessionId);
@@ -3563,27 +4681,156 @@ ${latestSnapshot}`;
       });
     }
   }
-  function offloadExtracted(items, ownerSessionId, label) {
+  function offloadExtracted(facts, ownerSessionId, label) {
+    if (facts.length === 0) return;
+    recordSessionFacts(facts);
     if (!offloader.connected) {
-      pushProseBacklog(ownerSessionId, items);
+      pushProseBacklog(ownerSessionId, facts);
       void connection.get();
       return;
     }
     proseTurns += 1;
     const gen = ++snapshotGeneration;
-    void offloader.offloadItems(items).then((result) => {
+    void offloader.offloadFacts(facts).then((result) => {
       if (gen !== snapshotGeneration) return;
       if (result.distilled > 0) {
         if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
           saveSnapshot(result.snapshot, ownerSessionId);
         }
-        ctx.logger.info(`[lrc] ${label} ${result.distilled} 条约束/决策（写入 ${result.written}）`);
+        ctx.logger.info(`[lrc] ${label} ${result.distilled} 条关键信息（写入 ${result.written}）`);
       }
     }).catch((error) => {
       ctx.logger.warn(
         `[lrc] ${label}沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
       );
     });
+  }
+  function archiveLongText(text, sessionId) {
+    try {
+      const { meta, reused } = artifactStore.store(text);
+      const fact = makeArtifactFact({
+        hash: meta.hash,
+        preview: meta.preview,
+        chars: meta.chars,
+        kindLabel: "长文档",
+        origin: "user",
+        sessionId
+      });
+      const verdict = validateFact(fact);
+      if (!verdict.ok) {
+        ctx.logger.warn(`[lrc] 工件指针 Fact 未通过校验：${verdict.reason}`);
+        return;
+      }
+      offloadExtracted([fact], sessionId, "工件指针");
+      ctx.logger.info(
+        `[lrc] 长文本已落盘（${meta.chars} 字符，hash=${meta.hash}${reused ? "，复用已有工件" : ""}）：可用 lrc_fetch_artifact 取回`
+      );
+    } catch (error) {
+      ctx.logger.warn(
+        `[lrc] 长文本落盘失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  const LLM_EXTRACT_QUOTA_MAX = 20;
+  const llmExtractQuota = /* @__PURE__ */ new Map();
+  function quotaFor(sessionId) {
+    const existing = llmExtractQuota.get(sessionId);
+    if (existing !== void 0) {
+      existing.touchedAt = Date.now();
+      return existing;
+    }
+    if (llmExtractQuota.size >= LLM_EXTRACT_QUOTA_MAX) {
+      const maxCalls = Math.max(0, config.llmExtractMaxCalls);
+      let victimKey = null;
+      let victimAt = Number.POSITIVE_INFINITY;
+      for (const [key, value] of llmExtractQuota) {
+        const exhausted = maxCalls > 0 && value.count >= maxCalls;
+        const rank = exhausted ? value.touchedAt + 1e15 : value.touchedAt;
+        if (rank < victimAt) {
+          victimAt = rank;
+          victimKey = key;
+        }
+      }
+      if (victimKey !== null) llmExtractQuota.delete(victimKey);
+    }
+    const now = Date.now();
+    const fresh = { count: 0, lastCallAt: 0, touchedAt: now };
+    llmExtractQuota.set(sessionId, fresh);
+    return fresh;
+  }
+  function shouldFallback(text, extracted, sessionId, extractedKinds, pending) {
+    const quota = quotaFor(sessionId);
+    return shouldFallbackToLlm({
+      text,
+      extracted,
+      extractedKinds,
+      pending,
+      enabled: config.llmExtractEnabled,
+      minChars: config.llmExtractMinChars,
+      maxCalls: config.llmExtractMaxCalls,
+      usedCalls: quota.count,
+      minIntervalMs: config.llmExtractMinIntervalMs,
+      sinceLastMs: quota.lastCallAt === 0 ? Number.MAX_SAFE_INTEGER : Date.now() - quota.lastCallAt,
+      globalCalls: globalWindowCount(Date.now()),
+      globalMaxCalls: config.llmExtractGlobalMaxCalls
+    });
+  }
+  async function runLlmFallback(text, session, ownerSessionId, alreadyExtracted = [], candidates = [], origin = "assistant") {
+    const quota = quotaFor(ownerSessionId);
+    quota.count += 1;
+    quota.lastCallAt = Date.now();
+    llmExtractCalls += 1;
+    llmExtractGlobalStamps.push(Date.now());
+    try {
+      const lines = await extractWithLlm(ctx, session, text, {
+        maxInputChars: config.llmExtractMaxInputChars,
+        // 有候选时走「判定」模式：模型只做二分类，产物可追溯到原文
+        candidates,
+        // ★失败必须留痕（2026-11-16 发布前审查 P1-3）
+        //
+        // 这是唯一产生额外计费的路径。若不区分「调用失败」与「模型判定无内容」，
+        // 超时 / 401 / 路由拒绝在日志里与「没抽到」完全同形，排查时只能靠
+        // `lrc_status` 的计数间接推断。
+        onFailure: (reason) => {
+          ctx.logger.warn(`[lrc] LLM 兜底调用失败（不影响主流程）：${reason.slice(0, 200)}`);
+        }
+      });
+      if (lines.length === 0) {
+        llmExtractFailures += 1;
+        return;
+      }
+      const stripPrefix = (line) => line.replace(/^(约束|决策|结论|事实)：/, "").trim();
+      const fresh = lines.filter((line) => {
+        const body = stripPrefix(line);
+        if (body.length === 0) return false;
+        return !alreadyExtracted.some((prev) => {
+          if (prev.length >= 4 && body.includes(prev.slice(0, 8))) return true;
+          return areNearDuplicate(prev, body, 0.85);
+        });
+      });
+      if (fresh.length === 0) {
+        llmExtractFailures += 1;
+        return;
+      }
+      const extracted = factsFromLlmLines(fresh, {
+        origin,
+        sessionId: ownerSessionId
+      });
+      if (extracted.facts.length === 0) {
+        llmExtractFailures += 1;
+        ctx.logger.info(
+          `[lrc] LLM 兜底 ${fresh.length} 条候选全部被 schema 拒绝：` + extracted.rejected.map((r) => r.reason).join(",")
+        );
+        return;
+      }
+      llmExtractHits += 1;
+      offloadExtracted(extracted.facts, ownerSessionId, "LLM 兜底");
+    } catch (error) {
+      llmExtractFailures += 1;
+      ctx.logger.warn(
+        `[lrc] LLM 兜底提取失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
   void (async () => {
     const client = await connection.get();
@@ -3647,12 +4894,30 @@ ${latestSnapshot}`;
       if (generation !== recallGeneration) return;
       const next = formatRecallInjection(result.memories, recallOptions);
       recallFingerprint = fingerprint;
-      if (next === recallText) return;
-      recallText = next;
-      recallRewrites += 1;
-      ctx.logger.info(
-        next.length === 0 ? `[lrc] 本轮无相关记忆，不注入（指纹 ${fingerprint}）` : `[lrc] 注入 ${result.memories.length} 条候选中的 ${recallOptions.maxItems} 条（${next.length} 字符，指纹 ${fingerprint}，累计改写 ${recallRewrites} 次）`
-      );
+      const changed = next !== recallText;
+      if (changed) {
+        recallText = next;
+        recallRewrites += 1;
+      }
+      const injected = next.length === 0 ? 0 : next.split("\n").length - 1;
+      if (next.length === 0) {
+        const top = result.memories.reduce((max, m) => {
+          const raw = typeof m.score === "number" && Number.isFinite(m.score) ? m.score : -1;
+          return raw > max ? raw : max;
+        }, -1);
+        const message = `[lrc] 本轮无记忆注入（候选 ${result.memories.length} 条，最高绝对分 ${top >= 0 ? top.toFixed(4) : "缺失"}，阈值 ${recallOptions.minRawScore}，指纹 ${fingerprint}）`;
+        if (result.memories.length > 0 && top >= 0 && top < recallOptions.minRawScore) {
+          ctx.logger.warn(
+            `${message} —— 候选全部被绝对分闸门挡掉。若长期如此，检查 LRC 的通路权重（语义/深度路不可用时单路上限约 0.0164）或调低 recallInjectMinRawScore`
+          );
+        } else {
+          ctx.logger.info(message);
+        }
+      } else if (changed) {
+        ctx.logger.info(
+          `[lrc] 注入 ${injected}/${result.memories.length} 条候选（${next.length} 字符，指纹 ${fingerprint}，累计改写 ${recallRewrites} 次）`
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (isConnectionError(error)) {
@@ -3678,16 +4943,20 @@ ${latestSnapshot}`;
           warnedEmpty = true;
           ctx.logger.warn("[lrc] 会话日志里没有可沉淀的文本行，本次跳过");
         }
-        const conclusions = conclusionsFromReasoning(turnReasoning.join("\n"));
-        if (conclusions.length === 0 && turnReasoning.length > 0 && !warnedNoConclusion) {
+        const fromReasoning = extractFactsFromReasoning({
+          text: turnReasoning.join("\n"),
+          origin: "assistant",
+          sessionId
+        });
+        if (fromReasoning.facts.length === 0 && turnReasoning.length > 0 && !warnedNoConclusion) {
           warnedNoConclusion = true;
           ctx.logger.info(
-            `[lrc] 推理兜底：本轮推理 ${turnReasoningChars} 字符，未抽到结论句（词表未命中）`
+            `[lrc] 推理兜底：本轮推理 ${turnReasoningChars} 字符，未拆出可用三元组（拒绝原因：${[...new Set(fromReasoning.rejected.map((r) => r.reason))].join(",") || "无候选"}）`
           );
         }
-        if (conclusions.length > 0) {
+        if (fromReasoning.facts.length > 0) {
           try {
-            const result2 = await offloader.offloadItems(itemsFromTag(conclusions.join("\n")));
+            const result2 = await offloader.offloadFacts(fromReasoning.facts);
             if (result2.distilled > 0) {
               if (result2.snapshot.length > 0 && snapshotChanged(latestSnapshot, result2.snapshot)) {
                 saveSnapshot(result2.snapshot, sessionId);
@@ -3743,7 +5012,7 @@ ${latestSnapshot}`;
       const seen = turnHits + turnMisses;
       if (seen % 20 === 0) {
         ctx.logger.info(
-          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取命中 ${proseTurns} 条消息（另有 ${turnNoText} 轮无正文）`
+          `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取命中 ${proseTurns} 条消息（另有 ${turnNoText} 轮无正文）` + (config.llmExtractEnabled ? `；LLM 兜底 ${llmExtractCalls} 次调用，命中 ${llmExtractHits} 次，失败 ${llmExtractFailures} 次` : "；LLM 兜底未启用")
         );
       }
     } else {
@@ -3755,10 +5024,14 @@ ${latestSnapshot}`;
     const sessionId = session?.id ?? "";
     await flush(session, "turn/end");
     if (hadText || reasoning.length === 0) return;
-    const conclusions = conclusionsFromReasoning(reasoning);
-    if (conclusions.length === 0) return;
+    const fromReasoning = extractFactsFromReasoning({
+      text: reasoning,
+      origin: "assistant",
+      sessionId
+    });
+    if (fromReasoning.facts.length === 0) return;
     try {
-      const result = await offloader.offloadItems(itemsFromTag(conclusions.join("\n")));
+      const result = await offloader.offloadFacts(fromReasoning.facts);
       if (result.distilled > 0) {
         if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
           saveSnapshot(result.snapshot, sessionId);
@@ -3788,32 +5061,25 @@ ${latestSnapshot}`;
     if (type === "user/message" && isRealUserMessage(event)) {
       const userText = userMessageText(event);
       void refreshRecallInjection(userText);
-      const corrections = constraintsFromUser(userText);
-      if (corrections.length > 0) {
-        offloadExtracted(
-          itemsFromTag(corrections.join("\n")).map((i) => ({ ...i, origin: "user" })),
+      const result = extractFacts({
+        text: userText,
+        origin: "user",
+        sessionId
+      });
+      offloadExtracted(result.facts, sessionId, "用户消息");
+      const userExtractedKinds = result.facts.map((f) => f.kind);
+      if (shouldFallback(userText, result.facts.map((f) => f.statement), sessionId, userExtractedKinds, result.pending)) {
+        void runLlmFallback(
+          userText,
+          session,
           sessionId,
-          "用户纠正"
+          result.facts.map((f) => f.statement),
+          result.pending,
+          "user"
         );
       }
-      if (corrections.length === 0 && isKeyResourceLocation(userText, true)) {
-        const body = userText.trim();
-        if (body.length > 0) {
-          offloadExtracted(
-            [
-              {
-                content: `[事实] ${body.length > 200 ? `${body.slice(0, 200)}…` : body}`,
-                memory_type: "fact",
-                tags: ["resource", "distilled", "user"],
-                importance: 8,
-                source_turns: [0, 0],
-                origin: "user"
-              }
-            ],
-            sessionId,
-            "资源位置"
-          );
-        }
+      if (artifactEnabled && isArtifactWorthy(userText, artifactMinChars)) {
+        archiveLongText(userText, sessionId);
       }
       return;
     }
@@ -3825,13 +5091,16 @@ ${latestSnapshot}`;
       turnHadText = true;
       if (extractMemoryTag(text) !== null) turnTagSeen = true;
       offloader.observe(text);
-      const prose = constraintsFromProse(text);
-      if (prose.length > 0) {
-        offloadExtracted(
-          itemsFromTag(prose.join("\n")).map((i) => ({ ...i, origin: "assistant" })),
-          sessionId,
-          "正文抽取"
-        );
+      const extracted = extractFacts({
+        text,
+        origin: "assistant",
+        sessionId
+      });
+      offloadExtracted(extracted.facts, sessionId, "正文抽取");
+      const alreadyExtracted = extracted.facts.map((f) => f.statement);
+      const extractedKinds = extracted.facts.map((f) => f.kind);
+      if (shouldFallback(text, alreadyExtracted, sessionId, extractedKinds, extracted.pending)) {
+        void runLlmFallback(text, session, sessionId, alreadyExtracted, extracted.pending);
       }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       warnedShape = true;
@@ -3958,10 +5227,11 @@ ${latestSnapshot}`;
         run: async () => {
           const surfaceNodes = agent?.session?.surface?.nodes;
           const nodeCount = Array.isArray(surfaceNodes) ? surfaceNodes.length : 0;
-          const force = nodeCount > config.trimMaxNodes;
+          const trimMaxNodes = typeof config.trimMaxNodes === "number" && Number.isFinite(config.trimMaxNodes) && config.trimMaxNodes > 0 ? config.trimMaxNodes : 120;
+          const force = nodeCount > trimMaxNodes;
           if (force) {
             ctx.logger.info(
-              `[lrc][trim] 节点数 ${nodeCount} 超过上限 ${config.trimMaxNodes}，跳过 token 阈值强制裁剪`
+              `[lrc][trim] 节点数 ${nodeCount} 超过上限 ${trimMaxNodes}，跳过 token 阈值强制裁剪`
             );
           }
           const outcome = await trimContext({
@@ -3983,7 +5253,10 @@ ${latestSnapshot}`;
               //
               // 节点数硬上限只是个「兜底触发器」；真正决定「一次裁多少」的
               // 是这里。所以两条路径统一用一个上限：见 `trimMaxNodesPerRun`。
-              maxNodesPerRun: trimMaxNodesPerRun
+              maxNodesPerRun: trimMaxNodesPerRun,
+              // 摘要的「助手结论」段从这里投影，而不是靠 role 猜。
+              // 不传的话，摘要会把「我先去仓库看看」这类过程叙述当结论。
+              facts: sessionFacts
             },
             log: (message) => ctx.logger.info(message)
           });
@@ -4077,32 +5350,31 @@ ${latestSnapshot}`;
         }
         const { client } = acquired;
         try {
-          const tag = extractMemoryTag(args.text);
-          if (tag !== null) {
-            if (isNoUpdate(tag)) {
-              return { snapshot: "本轮无新增，未沉淀", distilled: 0, written: 0, merged: 0 };
-            }
-            const items = itemsFromTag(tag);
-            const migrated = await client.migrate(items, config.project);
-            ctx.logger.info(
-              `[lrc][tool] lrc_remember_now 沉淀 ${items.length} 条（写入 ${migrated.written}，合并 ${migrated.merged}）`
-            );
+          const extracted = extractFacts({
+            text: args.text,
+            origin: "assistant",
+            sessionId: currentSessionId
+          });
+          if (extracted.facts.length === 0) {
+            const reasons = [...new Set(extracted.rejected.map((r) => r.reason))].join(",");
+            ctx.logger.info(`[lrc][tool] lrc_remember_now 无可入库内容（${reasons || "无候选"}）`);
             return {
-              snapshot: `已沉淀 ${items.length} 条（写入 ${migrated.written}，其中合并 ${migrated.merged}）`,
-              distilled: items.length,
-              written: migrated.written,
-              merged: migrated.merged
+              snapshot: `未沉淀：没有可拆成「主体+关系+取值」的关键信息${reasons.length > 0 ? `（${reasons}）` : ""}`,
+              distilled: 0,
+              written: 0,
+              merged: 0
             };
           }
-          const result = await client.migrateText(args.text, config.project, config.maxItems);
+          const items = factsToItems(extracted.facts);
+          const migrated = await client.migrate(items, config.project);
           ctx.logger.info(
-            `[lrc][tool] lrc_remember_now 沉淀 ${result.distilled} 条（写入 ${result.written}，合并 ${result.merged}）`
+            `[lrc][tool] lrc_remember_now 沉淀 ${items.length} 条（写入 ${migrated.written}，合并 ${migrated.merged}）`
           );
           return {
-            snapshot: result.indexLine,
-            distilled: result.distilled,
-            written: result.written,
-            merged: result.merged
+            snapshot: extracted.facts.map(renderFact).join("\n"),
+            distilled: items.length,
+            written: migrated.written,
+            merged: migrated.merged
           };
         } catch (error) {
           return {
@@ -4277,22 +5549,42 @@ ${value.text}`
       async execute(args) {
         const session = lastAgent?.session;
         const source = extractHandoffSource(session);
-        let indexLines = [];
-        const client = connection.peek();
-        if (client !== null) {
+        let text;
+        if (sessionFacts.length > 0) {
+          const projected = projectHandoff({
+            facts: sessionFacts,
+            task: source.lastUserRequest,
+            note: args.note ?? ""
+          });
+          text = projected.text;
+          ctx.logger.info(
+            `[lrc][tool] lrc_handoff 从 ${sessionFacts.length} 条 Fact 投影：事实 ${projected.sections.confirmed.length} / 进展 ${projected.sections.progress.length} / 下一步 ${projected.sections.next.length}`
+          );
+        } else if (connection.peek() !== null) {
+          let indexLines = [];
           try {
-            const index = await client.index(config.project, 10);
+            const index = await connection.peek().index(config.project, 10);
             indexLines = index.items.map((item) => item.content_preview);
           } catch {
           }
+          text = buildHandoffText({
+            lastUserRequest: source.lastUserRequest,
+            recentAssistant: source.recentAssistant,
+            snapshot: latestSnapshot,
+            indexLines,
+            note: args.note ?? ""
+          });
+          ctx.logger.info("[lrc][tool] lrc_handoff 本会话 Fact 账本为空，退回索引拼装");
+        } else {
+          text = buildHandoffText({
+            lastUserRequest: source.lastUserRequest,
+            recentAssistant: source.recentAssistant,
+            snapshot: latestSnapshot,
+            indexLines: [],
+            note: args.note ?? ""
+          });
+          ctx.logger.info("[lrc][tool] lrc_handoff 无 Fact 账本且 LRC 未连接，退回纯文本交接");
         }
-        const text = buildHandoffText({
-          lastUserRequest: source.lastUserRequest,
-          recentAssistant: source.recentAssistant,
-          snapshot: latestSnapshot,
-          indexLines,
-          note: args.note ?? ""
-        });
         const result = await createHandoffSession({
           ctx,
           agent: lastAgent,
@@ -4307,6 +5599,65 @@ ${value.text}`
           sessionId: result.sessionId ?? "",
           mode: result.mode,
           text: result.text
+        };
+      }
+    })
+  );
+  registerTool(
+    "lrc_fetch_artifact",
+    () => defineTool({
+      name: "lrc_fetch_artifact",
+      description: `取回此前落盘的长文档 / 超长代码原文。当上下文里出现「[工件] 长文档已存入工件库（… hash=xxx）」而你需要看原文时调用。单次最多返回 ${ARTIFACT_CHUNK_CHARS} 字符，超长内容用 offset 分段读。`,
+      parameters: {
+        hash: {
+          type: "string",
+          required: true,
+          description: "工件 hash（从 [工件] 记忆条目里取 hash= 后面的值）"
+        },
+        offset: {
+          type: "number",
+          description: "起始字符偏移，默认 0"
+        }
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            text: { type: "string", required: true },
+            found: { type: "boolean", required: true },
+            total: { type: "number", required: true }
+          }
+        },
+        render: (_args, value) => [{ type: "text", text: value.text }]
+      },
+      async execute(args) {
+        const hash = typeof args.hash === "string" ? args.hash.trim() : "";
+        if (hash.length === 0) {
+          return { text: "lrc_fetch_artifact 需要非空的 hash。", found: false, total: 0 };
+        }
+        const body = artifactStore.fetch(hash);
+        if (body === null) {
+          return {
+            text: `未找到工件 ${hash}。可能已被配额淘汰，或 hash 有误。可用 lrc_recall 检索「工件」类记忆确认可用的 hash。`,
+            found: false,
+            total: 0
+          };
+        }
+        const offset = typeof args.offset === "number" && args.offset > 0 ? Math.floor(args.offset) : 0;
+        const chunk = body.slice(offset, offset + ARTIFACT_CHUNK_CHARS);
+        const more = offset + chunk.length < body.length;
+        const head = offset === 0 ? `工件 ${hash}（共 ${body.length} 字符）` : `工件 ${hash}（共 ${body.length} 字符，从 ${offset} 开始）`;
+        const tail = more ? `
+
+--- 还有 ${body.length - offset - chunk.length} 字符，用 offset=${offset + chunk.length} 继续读 ---` : "";
+        ctx.logger.info(`[lrc][tool] lrc_fetch_artifact ${hash} → ${chunk.length}/${body.length} 字符`);
+        return {
+          text: `${head}
+
+${chunk}${tail}`,
+          found: true,
+          total: body.length
         };
       }
     })
@@ -4381,6 +5732,23 @@ ${value.text}`
           lines.push(`查重窗口：${stats.recentWindow} 块`);
         }
         lines.push("");
+        lines.push("## 工件库");
+        {
+          if (!artifactEnabled) {
+            lines.push("已关闭（artifactEnabled=false）：长文本按原样留在上下文。");
+          } else {
+            const items = artifactStore.list();
+            lines.push(
+              `启用：阈值 ${artifactMinChars} 字符 / 配额 ${quotaMb} MB / 现有 ${items.length} 个 / 占用 ${(artifactStore.usageBytes() / 1024 / 1024).toFixed(2)} MB`
+            );
+            for (const item of items.slice(0, 5)) {
+              lines.push(`- ${item.hash}（${item.chars} 字符）：${item.preview}`);
+            }
+            if (items.length > 5) lines.push(`- …另有 ${items.length - 5} 个`);
+          }
+          lines.push(`本会话 Fact 账本：${sessionFacts.length} 条（交接文档的数据源）`);
+        }
+        lines.push("");
         lines.push("## 预算");
         lines.push(budget === null ? "尚未解析" : formatBudget(budget));
         lines.push("");
@@ -4395,17 +5763,18 @@ ${value.text}`
           ].join("\n")
         );
         if (!recallInjectOn) {
-          const dshHome = dirname2(dirname2(cacheDir));
-          const patchPath = join2(dshHome, "profiles", "desktop", "cordis.patch.yml");
+          const dshHome = dirname3(dirname3(cacheDir));
+          const patchPath = join3(dshHome, "profiles", "desktop", "cordis.patch.yml");
           lines.push("");
           lines.push("### 主动召回注入未启用");
           lines.push(
-            `在 \`${patchPath}\` 的 \`id: dsh-plugin-lrc\` → \`config:\` 下补以下四行，然后重启 DSH：`
+            `在 \`${patchPath}\` 的 \`id: dsh-plugin-lrc\` → \`config:\` 下补以下五行，然后重启 DSH：`
           );
           lines.push("```yaml");
           lines.push("        recallInjectEnabled: true");
           lines.push("        recallInjectMaxItems: 2");
-          lines.push("        recallInjectMinScore: 0.5");
+          lines.push("        recallInjectMinScore: 0.85");
+          lines.push("        recallInjectMinRawScore: 0.025");
           lines.push("        recallInjectMaxCharsPerItem: 80");
           lines.push("```");
           lines.push("（上溯路径来自本插件实际使用的缓存目录；多 profile 时请确认当前 profile 名。）");
@@ -4424,8 +5793,13 @@ ${value.text}`
             recallText.length > 0 ? `已注入 ${recallText.length} 字符｜指纹 ${recallFingerprint}` : `本轮无匹配，未注入｜指纹 ${recallFingerprint || "(空)"}`
           );
           lines.push(
-            `配置：最多 ${recallOptions.maxItems} 条｜阈值 ${recallOptions.minScore}｜单条 ${recallOptions.maxCharsPerItem} 字符｜总长 ${recallOptions.maxTotalChars}`
+            `配置：最多 ${recallOptions.maxItems} 条｜相对分 ≥${recallOptions.minScore}｜绝对分 ≥${recallOptions.minRawScore}｜单条 ${recallOptions.maxCharsPerItem} 字符｜总长 ${recallOptions.maxTotalChars}`
           );
+          if (recallOptions.minRawScore > 0.0164) {
+            lines.push(
+              "（绝对分阈值为 RRF 名次分：单路命中上限约 0.0164。若 LRC 的语义/深度通路不可用，该阈值会导致整场不注入 —— 见日志 warn。）"
+            );
+          }
           lines.push(`累计改写 ${recallRewrites} 次（每次改写会打断一次前缀缓存）`);
           if (recallText.length > 0) {
             lines.push("内容：");

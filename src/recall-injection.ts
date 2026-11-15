@@ -8,7 +8,14 @@
  * 系统提示里明明写着"涉及历史先调 lrc_recall"，工具也注册了，但模型
  * 注意力全在"把视频做出来"上，记忆检索在它眼里不是必要前置。
  *
- * 结论：**不能依赖模型主动"拉"，必须由插件主动"推"。**
+ * 结论：不依赖模型主动"拉"，由插件把**相关**记忆推进去。
+ *
+ * ## 「推」必须是软的，不是命令
+ *
+ * 注入的历史若被写成"这是事实"，模型会为了迎合它而改变当前做法 ——
+ * 哪怕那段历史来自别的项目、或早已被废弃的方案（真实风险：上下文偏移与幻觉）。
+ * 所以注入段落必须自带**来源与时效性声明**：它是历史，可能与当前任务无关，
+ * 判断权在正在工作的模型手里。
  *
  * ## 但"推"有三个硬约束
  *
@@ -37,6 +44,9 @@ export interface InjectedMemory {
   id: string;
   content: string;
   memory_type?: string;
+  /** 融合原始分（绝对相关度，LRC RRF 实测量级 0.016–0.032） */
+  score?: number;
+  /** 相对 top1 归一化的展示分（top1 恒为 1.0） */
   score_norm?: number;
 }
 
@@ -48,9 +58,53 @@ export interface RecallInjectionOptions {
   maxCharsPerItem: number;
   /** 整段注入的字符上限 */
   maxTotalChars: number;
-  /** 低于该相关度不注入（0–1） */
+  /**
+   * 相对分下限（0–1，`score_norm`）。
+   *
+   * 它只能筛掉「同批候选里明显掉队的那几条」，**不能**单独当相关性判据：
+   * top1 恒为 1.0，任何情况下都会放行一条。真正的准入由 `minRawScore` 决定。
+   */
   minScore: number;
+  /**
+   * 绝对分下限（`score`，RRF 融合分）。
+   *
+   * ## 这个字段的真实含义（★独立审查纠正了我的错误归因）
+   *
+   * RRF 分 = Σ 1/(k + rank)，`k=60`。所以它的值域是 `(0, 2/61]`，
+   * **只与"命中几条检索通路、各排第几"有关，与语义相关度无关**。
+   * 实测 24 条查询的 top1 绝对分只有三个离散簇：
+   *
+   * | 取值 | 含义 |
+   * |---|---|
+   * | `0.0164` | 单路 rank1（`1/61`） |
+   * | `0.0301` | 双路命中（`1/61 + 1/62` 等） |
+   * | `0.0328` | 双路都在前列 |
+   *
+   * 没有中间值。它是个**名次信号，不是相似度信号**。
+   *
+   * ## 那它凭什么能用
+   *
+   * 因为"多路同时命中"在实践中与"查询有实词可匹配"高度相关：
+   * 实测 12 条项目内查询 **12/12** 过线，12 条生活类无关查询 **2/12** 过线
+   * （误放的是"红烧肉怎么做""量子纠缠退相干"—— 它们碰巧在库里撞到了
+   * 高频字面）。作为**粗筛**足够，作为**相关性证明**不够。
+   *
+   * ## 0.025 取值的由来
+   *
+   * 落在单路簇（0.0164）与双路簇（0.0301）之间，等价于「要求至少两路命中」。
+   * 不要改成 0.016 以下 —— 那样单路也能过，等于关掉这道闸门。
+   */
+  minRawScore: number;
 }
+
+/**
+ * 注入段落的表头。
+ *
+ * 必须显式声明「这是历史、可能过时」：模型对注入内容有天然的顺从倾向，
+ * 一句"这是事实"就足以让它在冲突时放弃自己的判断。加上时效性声明后，
+ * 它才有权说"这条与当前任务无关"。
+ */
+const INJECTION_HEADER = '[LRC 历史记忆（可能过时，与当前任务无关时请忽略）]';
 
 export const DEFAULT_RECALL_INJECTION: RecallInjectionOptions = {
   // 2 条足够覆盖"用户偏好 + 关键决定"这类最常见场景，再多就是噪音
@@ -58,9 +112,61 @@ export const DEFAULT_RECALL_INJECTION: RecallInjectionOptions = {
   maxCharsPerItem: 80,
   // 与快照 220 字符同量级，避免单次注入就把上下文撑大
   maxTotalChars: 240,
-  // enrich 的 score_norm 是相对 top1 归一化的，低于 0.5 基本是"沾边"
-  minScore: 0.5,
+  // 相对分只用于筛掉同批里的掉队项（top1 恒为 1.0，单靠它等于永远放行）
+  minScore: 0.85,
+  // RRF 分：单路 ≈0.0164 / 双路 ≈0.0301。0.025 等价于「要求至少两路命中」。
+  // 注意它是名次信号而非相关度，见字段注释里的实测数据。
+  minRawScore: 0.025,
 };
+
+/**
+ * 单条记忆是否够格注入（双闸门）。
+ *
+ * # 为什么必须是两道
+ *
+ * 1. **绝对分**决定"这一批值不值得看"：单路命中（0.0164）说明查询只有一个
+ *    检索通路撞上，多半是字面偶然；只用相对分会放行 top1（恒 1.0），
+ *    把噪音灌进上下文。
+ * 2. **相对分**决定"同批里哪几条还算同档"：绝对分达标但明显掉队的第 3、4 条
+ *    （如 0.0315 → 0.0164）不该跟着进来，它们只是单路近邻，不是同一件事。
+ *
+ * 缺任何一道都会退化：只有绝对分 → 一强三弱全进来；只有相对分 → 永远进来一条。
+ *
+ * # `score` 缺失时怎么办
+ *
+ * 退回「只过更严的相对闸门」（0.85 而非历史默认 0.5）。这是兼容旧版 LRC 的
+ * 最低成本兜底，但它**不等于**原来的行为：原来的 0.5 会放行一堆相对分 0.5
+ * 的噪音，0.85 只放行同批里几乎并列的那几条。
+ *
+ * `null` 与 `undefined` **必须同等对待**。`typeof null === 'object'`，
+ * 若只判 `typeof === 'number'` 就漏掉 null；而 LRC 侧序列化 null 是常规操作，
+ * 那会让插件在服务端字段降级时静默回到「任何话题都注入一条」。
+ */
+function isRelevant(memory: InjectedMemory, options: RecallInjectionOptions): boolean {
+  const norm =
+    typeof memory.score_norm === 'number' && Number.isFinite(memory.score_norm)
+      ? memory.score_norm
+      : 1;
+  if (norm < options.minScore) return false;
+
+  const raw = absoluteScore(memory);
+  if (raw === null) return true;
+  return raw >= options.minRawScore;
+}
+
+/**
+ * 取绝对分；缺失（含 `null` / `NaN` / 字符串）时返回 `null`。
+ *
+ * `isRelevant` 与排序必须共用这一个取值函数：两边口径不一致时，
+ * 排序会拿 `score_norm`（0–1 量级）去和真实 RRF 分（0.03 量级）比，
+ * 把混合格式的批次顺序彻底打乱。
+ */
+function absoluteScore(memory: InjectedMemory): number | null {
+  const raw = memory.score;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  return null;
+}
+
 
 /**
  * 把外部传入的注入参数规范化。
@@ -95,8 +201,12 @@ export function normalizeRecallOptions(input: unknown): RecallInjectionOptions {
       1,
       Math.floor(num(raw.maxTotalChars, DEFAULT_RECALL_INJECTION.maxTotalChars)),
     ),
-    // 相关度必须落在 [0,1]，否则过滤条件会恒真或恒假
+    // 相对分必须落在 [0,1]，否则过滤条件会恒真或恒假
     minScore: Math.min(1, Math.max(0, num(raw.minScore, DEFAULT_RECALL_INJECTION.minScore))),
+    // 绝对分是 RRF 分（值域 (0, 2/61]），**不能**夹到 [0,1]：
+    // 夹上限到 1 会让所有候选都被判为不相关 ⇒ 永不注入。
+    // 夹下限到 0 则是「显式关闭绝对闸门」，这是合法配置，不做拦截。
+    minRawScore: Math.max(0, num(raw.minRawScore, DEFAULT_RECALL_INJECTION.minRawScore)),
   };
 }
 
@@ -114,30 +224,32 @@ export function formatRecallInjection(
 
   const picked = memories
     .filter((m) => typeof m.content === 'string' && m.content.trim().length > 0)
-    .filter((m) => (m.score_norm ?? 1) >= options.minScore)
+    .filter((m) => isRelevant(m, options))
+    // 按绝对分从高到低：LRC 已按融合分排序，这里再排一次是为了
+    // 「同一批被过滤后」仍保持最强证据在最前（模型对首条注意力最高）。
+    .sort((a, b) => sortScoreOf(b) - sortScoreOf(a))
     .slice(0, options.maxItems);
 
   if (picked.length === 0) return '';
 
-  const lines = picked.map((m) => {
-    const body = m.content.trim().replace(/\s+/g, ' ');
-    const cut =
-      body.length > options.maxCharsPerItem
-        ? `${body.slice(0, options.maxCharsPerItem)}…`
-        : body;
-    return `- ${cut}`;
-  });
+  const render = (list: InjectedMemory[]): string => {
+    const lines = list.map((m) => {
+      const body = m.content.trim().replace(/\s+/g, ' ');
+      const cut =
+        body.length > options.maxCharsPerItem
+          ? `${body.slice(0, options.maxCharsPerItem)}…`
+          : body;
+      return `- ${cut}`;
+    });
+    return `${INJECTION_HEADER}\n${lines.join('\n')}`;
+  };
 
-  let text = `[LRC 相关记忆]\n${lines.join('\n')}`;
+  let text = render(picked);
 
   // 超总长时逐条裁剪，保证不会因为一条长记忆吃掉整个预算
   while (text.length > options.maxTotalChars && picked.length > 1) {
     picked.pop();
-    const kept = picked.map((m) => {
-      const body = m.content.trim().replace(/\s+/g, ' ');
-      return `- ${body.length > options.maxCharsPerItem ? `${body.slice(0, options.maxCharsPerItem)}…` : body}`;
-    });
-    text = `[LRC 相关记忆]\n${kept.join('\n')}`;
+    text = render(picked);
   }
 
   if (text.length > options.maxTotalChars) {
@@ -146,6 +258,14 @@ export function formatRecallInjection(
   }
 
   return text;
+}
+
+/** 取排序用分数：绝对分优先，缺失时用相对分（两者不可混比，故只在同批内退化）。 */
+function sortScoreOf(memory: InjectedMemory): number {
+  const raw = absoluteScore(memory);
+  if (raw !== null) return raw;
+  const norm = memory.score_norm;
+  return typeof norm === 'number' && Number.isFinite(norm) ? norm : 0;
 }
 
 /**

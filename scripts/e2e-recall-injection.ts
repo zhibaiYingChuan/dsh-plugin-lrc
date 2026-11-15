@@ -31,6 +31,19 @@ const mem = (id: string, content: string, score = 0.9): InjectedMemory => ({
   score_norm: score,
 });
 
+/**
+ * 带**绝对分**的记忆（新版 LRC 的真实返回形态）。
+ *
+ * `score_norm` 是相对 top1 归一化的（top1 恒 1.0），`score` 才是绝对相关度。
+ * 实测：相关 ≈0.032 / 沾边 ≈0.016。
+ */
+const memRaw = (id: string, content: string, raw: number, norm = 1): InjectedMemory => ({
+  id,
+  content,
+  score: raw,
+  score_norm: norm,
+});
+
 // ── 1) 基本形态 ──
 console.log('=== 1) 注入文本形态 ===');
 {
@@ -39,7 +52,8 @@ console.log('=== 1) 注入文本形态 ===');
     mem('m2', '视频时长确定为 60 秒'),
   ]);
   console.log(`  产出（${text.length} 字符）:\n${text.split('\n').map((l) => '    ' + l).join('\n')}`);
-  check('含标题行', text.startsWith('[LRC 相关记忆]'), text.slice(0, 30));
+  // 表头必须自带时效性声明：注入内容是历史，判断权在模型手里
+  check('含来源与时效性声明表头', text.startsWith('[LRC 历史记忆（可能过时'), text.slice(0, 40));
   check('含两条内容', text.includes('纸质拼贴') && text.includes('60 秒'));
   check('长度可控（<= 240）', text.length <= 240, text.length);
 }
@@ -169,13 +183,23 @@ console.log('=== 7) 配置规范化 ===');
     maxCharsPerItem: 80,
     maxTotalChars: 240,
     minScore: 0.5,
+    minRawScore: 0.02,
   });
-  check('完整配置原样保留', full.maxItems === 2 && full.minScore === 0.5, full);
+  check(
+    '完整配置原样保留',
+    full.maxItems === 2 && full.minScore === 0.5 && full.minRawScore === 0.02,
+    full,
+  );
 
   // 全缺失：必须落到默认值，而不是 undefined
   const empty = normalizeRecallOptions({});
   check('空对象 → 默认 maxItems', empty.maxItems === DEFAULT_RECALL_INJECTION.maxItems, empty);
   check('空对象 → 默认 minScore（不是 0）', empty.minScore === DEFAULT_RECALL_INJECTION.minScore, empty);
+  check(
+    '空对象 → 默认 minRawScore（不是 0）',
+    empty.minRawScore === DEFAULT_RECALL_INJECTION.minRawScore,
+    empty,
+  );
   check('空对象 → 默认单条长度', empty.maxCharsPerItem === DEFAULT_RECALL_INJECTION.maxCharsPerItem, empty);
   check('空对象 → 默认总长', empty.maxTotalChars === DEFAULT_RECALL_INJECTION.maxTotalChars, empty);
   check('null 输入不炸', normalizeRecallOptions(null).maxItems > 0);
@@ -185,25 +209,107 @@ console.log('=== 7) 配置规范化 ===');
   // 让 maxItems 变成"全部注入"
   const undef = normalizeRecallOptions({ maxItems: undefined, minScore: undefined });
   check('maxItems=undefined 不变成"全部"', undef.maxItems === 2, undef.maxItems);
-  check('minScore=undefined 不变成"永不注入"', undef.minScore === 0.5, undef.minScore);
+  check(
+    'minScore=undefined 落到默认',
+    undef.minScore === DEFAULT_RECALL_INJECTION.minScore,
+    undef.minScore,
+  );
+  check(
+    'minRawScore=undefined 落到默认（不是 0 ⇒ 不是永不放行）',
+    undef.minRawScore === DEFAULT_RECALL_INJECTION.minRawScore,
+    undef.minRawScore,
+  );
 
   // NaN / 字符串 / 负值
   const weird = normalizeRecallOptions({
     maxItems: Number.NaN,
     minScore: Number.NaN,
+    minRawScore: Number.NaN,
     maxCharsPerItem: '80',
     maxTotalChars: -5,
   });
   check('NaN → 默认 maxItems', weird.maxItems === 2, weird.maxItems);
-  check('NaN → 默认 minScore', weird.minScore === 0.5, weird.minScore);
+  check('NaN → 默认 minScore', weird.minScore === DEFAULT_RECALL_INJECTION.minScore, weird.minScore);
+  check(
+    'NaN → 默认 minRawScore',
+    weird.minRawScore === DEFAULT_RECALL_INJECTION.minRawScore,
+    weird.minRawScore,
+  );
   check('字符串数字 → 默认（不隐式转换）', weird.maxCharsPerItem === 80, weird.maxCharsPerItem);
   check('负总长 → 抬到 1', weird.maxTotalChars === 1, weird.maxTotalChars);
 
   // 边界：0 是合法值（显式关闭）
   check('maxItems=0 保留为 0', normalizeRecallOptions({ maxItems: 0 }).maxItems === 0);
-  // 相关度夹紧到 [0,1]
+  // 相对分夹紧到 [0,1]
   check('minScore>1 夹紧到 1', normalizeRecallOptions({ minScore: 5 }).minScore === 1);
   check('minScore<0 夹紧到 0', normalizeRecallOptions({ minScore: -1 }).minScore === 0);
+  // 绝对分**不得**夹到 1：RRF 原始分量级是 0.02，夹上去等于永不注入
+  check(
+    'minRawScore 不被夹到 1',
+    normalizeRecallOptions({ minRawScore: 0.02 }).minRawScore === 0.02,
+    normalizeRecallOptions({ minRawScore: 0.02 }).minRawScore,
+  );
+  check('minRawScore<0 抬到 0', normalizeRecallOptions({ minRawScore: -1 }).minRawScore === 0);
+}
+
+// ── 7b) 双闸门：绝对分与相对分各管一件事 ──
+//
+// 未修复前只有 `score_norm >= 0.5` 一道闸门。而 `score_norm` 是**相对 top1**
+// 归一化的 —— top1 永远是 1.0，所以无论话题多无关，都至少会注入一条。
+// 那是把噪音当记忆，比不注入更坏（模型会把无关历史当当前事实）。
+console.log('=== 7b) 双闸门过滤 ===');
+{
+  // 场景 A：话题完全无关 ⇒ 整批都不该注入
+  // （实测无关候选绝对分 0.015 上下，top1 相对分仍是 1.0）
+  const offTopic = [memRaw('m1', '无关历史 A', 0.0153, 1.0), memRaw('m2', '无关历史 B', 0.0148, 0.97)];
+  check('无关话题整段不注入', formatRecallInjection(offTopic) === '');
+
+  // 场景 B：话题相关 ⇒ 强相关的两条注入
+  const onTopic = [memRaw('m1', '相关历史 A', 0.0315, 1.0), memRaw('m2', '相关历史 B', 0.0312, 0.99)];
+  const t = formatRecallInjection(onTopic);
+  const lines = t.split('\n').filter((l) => l.startsWith('- '));
+  check('相关话题注入两条', lines.length === 2, lines.length);
+
+  // 场景 C：一强一弱（0.0315 → 0.0164，相对 0.52）⇒ 只留强的
+  // 弱的那条是向量近邻，不是同一件事；跟着进来就是噪音
+  const mixed = [memRaw('m1', '强相关', 0.0315, 1.0), memRaw('m2', '明显掉队', 0.0164, 0.52)];
+  const tm = formatRecallInjection(mixed);
+  check('相对分掉队项被剔除', tm.includes('强相关') && !tm.includes('明显掉队'), tm);
+
+  // 场景 D：绝对分达标且相对分并列 ⇒ 两条都留（断言两条，不是只断言 A）
+  const tight = [memRaw('m1', '同档 A', 0.0315, 1.0), memRaw('m2', '同档 B', 0.0310, 0.98)];
+  const tt = formatRecallInjection(tight);
+  check('同档候选都保留', tt.includes('同档 A') && tt.includes('同档 B'), tt);
+
+  // 场景 E：旧版 LRC 不返回 score ⇒ 只走相对闸门（0.85，比历史 0.5 更严）
+  check('无绝对分时按相对分放行（高）', formatRecallInjection([mem('m1', '旧版高', 0.95)]) !== '');
+  check('无绝对分时按相对分拦截（低）', formatRecallInjection([mem('m1', '旧版低', 0.6)]) === '');
+
+  // 场景 E2：`score: null` 必须与 undefined 同等对待 —— 都走相对闸门。
+  //
+  // `typeof null === 'object'`：若判据只写 `typeof === 'number'`，
+  // null 会落到 `return true`；而 LRC 侧把字段序列化成 null 是常规操作。
+  const withNull = { id: 'n1', content: 'null 绝对分', score: null, score_norm: 1.0 } as unknown as InjectedMemory;
+  check('score=null 不炸且不退化为永不放行', formatRecallInjection([withNull]) !== '', formatRecallInjection([withNull]));
+  const nullLowNorm = { id: 'n2', content: 'null 且相对分低', score: null, score_norm: 0.5 } as unknown as InjectedMemory;
+  check('score=null 时相对闸门仍生效', formatRecallInjection([nullLowNorm]) === '');
+
+  // 场景 E3：NaN 绝对分同样降级为缺失
+  const withNaN = { id: 'n3', content: 'NaN 绝对分', score: Number.NaN, score_norm: 0.95 } as unknown as InjectedMemory;
+  check('score=NaN 时相对分可放行', formatRecallInjection([withNaN]) !== '');
+
+  // 场景 F：排序按绝对分降序（模型对首条注意力最高）
+  const reversed = [memRaw('m1', '次强', 0.0300, 1.0), memRaw('m2', '最强', 0.0400, 1.0)];
+  const tr = formatRecallInjection(reversed);
+  check('绝对分最高的排第一', tr.split('\n')[1]?.includes('最强') === true, tr);
+
+  // 场景 G：真实 LRC 的离散簇（★用实测值，不用编造的中间值）
+  //
+  // 实测 24 条查询：单路恒 0.0164（=1/61），双路 0.0301/0.0328，**无中间值**。
+  // 0.025 的语义因此是「至少两路命中」，不是「相似度够高」。
+  check('单路簇 0.0164 被拦', formatRecallInjection([memRaw('c1', '单路', 0.0164, 1.0)]) === '');
+  check('双路簇 0.0301 放行', formatRecallInjection([memRaw('c2', '双路', 0.0301, 1.0)]) !== '');
+  check('双路簇 0.0328 放行', formatRecallInjection([memRaw('c3', '双路强', 0.0328, 1.0)]) !== '');
 }
 
 // ── 8) 用户消息取文本：锁住"功能写了却从未触发"的缺陷 ──

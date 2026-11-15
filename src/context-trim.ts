@@ -41,6 +41,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { isConversationNode } from './event-classify.ts';
+import { isProcessNarration as schemaIsProcessNarration } from './memory-schema.ts';
 
 /** 保留尾部节点数的默认值（配置非法时用它）。 */
 export const DEFAULT_KEEP_RECENT = 8;
@@ -97,6 +98,13 @@ export interface TrimOptions {
    * **不会退化成「不限制」** —— 那是事故形态本身。
    */
   maxNodesPerRun?: number;
+  /**
+   * 会话 Fact 账本：摘要「助手结论」段的**唯一真理源**（★2026-11-14）。
+   *
+   * 不传时退回旧行为（按 role 判定），那会把过程叙述当结论。
+   * 由 `index.ts` 在每次 `trimContext` 调用时传入本会话账本。
+   */
+  facts?: readonly { kind: string; statement: string; status?: string }[];
 }
 
 /** 一次裁剪的结果。 */
@@ -522,10 +530,56 @@ function oneLine(text: string, max: number): string {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
-/** 去重后按上限收集。 */
-function collect(target: string[], seen: Set<string>, line: string, limit: number): void {
-  if (target.length >= limit) return;
+/**
+ * 把一段正文切成句子（用于**逐句**判过程叙述，★2026-11-15 独立审查 P1）。
+ *
+ * ## 为什么需要它
+ *
+ * lrc-prune 的正文是一整段 text block，可能包含几十句。对整段做
+ * `isProcessNarration` 是**粒度层双裁判**：`memory-extract` 按单句判，
+ * 摘要按整块判，同一判据两种结论 —— 首句是过程叙述就让整段消失。
+ *
+ * ## 切分规则
+ *
+ * 与 `memory-extract.splitClauses` 保持同源：换行 + 句末标点。
+ * 只做切分不改写，空句丢弃。长度上限交给调用方的 `oneLine`。
+ */
+function splitSentences(text: string): string[] {
+  return text
+    .split(/[\n。！？；]+/)
+    .map((line) => line.trim().replace(/^[-*+\d.)\s|#]+/, '').trim())
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * 去重后按上限收集。
+ *
+ * @param options.keepNewest - 达到上限后**淘汰最旧、保留最新**（★2026-11-15）
+ *
+ * ## 为什么需要 `keepNewest`
+ *
+ * 默认语义是「先到先得，满了就丢后来者」，适合调用/错误这类**日志**。
+ * 但 lrc-prune 桶要的是「本轮最新的任务产出」：实测 20 条素材、
+ * 上限 10 时只留下素材 1–10，第 20 条（最新）永远进不来 ——
+ * 即使投影端倒序遍历也救不回来，因为**收集端就已经丢了**。
+ *
+ * 这是独立审查 P0-3 复查时发现的：上一轮只改了投影端的方向，
+ * 没注意收集端是另一种截断。
+ */
+function collect(
+  target: string[],
+  seen: Set<string>,
+  line: string,
+  limit: number,
+  options: { keepNewest?: boolean } = {},
+): void {
   if (line.length === 0 || seen.has(line)) return;
+  if (target.length >= limit) {
+    if (options.keepNewest !== true) return;
+    // 淘汰最旧（队首），腾出位置给这一条最新
+    const evicted = target.shift();
+    if (evicted !== undefined) seen.delete(evicted);
+  }
   seen.add(line);
   target.push(line);
 }
@@ -560,6 +614,16 @@ const NOISE_PREFIXES = [
   // 每轮 prepare 时宿主采样时间并注入，同样伪装成 role:'user'
   'Time sampled while preparing',
   'Browser time zone for this request:',
+  // ## 后台任务通知（`source.kind === 'tool-jobs'`）不是用户发言（★2026-11-15）
+  //
+  // 实测最新摘要的「用户请求」首条是：
+  // ```
+  // - background job pwsh-2b002cc2420941a9 (pwsh: cd H:\xjz; node server/src/index.js) finished …
+  // ```
+  // 这是宿主报告后台命令结束的注入，与用户意图无关，却占了仅有的
+  // 12 个请求槽位之一。`source.kind` 已能识别，但摘要采集只看内容，
+  // 所以这里补前缀兜底（两条通道都要拦，不能只靠 kind）。
+  'background job ',
   '## 已裁剪的历史',
   '### 用户请求',
   '### 工具调用与结果',
@@ -581,13 +645,56 @@ function isNoiseText(text: string): boolean {
 /**
  * 是否是「过程叙述」：描述「接下来要做什么」，不是已完成的结论。
  *
- * 实测 AI 会把「接下来我要确认工具参数存放在哪里」当成结论写进摘要，
- * 导致 `### 助手结论` 约 10% 是待办意图。含完成时态词时不判为过程叙述。
+ * ## 为什么复用 `memory-schema` 的判据（★2026-11-15）
+ *
+ * 这个文件原本有一份**自己写的**过程叙述判断：
+ * ```
+ * /接下来|下一步|我要|待确认|待验证|还需要|准备|打算|将要/
+ * ```
+ * 它比 `memory-schema.ts` 的 `isProcessNarration` 弱得多 —— 后者已经
+ * 迭代出三层判据（显式第一人称 / 时间副词 / 执行叙述），覆盖
+ * `我把 X 改成 Y`、`全部换成了…`、`现在换成…` 等 9 类形态。
+ *
+ * 实测后果（`session-95eaf7e3`）：
+ * ```
+ * 提取器：`我先看一下文件` → 拒绝（process_narration）
+ * 摘要：  `我先看一下文件` → 收进「助手结论」
+ * ```
+ * **同一句话被两个模块判成相反结论** —— 这是「双裁判」问题的第三处实例
+ * （前两处：写入路径 6 条合并、摘要 isConclusionRole）。
+ *
+ * 现在统一走 `memory-schema` 的判据，注解为 `assistant`（摘要里的正文
+ * 全部来自助手消息）。
  */
 function isProcessNarration(text: string): boolean {
-  if (!/接下来|下一步|我要|待确认|待验证|还需要|准备|打算|将要/.test(text)) return false;
-  return !/已完成|已确认|已验证|已修复|结论是|因此|所以|说明|表明/.test(text);
+  return schemaIsProcessNarration(text, 'assistant');
 }
+
+/**
+ * 「用户请求」段里**实际上是助手正文**的形态特征（★2026-11-15 存量清理）。
+ *
+ * ## 为什么需要它
+ *
+ * 旧版插件把 `lrc-prune` 的助手正文错记进摘要的「用户请求」段：
+ * ```
+ * - 十六枚都已经画好，全在下面这张图里…  ![十六枚候选](H:\xjz\.shots\95-…png)
+ * - 提交了（`c1cf3be`）。这是画押屏的样板…  ![未蘸](H:\xjz\.shots\70-…png)
+ * ```
+ * 该摘要被宿主包成 `compact-checkpoint`，本函数每次裁剪都原样吸收，
+ * 于是污染在 69 个 checkpoint 里层层复制（实测会话至今 2 条残留）。
+ *
+ * 新代码已阻止**新增**（`prunedByLrc` 重分类 + `tool-jobs` 过滤），
+ * 但已写进历史摘要的内容无法自动消失 —— 只能在此处**逐条清掉**。
+ *
+ * ## 判据为什么选 Markdown 图片语法
+ *
+ * 它是纯**形态**标记（`![alt](path)`），不涉及任何语义判断 ——
+ * 符合「代码层只判形态、价值判断交 LLM」的分工。
+ *
+ * 实测该会话 11 条真实用户消息**全部不含** `![`，两条污染条目**全部含**。
+ * 用户粘贴图片时给的是路径或截图，不会写成 Markdown 图片标签。
+ */
+const ASSISTANT_PROSE_MARKER = /!\[[^\]]*\]\([^)]*\)/;
 
 /**
  * 把一条旧摘要的内容吸收进当前桶，而不是原样再嵌一层。
@@ -623,6 +730,8 @@ function absorbPriorSummary(
     if (!line.startsWith('- ')) continue;
     const body = line.slice(2);
     if (isNoiseText(body)) continue;
+    // 存量污染清理：助手正文不该留在「用户请求」段（见上方判据注释）
+    if (section === 'requests' && ASSISTANT_PROSE_MARKER.test(body)) continue;
     collect(buckets[section], seen, `- ${body}`, limits[section]);
   }
 }
@@ -666,6 +775,17 @@ function isConversationRole(role: unknown): boolean {
   return role === 'user' || role === 'assistant' || role === undefined;
 }
 
+/** 结论段的总槽位数（账本 + prune 补位共用）。 */
+const CONCLUSION_SLOTS = 15;
+
+/**
+ * lrc-prune 补位条数上限。
+ *
+ * 低于总槽位，确保**任何情况下都至少留 5 个槽给账本** ——
+ * 账本是已过双闸门的判断，不该被未经裁决的原始素材挤掉。
+ */
+const PRUNE_CONCLUSION_LIMIT = 10;
+
 /** 是否该把该角色的文本收进「助手结论」区。 */
 function isConclusionRole(role: unknown): boolean {
   // 缺 role 时按 assistant 处理：真实重放里 user 消息一定带 role
@@ -679,9 +799,39 @@ function isConclusionRole(role: unknown): boolean {
  * 只保留四类信息：用户请求、工具调用、工具错误、助手结论。
  * 工具成功输出只留首行 —— 那才是上下文膨胀的主因。
  *
+ * ## ★2026-11-14：助手结论改为**消费 Fact 账本**
+ *
+ * ## 为什么要改
+ *
+ * 真实测试（session-a7f16f92）暴露：这次 compaction 的摘要里
+ * `### 助手结论` 有 4 条，全是过程叙述：
+ * ```
+ * 我先去仓库看看它到底是什么。
+ * 两个联网工具都报错了，我换一种方式直接访问。
+ * 仓库本身可以访问，于是直接把它克隆到本地来读。
+ * 克隆成功，仓库比预期大，开始读它的结构。
+ * ```
+ * **真结论 0 条**，而 `### 工具调用与结果` 有 17 条，占了摘要主体。
+ * 同一批 4 句喂给 `extractFacts` 全部被拒 —— 也就是说：
+ * **同一个系统里有两个裁判，判同一件事，结论相反。**
+ *
+ * 这与上一轮修的「6 条写入路径」是同类问题，只是发生在另一个维度：
+ * 写入侧收口到 `validateFact` 了，读侧（压缩摘要）却还留着一套独立实现。
+ *
+ * ## 现在的结构
+ *
+ * ```
+ * 有 facts  → 助手结论 = facts 里 kind ∈ {constraint, decision, conclusion, statement} 的陈述
+ * 无 facts  → 退回旧行为（只按 role 判定）+ 记住这是降级
+ * ```
+ *
+ * 降级路径必须保留：`trimContext` 可能在 Fact 账本尚未建立时被调用
+ * （会话开始、插件刚加载），此时若要求必须有 facts，摘要会变成空的。
+ *
  * @param messages - 被裁剪区间的重放消息（`SummarizationInput.messages`）
  * @param maxChars - 摘要字符上限
- * @returns 摘要文本
+ * @param realCounts - 可选出参：回填真实条数（见下）
+ * @param facts - 可选的会话 Fact 账本；提供时「助手结论」从它投影
  */
 export function buildDeterministicSummary(
   messages: readonly unknown[],
@@ -692,21 +842,84 @@ export function buildDeterministicSummary(
    * 为什么需要：第二遍会把旧摘要补位进各桶，导致 `summaryStats` 里的
    * 「请求 8」恒等于 absorb 上限（8），而不是真实请求数（真实上限是 12）。
    * 把真实条数单独回填，诊断时才能区分「真实负载」与「补位填充」。
+   *
+   * ★注意：它在**字符预算截断之前**快照，所以 `real` 可能**大于**最终条数
+   * （`调用` 段 weight 最低、最先被砍）。`summaryStats` 必须能表达
+   * `real > total` 这个关系，否则相减会得到负数。
    */
   realCounts?: { requests: number; conclusions: number; errors: number; calls: number },
+  /**
+   * 会话 Fact 账本：**摘要结论的唯一真理源**。
+   *
+   * 类型用结构化的最小契约而非 `MemoryFact`，避免 `context-trim.ts`
+   * 依赖 `memory-schema.ts`（它原本是零依赖的纯文本模块，单测不需要
+   * 构造完整 Fact）。
+   */
+  facts?: readonly { kind: string; statement: string; status?: string }[],
 ): string {
+  // ## `maxChars` 必须是有限数（★2026-11-16 发布前审查 P1-2）
+  //
+  // 该函数是导出的纯函数，任何调用方（含测试、未来的新调用点）都可能传
+  // `undefined` / `NaN`。而本函数内部的截断判据全是 `text.length > maxChars`：
+  // `Infinity` ⇒ 永不截断（可接受）；**`NaN` ⇒ 恒 false ⇒ 直接掉到末尾的
+  // `slice(0, maxChars - 1)`，产出单个 `"…"`**，整段摘要被毁（测试已复现）。
+  //
+  // 在入口兜底而不是只在调用点兜底：调用点有多个，函数只有一个。
+  const max = typeof maxChars === 'number' && Number.isFinite(maxChars) && maxChars > 0 ? maxChars : 4000;
+
   const requests: string[] = [];
   const calls: string[] = [];
   const errors: string[] = [];
   const conclusions: string[] = [];
+  /**
+   * lrc-prune 正文（助手任务产出）单独成桶（★2026-11-15 代码审查）。
+   *
+   * 直接和账本共用 `conclusions` 会挤占：实测 15 条 prune 能让账本
+   * **全灭**。账本是已过双闸门的判断，优先级高于未经裁决的原始素材，
+   * 所以先收这里，等账本投影完再用剩余槽位补位。
+   */
+  const pruneConclusions: string[] = [];
+  /**
+   * prune 桶自己的去重集合。
+   *
+   * 不能与全局 `seen` 共用：`collect` 会先 `seen.add(line)` 再入桶，
+   * 共用会让补位阶段认为「已收过」而整条丢弃。
+   */
+  const pruneSeen = new Set<string>();
   const seen = new Set<string>();
+  /** 「用户请求」段的独立去重集合（见下方 `collect(requests, …)` 注释）。 */
+  const requestSeen = new Set<string>();
   /** 旧摘要文本，留到第二遍再吸收（见下方「两遍扫描」说明） */
   const priorSummaries: string[] = [];
 
   for (const raw of messages) {
-    const message = raw as { role?: string; content?: unknown; isError?: unknown };
+    const message = raw as { role?: string; content?: unknown; isError?: unknown; source?: { kind?: string } };
     const content = message?.content;
     if (!Array.isArray(content)) continue;
+
+    // ## LRC 的「已剪枝」节点是**助手正文**，不是用户发言（★2026-11-15 修正）
+    //
+    // ## 上一版错在哪
+    //
+    // 曾写成 `if (source.kind === 'lrc-prune') continue` —— 直接丢弃。
+    // 核实后这是**有损的错误**：`appendReplace` 用 `surfaceOp: replace`
+    // 遮蔽了原始 `assistant/message` 节点，所以 lrc-prune 是该内容在
+    // 重放里的**唯一载体**。它承载的是助手刚写的正文，例如：
+    // ```
+    // 十六枚都已经画好…一眼能认出 1A 锁、2A 窗、4B 镜…失败的案例 4 个
+    // ```
+    // 这是用户任务最核心的产出。丢弃它等于把「本轮做了什么」整段抹掉。
+    //
+    // ## 正确的区分：**身份错位** ≠ **内容无主**
+    //
+    // ```
+    // lrc-prune → role='user' 但内容属于助手 ⇒ 重新归类到「助手结论」
+    // tool-jobs → 内容不属于任何参与者       ⇒ 丢弃
+    // ```
+    // 前者是**有损重分类**，后者才是**有损过滤**。混为一谈就会误删。
+    const prunedByLrc = message.source?.kind === 'lrc-prune';
+    // 后台任务结束通知是宿主插管，不属于任何参与者（见 `NOISE_PREFIXES`）
+    if (message.source?.kind === 'tool-jobs') continue;
 
     // 真实重放里工具结果是独立消息 `role:'tool'`，正文直接是 `[{type:'text'}]`，
     // **没有** `type:'tool-result'` 块。以前只认块类型，于是几百 KB 的工具输出
@@ -738,16 +951,110 @@ export function buildDeterministicSummary(
           continue;
         }
         // 宿主每轮注入的运行时事实 / 技能目录 / 审批策略：不是用户说的话
-        if (isNoiseText(b.text)) continue;
+        //
+        // ## lrc-prune 豁免这一层（★2026-11-15 代码审查）
+        //
+        // `NOISE_PREFIXES` 是按**用户消息**归纳的（`Current runtime context.`
+        // / `### 用户请求` / `[LRC 状态]` …）。而 lrc-prune 是助手正文，
+        // 正文里出现「### 助手结论」这种小标题完全正常 —— 若按噪音拦掉，
+        // 恰好把最结构化的任务产出整段丢掉。
+        //
+        // 它自己的身份已由 `prunedByLrc` 确认，不需要内容前缀再判一次。
+        if (!prunedByLrc && isNoiseText(b.text)) continue;
         // 系统提示：既不是用户请求也不是助手结论。
         // `systemPromptUpdate: in-history` 时它会出现在重放历史里，
         // 必须在这里显式拦掉（见 `isConclusionRole` 注释）。
         if (!isConversationRole(message.role)) continue;
         const line = oneLine(b.text, 300);
-        if (message.role === 'user') collect(requests, seen, `- ${line}`, 12);
-        // 过程叙述（「接下来我要…」）不是结论，不进 `### 助手结论`
-        else if (isConclusionRole(message.role) && !isProcessNarration(b.text)) {
-          collect(conclusions, seen, `- ${line}`, 15);
+        // ## lrc-prune 按 **assistant 身份**走（不是按 role）
+        //
+        // 它的 `role` 被宿主强制成 `'user'`（`appendReplace` 的限制），
+        // 但内容是助手正文。若按 role 分流，它的产出会全落进「用户请求」，
+        // 把真实用户发言挤出去 —— 实测 12 槽被占满导致「请求 真实 0」。
+        if (message.role === 'user' && !prunedByLrc) {
+          // ## 「用户请求」用**独立**去重集合（★2026-11-15 独立审查 P1）
+          //
+          // 共用 `seen` 时有个隐蔽后果：用户说「以后都不要碰 3099」，
+          // 这句话既进 requests、又被抽成 constraint 进账本。requests 先
+          // `seen.add`，账本投影时就被去重丢掉 —— 实测结论段退化成
+          // 「（本段无可用结论：已裁 1 条消息）」，信息被降级成语义更弱的
+          // 「用户请求」。
+          //
+          // 两个段落回答的是不同问题（用户要什么 / 已定了什么），
+          // 不该互相去重。
+          //
+          // ## 必须 `keepNewest`（★2026-11-16 发布前审查 P1-1）
+          //
+          // 首版用默认的「满额即丢」——那保留的是**最旧的 12 条**。
+          // 探针实测：20 条用户请求只留第 1–12 条，**最新 8 条被丢弃**，
+          // 用户刚说的话进不了摘要。
+          //
+          // 这与本项目已修的三处是同一个缺陷族（账本投影 / prune 补位 /
+          // handoff 投影都是「取最旧」），方向必须统一为「留最新」。
+          collect(requests, requestSeen, `- ${line}`, 12, { keepNewest: true });
+        }
+        // ## 助手结论：有 Fact 账本时**不再从这里收**
+        //
+        // 旧实现是 `isConclusionRole(role) && !isProcessNarration(text)` ——
+        // `isConclusionRole` 只看 role 是不是 assistant，**一条语义判据都没有**，
+        // 于是「我先去仓库看看它到底是什么」这种过程叙述全部进了结论区
+        // （实测 session-a7f16f92：4 条结论、0 条真结论）。
+        //
+        // 现在结论统一在下面从 `facts` 投影。只有 `facts` 缺失（账本尚未建立）
+        // 时才退回旧路径 —— 那时代码里没有任何语义判据可用，宁可保留
+        // 旧行为，也不要让摘要变空。
+        //
+        // ## 为什么 `prunedByLrc` 时**即使有 facts 也要收**
+        //
+        // 账本投影的是**已通过的 Fact**，而 lrc-prune 的正文正是尚未入库的
+        // 原始素材（提取器从中只抽到 1 条，另有 7 条待 LLM 裁决）。
+        // 若因为有 facts 就跳过它，这段「本轮做了什么」在摘要里会**完全消失**。
+        //
+        // ## 但**不能直接占结论槽**（★2026-11-15 代码审查）
+        //
+        // 首版直接 `collect(conclusions, …, 15)`，实测被挤占：
+        // ```
+        //  2 条 prune → 结论 15 条（prune 2 / 账本 13）
+        // 10 条 prune → 结论 15 条（prune 10 / 账本 5）
+        // 15 条 prune → 结论 15 条（prune 15 / 账本 0）  ← 账本全灭
+        // ```
+        // 账本是**已通过的判断**（`validateFact` / `validateJudgedFact` 双闸门），
+        // 价值高于未经裁决的原始素材。所以先收进独立桶，等账本投影完
+        // 再用剩余槽位补位 —— 账本永远优先。
+        else if (
+          (isConclusionRole(message.role) || prunedByLrc) &&
+          (facts === undefined || prunedByLrc)
+        ) {
+          // ## 过程叙述必须**按句**判，不能按整块（★2026-11-15 独立审查 P1）
+          //
+          // prune 的正文是一整段 text block。首版 `isProcessNarration(b.text)`
+          // 对整块判定：首句「我先看一下现有结构。」命中 ⇒ 整块被丢，
+          // 后面「十六枚都已经画好，一眼能认出 1A 锁…」一并消失。
+          //
+          // 这是**粒度层双裁判**：`memory-extract` 按单句判，这里按整块判，
+          // 同一判据两种结论。摘要没有 LLM 可仲裁（见 `isProcessNarration`
+          // 复用注释），必须与提取层同粒度。
+          //
+          // ## 为什么用换行 + 句末标点切分
+          //
+          // 与 `memory-extract.splitClauses` 同源。prune 正文结构是
+          // 「一段一句一行」，所以换行是最可靠的边界；再补句末标点兜底。
+          const bucket = prunedByLrc ? pruneConclusions : conclusions;
+          const limit = prunedByLrc ? PRUNE_CONCLUSION_LIMIT : CONCLUSION_SLOTS;
+          const seenForBucket = prunedByLrc ? pruneSeen : seen;
+          if (!prunedByLrc) {
+            if (isProcessNarration(b.text)) continue;
+            collect(bucket, seenForBucket, `- ${line}`, limit);
+          } else {
+            // 逐句判：过程句不占槽，真实产出逐句进桶
+            //
+            // `keepNewest`：prune 要的是**本轮最新**的产出，满了应淘汰最旧
+            // 而不是拒绝后来的（见 `collect` 注释）。
+            for (const clause of splitSentences(b.text)) {
+              if (isProcessNarration(clause)) continue;
+              collect(bucket, seenForBucket, `- ${oneLine(clause, 300)}`, limit, { keepNewest: true });
+            }
+          }
         }
       } else if (b?.type === 'tool-call') {
         const name = typeof b.name === 'string' ? b.name : 'tool';
@@ -760,6 +1067,62 @@ export function buildDeterministicSummary(
         else collect(calls, seen, `- 结果：${oneLine(text.split('\n')[0] ?? '', 150)}`, 30);
       }
     }
+  }
+
+  // ── 从 Fact 账本投影「助手结论」（★2026-11-14）──
+  //
+  // 这是本次修复的核心：结论的**唯一真理源**是 `validateFact` 产出的 Fact，
+  // 不是「role 是不是 assistant」。
+  //
+  // 顺序有讲究：必须先投影再快照 `realCounts`，否则统计里结论数是 0。
+  // 之所以放在两遍扫描之前：现有 Fact 是本会话的**最新真相**，
+  // 优先级高于旧摘要里吸收来的条目（`collect` 会按 `seen` 去重）。
+  if (facts !== undefined) {
+    // ## 必须**从新到旧**遍历（★2026-11-15 独立审查 P0）
+    //
+    // `sessionFacts` 是「越新越靠后」的数组（见 `recordSessionFacts`）。
+    // 首版 `for (const fact of facts)` 从头遍历 + `collect(..., 15)` 上限，
+    // 取到的是**最旧**的 15 条：实测 30 条账本只留第 0..14 条。
+    //
+    // 后果：账本超过 15 条后，新写入的 Fact **永远进不了摘要**。
+    // 真实日志证据 —— seq 6557/6686/6883/6888/7016 五次连续裁剪，
+    // 结论段首条完全相同（`file:// 形式的图片会被拦截…`）。
+    //
+    // 倒序遍历 + 走共享 `seen`：新值优先占槽，旧值只在有空位时补进来。
+    for (let i = facts.length - 1; i >= 0; i -= 1) {
+      const fact = facts[i] as { kind: string; statement: string; status?: string };
+      if (fact.status !== undefined && fact.status !== 'active') continue;
+      // 只收「会答用户问题」的四类：
+      //   约束/决策/结论 = 已定的事；statement = 这是什么
+      // 位置与工件已在「用户请求」与工具行里体现，不重复占结论槽。
+      if (
+        fact.kind !== 'constraint' &&
+        fact.kind !== 'decision' &&
+        fact.kind !== 'conclusion' &&
+        fact.kind !== 'statement'
+      ) {
+        continue;
+      }
+      collect(conclusions, seen, `- ${oneLine(fact.statement, 300)}`, CONCLUSION_SLOTS);
+    }
+  }
+
+  // ── lrc-prune 正文**补位**（★2026-11-15 代码审查）──
+  //
+  // 账本先占，prune 只用剩余槽位。见 `pruneConclusions` 注释：
+  // 共用同一个桶会让 15 条 prune 把账本全挤掉。
+  //
+  // ## 同样必须从新到旧（同一次审查的第二处）
+  //
+  // `pruneConclusions` 也是按重放顺序收的（旧→新）。若从头遍历，
+  // 15 条 prune 只会留下最早的 10 条，**本轮最新的任务产出反而丢失** ——
+  // 与账本那处是同一个缺陷的两个实例。
+  // 注意 `collect` 会用 `seen` 去重，而 prune 的条目可能和账本同文
+  // （同一条被替换的助手正文既入了账本、又还在重放里）。复用 `seen`
+  // 正是要的效果：账本已收过就不再重复补位。
+  for (let i = pruneConclusions.length - 1; i >= 0; i -= 1) {
+    if (conclusions.length >= CONCLUSION_SLOTS) break;
+    collect(conclusions, seen, pruneConclusions[i] as string, CONCLUSION_SLOTS);
   }
 
   // ── 两遍扫描：真实内容优先，旧摘要只补空位 ──
@@ -780,6 +1143,38 @@ export function buildDeterministicSummary(
   }
   for (let i = priorSummaries.length - 1; i >= 0; i -= 1) {
     absorbPriorSummary(priorSummaries[i] as string, { requests, calls, errors, conclusions }, seen);
+  }
+
+  // ## 结论为空时必须**显式标注**（★2026-11-15 六钥匙裁决）
+  //
+  // ## 为什么不能就这样留空
+  //
+  // 摘要会替换历史进入上下文。结论段为空时，接手方看到的是
+  // 「用户问了什么 + 调了哪些工具」—— 它**无从知道是没有结论，
+  // 还是结论被裁掉了**。「信息为 0」与「无法判断有没有信息」是两回事，
+  // 后者才是真正的损失。
+  //
+  // 实测（15 次裁剪）：结论真实值为 0 的占 20%。比例不高但确实发生，
+  // 且发生时分不清是哪种情况。
+  //
+  // ## 为什么用 LLM 补生成（否决）
+  //
+  // 那会引入**第三套语义判断**（提取层已有 `validateFact` /
+  // `validateJudgedFact` 的仲裁）。而摘要会替换历史，判错后的污染是
+  // 持续的、不可撤回的。为 20% 的场景付这个代价不划算。
+  //
+  // ## 为什么用「（…）」而不是「- …」
+  //
+  // `summaryStats` 只统计以 `- ` 开头的行。用圆括号前缀让它**不计入
+  // 结论条数** —— 否则日志里「结论 1」会掩盖真相（真实 0）。
+  //
+  // ## 措辞只写可核对的事实
+  //
+  // 不写「未沉淀为 Fact 的正文 N 条」这类无法核验的推断 —— 摘要里
+  // 每一句都应该是可追溯到具体数据的。只报「裁了多少条消息」。
+  if (conclusions.length === 0) {
+    const cutCount = Array.isArray(messages) ? messages.length : 0;
+    conclusions.push(`（本段无可用结论：已裁 ${cutCount} 条消息）`);
   }
 
   // 区块顺序 = 信息价值顺序，截断从最低价值端砍。
@@ -807,11 +1202,11 @@ export function buildDeterministicSummary(
   };
 
   let text = render(all);
-  if (text.length <= maxChars) return text;
+  if (text.length <= max) return text;
 
   // 超限：按 weight 升序逐条丢弃最低价值段落，直到装得下
   const working = all.map((s) => ({ ...s, lines: [...s.lines] }));
-  while (text.length > maxChars) {
+  while (text.length > max) {
     // 先删权重最低的段落的最后一条；该段空了就整段移除
     const target = working
       .filter((s) => s.lines.length > 0)
@@ -820,8 +1215,8 @@ export function buildDeterministicSummary(
     target.lines.pop();
     text = render(working.filter((s) => s.lines.length > 0));
   }
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars - 1)}…`;
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
 }
 
 /**
@@ -836,8 +1231,9 @@ export function summaryStats(
   /**
    * 可选：第一遍真实条数（由 `buildDeterministicSummary` 回填）。
    *
-   * 传入后，若某桶的最终条数 ≠ 真实条数（差额来自旧摘要补位），
-   * 会标注「（真实 N）」，避免把补位上限误读成真实负载。
+   * 传入后，若某桶的末尾条数 ≠ 真实条数，会标注构成
+   * （`N新+M继承` 或 `截断自 N`）—— 避免把补位上限误读成真实负载，
+   * 也避免把「本段没有真实用户发言」误读成「统计坏了」。
    */
   realCounts?: { requests: number; conclusions: number; errors: number; calls: number },
 ): string {
@@ -856,8 +1252,44 @@ export function summaryStats(
     }
     if (section !== undefined && line.startsWith('- ')) counts[section] += 1;
   }
-  const part = (label: string, total: number, real: number | undefined): string =>
-    real !== undefined && real !== total ? `${label} ${total}（真实 ${real}）` : `${label} ${total}`;
+  /**
+   * 输出该桶的**来源构成**，形如：
+   * - `3`                                   —— 全是本段真实内容
+   * - `8(0新+8继承)`                         —— 本段没有真实内容，全部继承自上游摘要
+   * - `26(截断自 30)`                        —— 真实有 30 条，被字符预算截到 26
+   *
+   * ## 为什么不能只写「真实 N」
+   *
+   * 旧写法 `请求 8（真实 0）` 在真实日志里连续出现 18 次，读起来像
+   * 「8 条请求里 0 条是真的」—— 即「统计坏了」或「用户发言全丢了」。
+   * 实测核对（用 `shadowedSeqs` 回查被遮蔽区间）后确认：那 8 条**全部**来自
+   * 旧摘要继承，被裁区间里确实一条真实用户消息都没有，**统计是对的**。
+   *
+   * ## 为什么必须分三支而不是 `total - real`
+   *
+   * ★独立审查 P0：首版写成 `${total}(=${real}新+${total - real}旧)`，
+   * 隐含假设 `real ≤ total`。但 `realCounts` 在**截断之前**快照
+   * （见 `buildDeterministicSummary` 里 `realCounts` 赋值处），而
+   * `maxChars` 超限时会按 weight 升序丢弃整段末尾条目 —— `调用` 段
+   * weight=0，最先被砍。于是 `real` 可以是 30 而 `total` 只有 26，
+   * `total - real` 得到 **负数**：
+   * ```
+   * 调用 26(=30新+-4旧)   ← 旧措辞至少只是模糊，这是数学上不可能的数
+   * ```
+   * 实测生产日志确实存在 `调用 26（真实 30）` / `调用 22（真实 30）`。
+   *
+   * 所以三种关系必须分别表达：`<`（继承）、`>`（截断）、`=`（不标注）。
+   *
+   * 用「继承」而不是「旧」：`8旧` 会被读成「这 8 条记忆很老」，
+   * 而实际含义是「继承自上游摘要」。
+   */
+  const part = (label: string, total: number, real: number | undefined): string => {
+    if (real === undefined || real === total) return `${label} ${total}`;
+    // 真实多于末尾条数 ⇒ 被字符预算截断
+    if (real > total) return `${label} ${total}(截断自 ${real})`;
+    // 真实少于末尾条数 ⇒ 差额来自由旧摘要补位
+    return `${label} ${total}(${real}新+${total - real}继承)`;
+  };
   return (
     `${part('请求', counts.requests, realCounts?.requests)} / ` +
     `${part('结论', counts.conclusions, realCounts?.conclusions)} / ` +
@@ -1330,8 +1762,10 @@ export async function trimContext(deps: {
         }
       }
     }
+    // `buildDeterministicSummary` 内部已对 NaN / 缺字段兜底（见该函数入口注释），
+    // 这里只负责把「源字符数 / 4」与配置上限取小。
     const cap = Math.max(200, Math.min(options.maxSummaryChars, Math.floor(sourceChars / 4)));
-    const text = buildDeterministicSummary(list, cap, summaryRealCounts);
+    const text = buildDeterministicSummary(list, cap, summaryRealCounts, options.facts);
     summaryChars = text.length;
     summaryText = text;
     return {

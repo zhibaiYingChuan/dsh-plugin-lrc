@@ -57,6 +57,17 @@ export interface RecallItem {
   id: string;
   content: string;
   memory_type: string;
+  /**
+   * 融合分（RRF 名次分，**不是语义相关度**）。
+   *
+   * RRF = Σ1/(60+rank)，值域 `(0, 2/61]`。实测只有三个离散簇：
+   * 单路命中 0.0164、双路命中 0.0301、双路靠前 0.0328，无中间值。
+   * 它衡量的是「命中几条检索通路、各排第几」，与查询-记忆的语义相似度正交。
+   *
+   * 用途：作为**粗筛**（要求至少两路命中）足够，作为相关性证明不够。
+   * 缺失（含 `null`）时调用方需退回相对分路径，见 `formatRecallInjection`。
+   */
+  score?: number;
   /** 展示用相关度（0–1，相对 top1 归一化） */
   score_norm: number;
   importance: number;

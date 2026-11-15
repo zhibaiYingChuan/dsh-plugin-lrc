@@ -107,12 +107,12 @@ try {
 }
 
 check('apply 不抛错', threw === null, threw instanceof Error ? threw.message : threw);
-check('注册了五个工具', tools.length === 5, tools.length);
+check('注册了六个工具', tools.length === 6, tools.length);
 
 const names = tools.map((tool) => (tool as { name?: string }).name);
 check(
   '工具名正确',
-  names.join(',') === 'lrc_remember_now,lrc_recall,lrc_forget,lrc_handoff,lrc_status',
+  names.join(',') === 'lrc_remember_now,lrc_recall,lrc_forget,lrc_handoff,lrc_fetch_artifact,lrc_status',
   names,
 );
 check('订阅了 session/event', events.includes('session/event'), events);

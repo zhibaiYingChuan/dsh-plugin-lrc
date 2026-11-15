@@ -1,38 +1,43 @@
 /**
  * 持续记忆沉淀：把对话边聊边搬进 LRC 长期记忆。
  *
- * ## 与"压缩时抢救"的区别
+ * ## 唯一写入路径
+ *
+ * ```
+ * 文本块 ──► extractFacts() ──► validateFact() ──► dedupeFacts() ──► migrate
+ * ```
+ *
+ * 本模块只做「切片 / 查重 / 落库 / 产出快照」，**不做任何语义判定** ——
+ * 判定全部在 `memory-schema.ts`（唯一真理源）与 `memory-extract.ts`
+ * （唯一提取器）。这样任何修复都只有一处可落，不存在「补丁落在路径之外」。
+ *
+ * ## 与「压缩时抢救」的区别
  *
  * 压缩时抢救 = 上下文已经涨到阈值，才把结论捞出来。此时已经晚了：
  * 宿主会生成一句干瘪摘要，约束全丢。
  *
- * 持续沉淀 = 每 N 步 / 8 轮 / 6000 字符就把结论搬走，上下文增速降到 1/8 左右。
- *
- * ## 三层过滤都在这里收口
- *
- * 送进 LRC 之前依次经过：硬规则（`hardFilter`）→ 本地查重（`isDuplicate`）。
- * 宿主 LLM 的 `<lrc_memory>` 提炼由 `hardFilter` 优先采纳。
- * LRC 只负责存，不做任何语义判断。
+ * 持续沉淀 = 每 N 步 / 8 轮 / 6000 字符就把结论搬走。
  *
  * ## 本模块不依赖 DSH
  *
- * 只做"给定新增文本 → 过滤 → 提炼 → 落库 → 产出快照行"。
  * 事件订阅在 index.ts 里做，这样核心逻辑可以脱离宿主单测。
  */
 import type { DistilledItem, LrcClient } from './lrc-client.ts';
 import { advanceCursor, sliceByCursor, type CursorStore, type RecentStore } from './cursor.ts';
 import {
   areNearDuplicate,
-  carriesResourceLocation,
   DEFAULT_DEDUP_THRESHOLD,
-  extractMemoryTag,
-  hardFilter,
   isDuplicate,
-  isKeyResourceLocation,
-  isNoUpdate,
-  jaccard,
-  maskPaths,
 } from './memory-filter.ts';
+import {
+  dedupeFacts,
+  extractFacts,
+  extractFactsFromReasoning,
+} from './memory-extract.ts';
+import {
+  factsToItems,
+  type MemoryFact,
+} from './memory-schema.ts';
 
 export interface OffloadConfig {
   /** 累计多少轮触发一次卸载 */
@@ -45,7 +50,7 @@ export interface OffloadConfig {
   project: string;
   /** 单次最多提炼条数 */
   maxItems: number;
-  /** 快照里最多列几条结论 */
+  /** 快照里最多列几条 */
   snapshotItems: number;
   /** 本地查重阈值（Jaccard） */
   dedupThreshold: number;
@@ -65,15 +70,15 @@ export const DEFAULT_OFFLOAD_CONFIG: OffloadConfig = {
 };
 
 export interface OffloadResult {
-  /** 本次送进 distill 的字符数（验收标准 1 用） */
+  /** 本次处理的字符数 */
   charsSent: number;
-  /** 提炼出的条数 */
+  /** 通过 schema 校验的条数 */
   distilled: number;
   /** 新写入条数 */
   written: number;
   /** 合并进已有记忆的条数 */
   merged: number;
-  /** 被本地查重丢弃的块数 */
+  /** 被本地查重丢弃的条数 */
   deduped: number;
   /** 注入下一轮的状态快照（1~3 行） */
   snapshot: string;
@@ -83,227 +88,156 @@ export interface OffloadResult {
 
 /** 沉淀累计统计（`lrc_status` 用）。 */
 export interface OffloadStats {
-  /** 累计成功沉淀次数 */
   flushCount: number;
-  /** 累计新写入条数 */
   totalWritten: number;
-  /** 累计合并进已有记忆的条数 */
   totalMerged: number;
-  /** 累计被本地查重丢弃的块数 */
   totalDeduped: number;
-  /** 最近一次沉淀时间（毫秒时间戳；0 表示还没沉淀过） */
   lastFlushAt: number;
-  /** 最近一次新写入条数 */
   lastFlushWritten: number;
-  /** 最近一次合并条数 */
   lastFlushMerged: number;
-  /** 当前查重窗口里的块数 */
   recentWindow: number;
 }
 
+/** 快照优先级（0 最高）。 */
+function keepPriority(fact: MemoryFact): number {
+  switch (fact.kind) {
+    case 'location':
+    case 'constraint':
+    case 'goal':
+      return 0;
+    case 'artifact':
+      // ## 工件指针必须与 location 同级（★2026-11-14 审查 P1）
+      //
+      // 它的作用是「告诉模型有这样一份长文档，要用就去取」。若排进 rank 3
+      // （默认分支），`snapshotItems=3` 时会被三条约束完全挤掉 ——
+      // 实测：3 条约束 + 1 条工件指针 → 快照里**没有**工件，模型因此
+      // 永远不知道该调 `lrc_fetch_artifact`，落盘等于白做。
+      //
+      // 排 0 是因为它与「资源在哪」同属**现场状态**：缺了它，接手方会在
+      // 一个信息不全的现场里继续干活。
+      return 0;
+    case 'decision':
+      return 1;
+    case 'conclusion':
+      return 2;
+    default:
+      return 3;
+  }
+}
+
 /**
- * 把提炼结果压成一行状态快照。
+ * 把记忆压成一行状态快照。
  *
  * ## 为什么不是「取最近几条」
  *
  * 原实现是 `items.slice(0, maxItems)` —— 纯按顺序取，等于「最新优先」。
- * 实测注入序列（session-e1419190，20 次注入）：
+ * 实测注入序列（session-e1419190，20 次注入）全是**过程中遇到的问题**，
+ * 没有一条是「当前任务的约束」；而 turn 4 用户明确说「音频在桌面，
+ * 别走 IDM 下载」，这条约束从未进入快照。
  *
- * ```
- * [LRC 状态] CLI 已安装（@motionharness/cli@0.1.5）
- * [LRC 状态] CLI 已安装                    ← 重复
- * [LRC 状态] The binary is truncated...
- * [LRC 状态] 桌面上的文件与 assets/score.wav 的 MD5 一致
- * ```
+ * ## 现在的取法
  *
- * 全是**过程中遇到的问题**，没有一条是「当前任务的约束」。
- * 而 turn 4 用户明确说「音频在桌面，别走 IDM 下载」—— 这条约束从未进入快照。
- *
- * 根因不只是取法：沉淀源本身几乎都来自硬规则从推理流抽的过程记录
- * （因为模型 98.2% 的轮次不输出 `<lrc_memory>`，见 `constraintsFromProse`）。
- *
- * ## 新的取法：约束 > 决策 > 结论，同类按新到旧
- *
- * 「约束」和「决策」是**跨轮有效**的（"不要用 IDM"、"已改用 --stdin"），
- * 结论和事实多半是**当轮有效**的（"CLI 已安装"）。
- * 把跨轮有效的放前面，才让注入的东西对下一轮真的有用。
- *
- * @param items - 本轮新沉淀的条目
- * @param maxItems - 快照里最多列几条
+ * 约束 / 目标 / 资源位置 > 决策 > 结论 > 事实，同类按新到旧，
+ * 且**跨类轮转** —— 单纯按类别排序后取前 N 条，会让同质条目
+ * （三条都在说「缓存放工作区外」）占满全部槽位。
  */
-export function buildSnapshot(items: DistilledItem[], maxItems: number): string {
-  if (items.length === 0) return '';
-  // 跨类轮转 + 同类去近似重复：单纯「按类别排序后取前 N 条」会让
-  // 同质条目（三条都在说「缓存放工作区外」）占满全部槽位，
-  // 把不同类的有效决策全挤掉。实测见 `pickDiverseSnapshot` 注释。
-  const picked = pickDiverseSnapshot(items, maxItems);
+export function buildSnapshot(facts: readonly MemoryFact[], maxItems: number): string {
+  if (facts.length === 0) return '';
+  const picked = pickDiverseSnapshot(facts, maxItems);
   if (picked.length === 0) return '';
   return `[LRC 状态] ${picked.join('；')}。细节在 LRC，需要时 recall。`;
 }
 
 /**
- * 快照取词时**跨类轮转**，避免同类同质条目占满所有槽位。
+ * 跨类轮转取词，同类去掉近似重复。
  *
- * ## 实测问题
- *
- * 真实会话回放（session-e1419190）的最终快照：
- * ```
- * [LRC 状态] 所以缓存必须放在工作区外；只有普通主体（SYSTEM、Administrators…）
- *           的目录才会被接受…；缓存必须在工作区之外。
- * ```
- *
- * 三条全是「缓存要放工作区外」的**同一件事的不同说法**，而
- * `改用 --stdin`、`改用 --file`、`无 BOM 写入` 这些**不同**的有效决策
- * 全被挤掉 —— 快照的信息密度和没排序时一样差。
- *
- * 根因：排序只按「类别优先级」，同类别内部完全按加入顺序，
- * 于是同质条目会连号占满。
- *
- * ## 做法
- *
- * 先按类别优先级分组，再**轮转取**（约束取 1 条 → 决策取 1 条 → 结论 1 条
- * → 约束再取 1 条…），保证不同类别都有机会露脸。
- * 同类别内部再用字符级相似度去掉近似重复（「缓存必须放在工作区外」
- * 与「缓存必须在工作区之外」只保留一条）。
- *
- * @param items - 候选池
+ * @param facts - 候选池（应为新到旧）
  * @param maxItems - 最多输出几条
  */
-/**
- * 快照候选的优先级（0 最高）。
- *
- * ## 为什么必须抽成模块级函数
- *
- * 它同时被两处使用，两处**必须同源**：
- * 1. `buildPooledSnapshot` 的淘汰判据（池满时保留哪些）
- * 2. `pickDiverseSnapshot` 的取词顺序（注入哪些）
- *
- * 上一版两处各写一套（淘汰只认 preference/decision），结果
- * 「资源位置」在取词时是 rank 0、在淘汰时是 low ⇒ 池一满先被删，
- * 提权等于没做（实测前 24 次注入一次都没出现）。
- *
- * ## 「资源位置」提权，但要用**收窄**判据
- *
- * 事故的另一半：用户说「音频在桌面」（seq=1539）终于进了库，
- * 但 LRC 的 distill 把它归成 `code_context`（默认最低优先级），
- * `snapshotItems=3` 时它永远进不了注入。
- *
- * 但**不能**用宽松的 `carriesResourceLocation`：那个判据会把助手正文里的
- * `G:\loong 是仓库`、`在 C:\Users\...\.dsh 下确认配置`、`assets/score.wav 的 MD5 一致`
- * 全提到 rank 0 —— 实测 rank0 从 5 条膨胀到 13 条，
- * 「不要用 IDM 下载」旧版注入 4 次、新版 **0 次**，是明确的**反向回归**。
- *
- * 所以只认 `isKeyResourceLocation`：媒体文件 + 不含过程结论词。
- *
- * @param item - 候选条目
- * @returns 0 = 约束/关键资源；1 = 决策；2 = 结论；3 = 其他（过程/事实）
- */
-function keepPriority(item: DistilledItem): number {
-  if (item.memory_type === 'preference' || item.tags?.includes('constraint')) return 0;
-  // **只有用户来源才提权**（见 `isKeyResourceLocation` 的注释）
-  if (isKeyResourceLocation(item.content, item.origin === 'user')) return 0;
-  if (item.memory_type === 'decision' || item.tags?.includes('decision')) return 1;
-  if (item.tags?.includes('conclusion')) return 2;
-  return 3;
-}
+export function pickDiverseSnapshot(facts: readonly MemoryFact[], maxItems: number): string[] {
+  if (facts.length === 0 || maxItems <= 0) return [];
 
-export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): string[] {
-  if (items.length === 0 || maxItems <= 0) return [];
-
-  const rank = keepPriority;
-
-  // 分组（保持各组内原顺序 = 新到旧）
-  const groups = new Map<number, DistilledItem[]>();
-  for (const item of items) {
-    const r = rank(item);
-    const list = groups.get(r) ?? [];
-    list.push(item);
-    groups.set(r, list);
+  const groups = new Map<number, MemoryFact[]>();
+  for (const fact of facts) {
+    const rank = keepPriority(fact);
+    const list = groups.get(rank) ?? [];
+    list.push(fact);
+    groups.set(rank, list);
   }
 
-  const bodyOf = (item: DistilledItem): string =>
-    item.content.replace(/^\[[^\]]+\]\s*/, '').trim();
+  const bodyOf = (fact: MemoryFact): string => fact.statement.trim();
   const keyOf = (s: string): string => s.replace(/[\s，。；：、！？（）()"'`*]/g, '');
 
   const picked: string[] = [];
   const pickedKeys: string[] = [];
   const cursor = new Map<number, number>();
 
-  /**
-   * 取一条候选（跳过与已选近似重复的）。返回是否取到。
-   */
-  const takeNext = (r: number): boolean => {
-    const list = groups.get(r) ?? [];
-    let i = cursor.get(r) ?? 0;
+  const push = (fact: MemoryFact): void => {
+    const body = bodyOf(fact);
+    picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
+    pickedKeys.push(keyOf(body));
+  };
+
+  /** 取一条未与已选重复的候选。 */
+  const takeNext = (rank: number): boolean => {
+    const list = groups.get(rank) ?? [];
+    let i = cursor.get(rank) ?? 0;
     while (i < list.length) {
-      const body = bodyOf(list[i]);
-      const key = keyOf(body);
+      const fact = list[i] as MemoryFact;
+      const key = keyOf(bodyOf(fact));
       i += 1;
       if (key.length === 0) continue;
       if (pickedKeys.some((p) => areNearDuplicate(p, key, 0.75))) continue;
-      picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-      pickedKeys.push(key);
-      cursor.set(r, i);
+      push(fact);
+      cursor.set(rank, i);
       return true;
     }
-    cursor.set(r, i);
+    cursor.set(rank, i);
     return false;
   };
 
   /**
    * 从指定类别里取一条**满足谓词**的候选并摘掉它。
    *
-   * @returns 是否取到
+   * 必须从组里 `splice` 而不是只挪游标：目标常常排在若干条目之后，
+   * 把游标设到 `idx + 1` 会把它前面那些条目一起跳过（实测导致
+   * 「不要用 IDM 下载」被跳掉、反而注入了低优先级结论）。
    */
-  const takeMatching = (r: number, pred: (i: DistilledItem) => boolean): boolean => {
-    const list = groups.get(r) ?? [];
+  const takeMatching = (rank: number, pred: (f: MemoryFact) => boolean): boolean => {
+    const list = groups.get(rank) ?? [];
     const idx = list.findIndex(pred);
     if (idx < 0) return false;
-    const item = list[idx] as DistilledItem;
-    // **必须从组里摘掉，不能只挪游标**：目标常常排在若干条目之后，
-    // 把游标设到 `idx + 1` 会把它前面那些条目一起跳过。
-    // 实测这样写导致「不要用 IDM 下载」被跳掉、反而注入了 rank2 的过程结论。
+    push(list[idx] as MemoryFact);
     list.splice(idx, 1);
-    const body = bodyOf(item);
-    picked.push(body.length > 120 ? `${body.slice(0, 120)}…` : body);
-    pickedKeys.push(keyOf(body));
     return true;
   };
 
-  // ── 第一步：给两类「用户亲口说的事实」各预留一个槽位 ──
+  // ── 第一步：给三类「现场状态」预留槽位 ──
   //
-  // 1. **资源位置**（`D:\Desktop，score.wav，这是你要打音频`）：
-  //    事故里模型缺的就是「源文件在哪」。LRC 把它归成 `code_context`，
-  //    不提权则永无机会。实测提权后从 1/16 升到 3/15。
+  // 1. **资源位置**（`D:\Desktop，score.wav`）：事故里模型缺的就是「源文件在哪」。
+  // 2. **用户纠正**：只提权资源位置时，它会与大量助手约束争第二槽位，
+  //    实测注入次数从 3/16 回退到 1/15。
+  // 3. **工件指针**（★2026-11-14 审查 P1）：长文本落盘后，这是模型
+  //    知道「该去取回什么」的**唯一线索**。实测不给预留时，
+  //    3 条约束就能把它完全挤掉，落盘等于白做。
   //
-  // 2. **用户纠正**（`不是告诉你音频在的位置了吗…`）：
-  //    只提权资源位置时，它被降为普通约束，只能轮转争第二槽位，
-  //    实测注入次数从 3/16 **回退到 1/15**（被大量助手约束挤掉）。
-  //    而「用户明确纠正过」恰恰是跨轮最该被记住的一类。
+  // 三个预留都要求 `maxItems >= 3`：`snapshotItems=3`（生产默认）下，
+  // 优先级依次是「资源位置 → 工件指针 → 用户纠正」，剩下的空位才给约束。
   //
-  // ## 必须给「至少 1 条约束」留位置
+  // ## 为什么先占工件而不是用户纠正
   //
-  // 上一版写成 `maxItems >= 2` 给资源位置、`>= 3` 给纠正，于是
-  // `maxItems=2` 且两类用户条目都在时 ⇒ **一条约束都不剩**
-  // （实测 `maxItems=2 → 资源+纠正，助手约束 0 条`），
-  // 与「避免把小配置挤死」的意图正好相反。
-  //
-  // 现在两个预留都要求 `maxItems >= 3`：`snapshotItems=3`（生产默认）
-  // 恰好是「资源位置 + 用户纠正 + 一条约束」。
+  // 用户纠正通常已被抽成 constraint（rank 0），即使不做专属预留也还在
+  // 轮转队列里；而工件指针是**唯一**的索引，丢了就再没有别的线索。
   if (maxItems >= 3) {
-    takeMatching(0, (i) => isKeyResourceLocation(i.content, i.origin === 'user'));
-    takeMatching(0, (i) => i.origin === 'user' && !isKeyResourceLocation(i.content, true));
+    takeMatching(0, (f) => f.kind === 'location');
+    takeMatching(0, (f) => f.kind === 'artifact');
+    takeMatching(0, (f) => f.origin === 'user' && f.kind !== 'location' && f.kind !== 'artifact');
   }
 
-  // 轮转取词：**只在前两类（约束、决策）之间轮转**，结论/事实仅用于填空位。
-  //
-  // ## 为什么不能对所有类别都轮转
+  // ── 第二步：只在高价值类（约束/目标/位置、决策）之间轮转 ──
   //
   // 实测：`maxItems=3` 时若让「约束/决策/结论」各占一条，新加入的高价值
-  // 约束（「不要走下载链接」）就进不来 —— 因为结论虽然优先级最低，
-  // 却在第一轮就锁定了第三个槽位。
-  // 约束和决策是**跨轮有效**的，结论/事实多半**当轮有效**，
-  // 让后者挤掉前者是本末倒置。
+  // 约束就进不来 —— 结论虽优先级最低，却在第一轮就锁定第三个槽位。
   const order = [...groups.keys()].sort((a, b) => a - b);
   const HIGH = order.filter((r) => r <= 1);
   const LOW = order.filter((r) => r > 1);
@@ -311,104 +245,20 @@ export function pickDiverseSnapshot(items: DistilledItem[], maxItems: number): s
   let progress = true;
   while (picked.length < maxItems && progress) {
     progress = false;
-    for (const r of HIGH) {
+    for (const rank of HIGH) {
       if (picked.length >= maxItems) break;
-      if (takeNext(r)) progress = true;
+      if (takeNext(rank)) progress = true;
     }
   }
 
-  // 高价值类别取完仍有空位 ⇒ 用结论/事实补满
-  for (const r of [...LOW, ...HIGH]) {
+  // ── 第三步：仍有余位才用结论/事实补满 ──
+  for (const rank of [...LOW, ...HIGH]) {
     if (picked.length >= maxItems) break;
-    while (picked.length < maxItems && takeNext(r)) {
+    while (picked.length < maxItems && takeNext(rank)) {
       // 继续填这个类别
     }
   }
   return picked;
-}
-
-/**
- * 过程叙述词：出现这些词说明句子在描述「接下来要做什么」，不是已完成的结论。
- *
- * 实测 DSH 会话里 AI 会把「接下来我要确认工具参数存放在哪里」写成 `- 结论：…`，
- * 插件按行首标签直接挂 `[结论]`，导致结论计数约 10% 虚高。
- */
-const PROCESS_NARRATION = /接下来|下一步|我要|待确认|待验证|还需要|准备|打算|将要/;
-
-/** 完成时态词：出现这些词说明句子已经得出结论，即使含过程词也不降级。 */
-const COMPLETION_WORDS = /已完成|已确认|已验证|已修复|结论是|因此|所以|说明|表明/;
-
-/** 是否是「过程叙述冒充结论」：含过程词且不含完成词。 */
-function isProcessNarration(body: string): boolean {
-  return PROCESS_NARRATION.test(body) && !COMPLETION_WORDS.test(body);
-}
-
-/**
- * 标签行的类别判定。
- *
- * **行首声明优先**：`决策：…` / `约束：…` / `结论：…` 是模型按系统提示写的固定格式，
- * 必须直接采信。此前先跑关键词匹配，导致「结论：…约束→preference…」这种行
- * 因为正文里出现「约束」二字被劫持成约束。
- * 关键词只在没有行首声明时兜底。
- */
-function classifyTagLine(line: string): {
-  kind: string;
-  memoryType: string;
-  tag: string;
-  importance: number;
-} {
-  const head = /^(决策|约束|结论)\s*[：:]/.exec(line);
-  if (head !== null) {
-    const body = line.slice(head[0].length).trim();
-    switch (head[1]) {
-      case '约束':
-        return { kind: '约束', memoryType: 'preference', tag: 'constraint', importance: 7 };
-      case '决策':
-        return { kind: '决策', memoryType: 'decision', tag: 'decision', importance: 7 };
-      default:
-        // 「结论：接下来我要…」是过程叙述，不是结论 → 降级为事实
-        if (isProcessNarration(body)) {
-          return { kind: '事实', memoryType: 'fact', tag: 'fact', importance: 5 };
-        }
-        return { kind: '结论', memoryType: 'fact', tag: 'conclusion', importance: 6 };
-    }
-  }
-  // 关键词兜底也要先挖路径：`- 看下 docs/禁止.md` 不该被判成约束。
-  const body = maskPaths(line);
-  if (/禁止|严禁|不得|不要|不能|切勿|杜绝|不允许|必须|约束|一律|统一为/.test(body)) {
-    return { kind: '约束', memoryType: 'preference', tag: 'constraint', importance: 7 };
-  }
-  if (/决策|决定|采用|改用|选型|定为|换成|改成/.test(body)) {
-    return { kind: '决策', memoryType: 'decision', tag: 'decision', importance: 7 };
-  }
-  return { kind: '结论', memoryType: 'fact', tag: 'conclusion', importance: 6 };
-}
-
-/**
- * 把 `<lrc_memory>` 标签内容直接转成记忆条目。
- *
- * **必须绕过 distill**：标签内容已经是宿主 LLM 提炼过的精粮，
- * 再送进 LRC 的规则式打分会被二次过滤 —— 实测 `- 决策：用 pnpm 替代 npm`
- * 因为 `DECISION_WORDS` 里没有「决策」而被直接丢掉。
- */
-export function itemsFromTag(tag: string): DistilledItem[] {
-  const items: DistilledItem[] = [];
-  const lines = tag.split('\n');
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim().replace(/^[-*+]\s*/, '').trim();
-    if (line.length === 0) continue;
-    const { kind, memoryType, tag: tagName, importance } = classifyTagLine(line);
-    // 去掉模型自己写的 `决策：` 前缀，避免入库变成 `[决策] 决策：…` 重复
-    const body = line.replace(/^(决策|约束|结论|决定)\s*[：:]\s*/, '').trim();
-    items.push({
-      content: `[${kind}] ${body.length > 0 ? body : line}`,
-      memory_type: memoryType,
-      tags: [tagName, 'distilled', 'lrc_memory'],
-      importance,
-      source_turns: [i, i],
-    });
-  }
-  return items;
 }
 
 export class Offloader {
@@ -418,8 +268,6 @@ export class Offloader {
    * 为什么不是构造时写死：插件可能在 LRC 还没起来时加载（实测桌面端晚 20 分钟），
    * 此前的做法是整个 Offloader 都不创建 —— 连 `observe()` 的计数都不做，
    * 于是 LRC 恢复后，之前那些轮次的内容已经不在待沉淀队列里了。
-   *
-   * 现在计数器先跑起来，连接一旦就绪只需 `bind()`，不丢历史累计。
    */
   private client: LrcClient | null;
   private readonly cursors: CursorStore;
@@ -428,46 +276,24 @@ export class Offloader {
   private pendingTurns = 0;
   private pendingChars = 0;
   private pendingSteps = 0;
-  /** 最近已发送的块，用于本地查重（跨会话共享，避免重复入库） */
+  /** 最近已发送的内容，用于本地查重（跨会话共享，避免重复入库） */
   private recent: string[] = [];
   /**
    * 快照候选池（**跨批累积**，上限 20）。
    *
-   * ## 为什么必须跨批累积
-   *
-   * 实测（session-e1419190 回放，完全按真实调用时序）：
-   * ```
-   * 第 1 批 items=1 → [LRC 状态] 缓存必须放在工作区之外
-   * 第 2 批 items=1 → [LRC 状态] 网络直连失败，改用搜索      ← 第 1 批被覆盖
-   * 第 3 批 items=1 → [LRC 状态] 改用 --stdin 传入          ← 第 2 批被覆盖
-   * 第 4 批 items=1 → [LRC 状态] 改用 --file 传入
-   * ```
-   *
-   * `buildSnapshot` 只对**传入的那一批**排序。而真实调用每次都只传
-   * 当前这一条消息抽出的 1~2 条 —— 此时「按约束优先排序」在数学上
-   * 等于「原序」，与修复前的 `slice(0, maxItems)` 完全等价。
-   * 整场会话结束时，5 条关键约束全部丢失，只剩最后一条当轮内容。
-   *
-   * 累积后排序才真正有意义：约束能长期占据快照槽位，而不是被
-   * 下一条无关的过程记录顶掉。
+   * `buildSnapshot` 只对**传入的那一批**排序，而真实调用每次只传
+   * 当前这一条消息抽出的 1~2 条 —— 此时「按类别优先排序」在数学上
+   * 等于「原序」，整场会话结束时关键约束全被下一条过程记录顶掉。
    */
-  private snapshotPool: DistilledItem[] = [];
-  /** 快照池上限：够覆盖「跨轮有效的约束」，又不至于让注入文本无限增长 */
+  private snapshotPool: MemoryFact[] = [];
   private readonly snapshotPoolMax = 20;
   /**
    * 池代次：会话切换时递增，用于丢弃**在飞**的旧会话沉淀结果。
    *
-   * ## 为什么光有 `snapshotGeneration` 不够
-   *
-   * 那个闸门在 `index.ts` 的 `.then` 回调里，只拦住 `saveSnapshot`。
-   * 但 `offloadItems()` **内部**就已经 `snapshotPool.push(...)` 了 ——
-   * 等闸门返回时池子早被改脏，无法撤销。
-   *
-   * 实测：A 发起 prose（migrate 200ms）→ 50ms 后切到 B 并 reset 池 →
-   * B 攒自己的约束 → A 的请求返回 ⇒ **B 的快照里混入 A 的私有约束**。
+   * 光有 `snapshotGeneration` 不够：那个闸门在 `index.ts` 的 `.then` 回调里，
+   * 而 `buildPooledSnapshot()` **内部**就改池子 —— 等闸门返回时池子早已被改脏。
    */
   private poolEpoch = 0;
-  /** 累计统计（`lrc_status` 用） */
   private flushCount = 0;
   private totalWritten = 0;
   private totalMerged = 0;
@@ -490,31 +316,19 @@ export class Offloader {
     this.recent = recentStore?.load() ?? [];
   }
 
-  /** 连接是否已就绪。 */
   get connected(): boolean {
     return this.client !== null;
   }
 
-  /**
-   * 当前池代次（发起异步请求时先取一份，返回时比对）。
-   *
-   * 调用方必须在 `await` **之前**读它，否则读到的已是新代次，闸门形同虚设。
-   */
+  /** 当前池代次（发起异步请求时先取一份，返回时比对）。 */
   get epoch(): number {
     return this.poolEpoch;
   }
 
-  /**
-   * 注入 / 替换客户端。
-   *
-   * 传 `null` 表示连接已断：保留所有计数器与游标，
-   * 只停止发起 HTTP —— 恢复后可以接着从断点继续，不会重复也不会丢失。
-   */
   bind(client: LrcClient | null): void {
     this.client = client;
   }
 
-  /** 取客户端（未连接时抛错，调用方负责先判 `connected`）。 */
   private requireClient(): LrcClient {
     if (this.client === null) {
       throw new Error('LRC 尚未连接');
@@ -524,10 +338,9 @@ export class Offloader {
 
   /** 记录一轮新增文本（由 index.ts 在 assistant/message 事件里调用）。 */
   observe(text: string): void {
-    const cleaned = hardFilter(text);
-    if (cleaned.trim().length === 0) return;
+    if (text.trim().length === 0) return;
     this.pendingTurns += 1;
-    this.pendingChars += cleaned.length;
+    this.pendingChars += text.length;
   }
 
   /**
@@ -540,7 +353,6 @@ export class Offloader {
     this.pendingSteps += 1;
   }
 
-  /** 是否达到卸载阈值。 */
   shouldOffload(): boolean {
     return (
       this.pendingTurns >= this.config.turnsThreshold ||
@@ -553,14 +365,12 @@ export class Offloader {
    * 是否有待沉淀内容（turn/end 兜底用）。
    *
    * 必须包含 `pendingSteps`：长任务里可能只有工具调用、没有正文，
-   * 此时步数阈值已经触发，但 turns/chars 都是 0。漏掉步数会让
-   * "88 步兜底"恰好在这类任务上失效。
+   * 此时步数阈值已经触发，但 turns/chars 都是 0。
    */
   hasPending(): boolean {
     return this.pendingTurns > 0 || this.pendingChars > 0 || this.pendingSteps > 0;
   }
 
-  /** 重置计数器（卸载成功或会话切换时调用）。 */
   resetCounters(): void {
     this.pendingTurns = 0;
     this.pendingChars = 0;
@@ -575,91 +385,69 @@ export class Offloader {
    */
   resetSnapshotPool(): void {
     this.snapshotPool = [];
-    // 递增代次：在飞的旧会话沉淀结果回来时会被丢弃（见 `poolEpoch`）
     this.poolEpoch += 1;
   }
 
   /**
    * 把新条目并入池子，再用**整个池子**生成快照。
    *
-   * 为什么不能只对新条目排序：真实调用每次只传 1~2 条，
-   * 此时排序退化为原序，约束照样被下一批过程记录顶掉（见 `snapshotPool`）。
-   *
-   * @param items - 本批新条目
-   * @param epoch - 发起请求时的池代次；与当前不一致说明会话已切换，
-   *                这批结果属于旧会话，**不得写入池子**（见 `poolEpoch`）
+   * @param facts - 本批新记忆
+   * @param epoch - 发起请求时的池代次；与当前不一致说明已切会话，
+   *                这批结果属旧会话，**不得写入池子**
    */
-  private buildPooledSnapshot(items: DistilledItem[], epoch: number = this.poolEpoch): string {
-    // 代次不符：请求在飞期间已切会话并清空池子。
-    // 此时返回空串（不注入），也绝不 push —— 否则 B 会话的快照会混入 A 的私有约束。
+  private buildPooledSnapshot(facts: readonly MemoryFact[], epoch: number = this.poolEpoch): string {
     if (epoch !== this.poolEpoch) return '';
-    // 按内容去重（同一约束可能被多轮重复提到）
-    const seen = new Set(this.snapshotPool.map((i) => i.content.replace(/\s+/g, '')));
-    for (const item of items) {
-      const key = item.content.replace(/\s+/g, '');
+    const seen = new Set(this.snapshotPool.map((f) => f.statement.replace(/\s+/g, '')));
+    for (const fact of facts) {
+      const key = fact.statement.replace(/\s+/g, '');
       if (key.length === 0 || seen.has(key)) continue;
       seen.add(key);
-      this.snapshotPool.push(item);
+      this.snapshotPool.push(fact);
     }
-    // 超限时**优先淘汰结论/事实**，保留约束/决策。
-    //
-    // 原来直接 `slice(-max)` 按入池顺序丢最旧的 —— 而高价值约束往往是
-    // 最早确立的，恰好最先被淘汰。实测：先攒 3 条关键约束，再一次
-    // distill 返回 25 条过程结论（常见量级），3 条约束**全部被挤出**。
     if (this.snapshotPool.length > this.snapshotPoolMax) {
-      // ## 淘汰判据必须与取词判据**同一套**
+      // ## 淘汰判据必须与取词判据**同一套**（`keepPriority`）
       //
-      // 上一版 `isHigh` 只认 preference/decision，而 `rank()` 已经把
-      // 「关键资源位置」也提到了 rank 0。两边不一致的后果（实测）：
-      // 资源位置进了池，但池一满就被判 low 先删掉，
-      // 于是 P0-1 的提权在真实时序下完全失效（前 24 次注入一次都没出现）。
-      //
-      // 现在统一用 `keepPriority`：它返回 0/1 的就是必须优先保留的。
-      const isHigh = (i: DistilledItem): boolean => keepPriority(i) <= 1;
+      // 上一版淘汰只认 preference/decision，而取词把「资源位置」也提到
+      // rank 0 —— 两边不一致时，资源位置进了池但一满就被删，
+      // 提权在真实时序下完全失效（实测前 24 次注入一次都没出现）。
+      const isHigh = (f: MemoryFact): boolean => keepPriority(f) <= 1;
 
-      // ## 资源位置要**钉住**，不参与「按新旧淘汰」
-      //
-      // 它天然是最早确立的（用户一上来就交代文件在哪），而下面的保留逻辑
-      // 是「高价值按新到旧留最后 N 条」—— 一旦高价值超过上限，
-      // 最早的资源位置恰好第一个被丢。实测：先放 1 条资源位置、
-      // 再灌 30 条约束 ⇒ 池满 20，资源位置**已被淘汰**。
-      //
-      // 所以先把它单独摘出来固定保留（最多 2 条，避免极端情况占满池子）。
-      const pinned: DistilledItem[] = [];
-      const rest: DistilledItem[] = [];
-      for (const item of this.snapshotPool) {
-        if (pinned.length < 2 && isKeyResourceLocation(item.content, item.origin === 'user')) pinned.push(item);
-        else rest.push(item);
+      // 资源位置与工件指针要**钉住**：两者天然最早确立（用户一上来就
+      // 交代文件在哪 / 贴进长文档），而下面按「新到旧」保留的规则会让它们
+      // 第一个被丢。工件上限单独算，避免一份长文档占满 pin 名额。
+      const pinned: MemoryFact[] = [];
+      const rest: MemoryFact[] = [];
+      let pinnedLoc = 0;
+      let pinnedArtifact = 0;
+      for (const fact of this.snapshotPool) {
+        if (fact.kind === 'location' && pinnedLoc < 2) {
+          pinned.push(fact);
+          pinnedLoc += 1;
+        } else if (fact.kind === 'artifact' && pinnedArtifact < 1) {
+          pinned.push(fact);
+          pinnedArtifact += 1;
+        } else {
+          rest.push(fact);
+        }
       }
 
       const high = rest.filter(isHigh);
-      const low = rest.filter((i) => !isHigh(i));
+      const low = rest.filter((f) => !isHigh(f));
       const budget = Math.max(0, this.snapshotPoolMax - pinned.length);
 
       // ## 两个必须避开的坑
       //
-      // 1. **`slice(-0)` 返回整个数组**（JS 规范），不是空数组。
-      //    上一版写 `low.slice(-room)`，当 `high.length >= 上限`（room=0）时
-      //    低价值条目一条都没被删 ⇒ 池子无界增长。
-      //    实测：25 条高价值之后每轮 +10 条低价值，池 30→40→…→80。
-      // 2. **保留哪一端**。池子是**追加**的，`slice(0, max)` 留的是**最旧的**
-      //    高价值条目，最新确立的约束反而被丢掉 —— 与「约束跨轮有效、
-      //    越新越相关」的设计意图相反。
-      //
-      // 所以：高价值按**新到旧**保留，剩余槽位才用低价值从新到旧补。
-      const highKept = high.slice(-budget);
+      // 1. `slice(-0)` 返回整个数组（JS 规范）⇒ 池子无界增长。
+      // 2. 保留哪一端：池子追加式，`slice(0, max)` 留的是**最旧**的，
+      //    与「越新越相关」相反。所以高价值按新到旧保留。
+      const highKept = budget > 0 ? high.slice(-budget) : [];
       const room = Math.max(0, budget - highKept.length);
-      this.snapshotPool =
-        room > 0 ? [...pinned, ...highKept, ...low.slice(-room)] : [...pinned, ...highKept];
+      this.snapshotPool = room > 0 ? [...pinned, ...highKept, ...low.slice(-room)] : [...pinned, ...highKept];
     }
-    // 池子是**追加**的（旧 → 新）。注入时要从**新到旧**取：
-    // 淘汰端保留的是最新 20 条（见上），如果取词仍从旧的一端开始，
-    // 注入的就是这批里排第 1~3 的旧条目 —— 与「越新越相关」正好相反。
-    // 实测：30 轮约束后池为 C10…C29，注入的却是 C10/C11/C12。
+    // 池子是追加的（旧 → 新），注入时从新到旧取
     return buildSnapshot([...this.snapshotPool].reverse(), this.config.snapshotItems);
   }
 
-  /** 累计沉淀统计（`lrc_status` 用）。 */
   stats(): OffloadStats {
     return {
       flushCount: this.flushCount,
@@ -673,7 +461,6 @@ export class Offloader {
     };
   }
 
-  /** 记录一次沉淀结果（只统计真正有产出的批次）。 */
   private record(result: OffloadResult): void {
     this.totalDeduped += result.deduped;
     if (result.written === 0 && result.merged === 0) return;
@@ -686,24 +473,21 @@ export class Offloader {
   }
 
   /**
-   * 执行一次卸载。
+   * 执行一次卸载：从 transcript 的新增切片提取记忆并落库。
    *
    * @param sessionId 会话 ID（游标按会话分槽）
    * @param lines 当前 transcript 的全部行
-   * @returns 卸载结果；没有新增内容时返回 null
    */
   async offload(
     sessionId: string,
     lines: readonly (string | { text: string; origin?: 'user' | 'assistant' })[],
   ): Promise<OffloadResult | null> {
-    // 同 `offloadItems`：在 await 之前捕获代次，避免在飞结果污染新会话的池子
     const epoch = this.poolEpoch;
     const state = this.cursors.get(sessionId);
-    // 兼容纯字符串（旧调用方 / 测试）与带来源的对象两种形态
     const plain = lines.map((l) => (typeof l === 'string' ? l : l.text));
-    const originOf = (i: number): 'user' | 'assistant' | undefined => {
+    const originOf = (i: number): 'user' | 'assistant' => {
       const l = lines[i];
-      return typeof l === 'string' ? undefined : l.origin;
+      return typeof l === 'string' ? 'assistant' : (l.origin ?? 'assistant');
     };
     const slice = sliceByCursor(plain, state);
 
@@ -712,71 +496,42 @@ export class Offloader {
       return null;
     }
 
-    // 第一层：硬规则过滤。
-    //
-    // **按"消息"整段过滤，不能按物理行**：`stripCodeFences` 需要跨行维护
-    // 围栏状态，逐行调用时状态永远是初始值，围栏内的代码会直接透传。
-    // `lines` 的每个元素就是一条完整消息（可能多行），正好是过滤单元。
-    const newLines = plain.slice(slice.fromLine);
-
-    // 第二层产物：标签内容直接成条目，**绕过 distill**（避免二次过滤）
-    const taggedItems: DistilledItem[] = [];
-    // 兜底路径：没有标签的消息走硬规则 + distill
-    const untagged: string[] = [];
-    // 与 `untagged` 一一对应的来源（下标始终对齐）
-    const untaggedOrigin: Array<'user' | 'assistant' | undefined> = [];
-
-    for (let i = 0; i < newLines.length; i += 1) {
-      const message = newLines[i] as string;
-      const origin = originOf(slice.fromLine + i);
-      const tag = extractMemoryTag(message);
-      if (tag !== null) {
-        if (!isNoUpdate(tag)) {
-          // 标签内容继承所在消息的来源，否则用户消息里的标签会失去 `user`
-          taggedItems.push(...itemsFromTag(tag).map((item) => (origin === undefined ? item : { ...item, origin })));
-        }
-        continue;
-      }
-      const cleaned = hardFilter(message);
-      if (cleaned.trim().length > 0) {
-        untagged.push(cleaned);
-        untaggedOrigin.push(origin);
-      }
+    // 每个元素就是一条完整消息（可能多行）—— 正好是提取单元。
+    // **不能按物理行切**：围栏状态需要跨行维护，逐行处理会让代码透传。
+    const collected: MemoryFact[] = [];
+    let charsSent = 0;
+    for (let i = slice.fromLine; i < plain.length; i += 1) {
+      const message = plain[i] as string;
+      if (message.trim().length === 0) continue;
+      charsSent += message.length;
+      const result = extractFacts({
+        text: message,
+        origin: originOf(i),
+        sessionId,
+        turn: i,
+      });
+      collected.push(...result.facts);
     }
 
-    // 第三层：本地查重 —— 换措辞复述连 HTTP 都不发
-    const freshTagged: DistilledItem[] = [];
-    const freshBlocks: string[] = [];
-    /** 与 `freshBlocks` 一一对应的来源 */
-    const freshBlockOrigin: Array<'user' | 'assistant' | undefined> = [];
-    let deduped = 0;
-    for (const item of taggedItems) {
-      // 同批查重：与 `offloadItems` 同因（模型常一轮内重复同一条约束）
-      const sameInBatch = freshTagged.some((f) =>
-        areNearDuplicate(f.content, item.content, this.config.dedupThreshold),
-      );
-      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+    // 本地查重（跨批 + 批内）：换措辞复述连 HTTP 都不发
+    const { fresh, dropped } = dedupeFacts(collected, [], (a, b) =>
+      areNearDuplicate(a, b, this.config.dedupThreshold),
+    );
+    const kept: MemoryFact[] = [];
+    let deduped = dropped;
+    for (const fact of fresh) {
+      if (isDuplicate(fact.statement, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
-      freshTagged.push(item);
-    }
-    for (let i = 0; i < untagged.length; i += 1) {
-      const block = untagged[i] as string;
-      const sameInBatch = freshBlocks.some((f) => areNearDuplicate(f, block, this.config.dedupThreshold));
-      if (sameInBatch || isDuplicate(block, this.recent, this.config.dedupThreshold)) {
-        deduped += 1;
-        continue;
-      }
-      freshBlocks.push(block);
-      freshBlockOrigin.push(untaggedOrigin[i]);
+      kept.push(fact);
     }
 
-    // 没有新内容：这段确实没有可沉淀的东西，游标可以安全推进
-    if (freshTagged.length === 0 && freshBlocks.length === 0) {
+    if (kept.length === 0) {
+      // 本段确实没有可入库内容 ⇒ 游标可以安全推进（不会丢任何东西）
       this.commitCursor(sessionId, plain, slice.fromLine);
       const empty: OffloadResult = {
-        charsSent: 0,
+        charsSent,
         distilled: 0,
         written: 0,
         merged: 0,
@@ -788,60 +543,10 @@ export class Offloader {
       return empty;
     }
 
-    let items: DistilledItem[] = [...freshTagged];
-    let charsSent = freshTagged.reduce((sum, item) => sum + item.content.length, 0);
-
-    if (freshBlocks.length > 0) {
-      const text = freshBlocks.join('\n');
-      charsSent += text.length;
-      const distilled = await this.requireClient().distill(
-        text,
-        this.config.project,
-        this.config.maxItems,
-      );
-      // **`distill` 返回的条目没有来源**（那是 LRC 侧的规则式提炼），
-      // 只能按块级来源回填。
-      //
-      // ## 必须取交集，不能取并集
-      //
-      // 上一版写「只要批内有 user 块就整批标 user」。这给助手开了一条
-      // 新的提权通道：
-      // ```
-      // 混合批：user「帮我给这个视频配一段音乐」
-      //       + assistant「音频已放到 assets/bgm.mp3 了」
-      //   ⇒ 蒸馏出的条目 origin=user ⇒ isKey=true ⇒ 抢 rank0
-      // ```
-      // 与前三轮修掉的假货是同一机制，只是入口从「文本形态」换成「来源误标」。
-      // 实测真实回放里已有一条助手正文被标成 user。
-      //
-      // 安全侧是**全部块都是 user 才标 user**：块级来源无法按条目切分，
-      // 保守处理最多是漏提权（少一次注入），而误标会让助手长期占槽。
-      const allUser = freshBlockOrigin.every((o) => o === 'user');
-      const batchOrigin: 'user' | 'assistant' | undefined = allUser
-        ? 'user'
-        : freshBlockOrigin.every((o) => o === 'assistant')
-          ? 'assistant'
-          : undefined;
-      items = [
-        ...items,
-        ...distilled.items.map((item) => (batchOrigin === undefined ? item : { ...item, origin: batchOrigin })),
-      ];
-    }
-
-    let written = 0;
-    let merged = 0;
-    if (items.length > 0) {
-      const migrated = await this.requireClient().migrate(items, this.config.project);
-      written = migrated.written;
-      merged = migrated.merged;
-    }
-
-    // **只有 distill + migrate 都成功才推进游标**。
-    // 提前推进会让任何一次网络抖动 / LRC 重启 / 超时把这一批对话永久丢掉。
+    const migrated = await this.requireClient().migrate(factsToItems(kept) as DistilledItem[], this.config.project);
+    // **只有 migrate 成功才推进游标**（见方法尾部注释）
     this.commitCursor(sessionId, plain, slice.fromLine);
-
-    // 记录已发送的块，供后续查重
-    this.recent.push(...freshTagged.map((item) => item.content), ...freshBlocks);
+    this.recent.push(...kept.map((f) => f.statement));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
     }
@@ -849,11 +554,11 @@ export class Offloader {
 
     const result: OffloadResult = {
       charsSent,
-      distilled: items.length,
-      written,
-      merged,
+      distilled: kept.length,
+      written: migrated.written,
+      merged: migrated.merged,
       deduped,
-      snapshot: this.buildPooledSnapshot(items, epoch),
+      snapshot: this.buildPooledSnapshot(kept, epoch),
       reset: slice.reset,
     };
     this.record(result);
@@ -861,42 +566,34 @@ export class Offloader {
   }
 
   /**
-   * 直接沉淀一批已提炼的条目（**不走行游标**）。
+   * 直接沉淀一批已提取的记忆（**不走行游标**）。
    *
-   * 用于推理结论兜底：这些句子来自 reasoning 流，不在 transcript 行流里，
-   * 无法用行号游标追踪，只能按内容查重。查重窗口与主路径共用。
+   * 用于推理兜底与 LLM 补全：这些内容不在 transcript 行流里，
+   * 无法用行号游标追踪，只能按内容查重。
    *
-   * @param items 已分类的记忆条目
-   * @param options.intoPool - 是否把条目并入快照池。
-   *   **补写旧会话时必须传 `false`**：补写发生在切会话之后，
-   *   此时池子已经属于新会话，把旧会话的私有约束 push 进去会让
-   *   新会话下一次注入出现「B 的约束；A 会话私有：不要用 IDM」。
-   *   记忆本身仍要写进 LRC（`migrate`），只是不参与当前会话的快照。
-   * @returns 卸载结果；全部被查重拦下时返回零值结果
+   * @param options.intoPool - 是否并入快照池。**补写旧会话时必须传 `false`**：
+   *   补写发生在切会话之后，此时池子已属于新会话，push 进去会让新会话
+   *   下一次注入出现「B 的约束；A 会话私有：…」。
    */
-  async offloadItems(
-    items: DistilledItem[],
+  async offloadFacts(
+    facts: readonly MemoryFact[],
     options: { intoPool?: boolean } = {},
   ): Promise<OffloadResult> {
-    // **在 await 之前**取代次：之后可能切会话并 reset 池子，
-    // 那时 `this.poolEpoch` 已变，只有提前捕获的这份才是「本批归属」。
     const epoch = this.poolEpoch;
-    const fresh: DistilledItem[] = [];
-    let deduped = 0;
-    for (const item of items) {
-      // **同批也要查重**：模型在同一轮里常把同一条约束说三遍，
-      // 上一版只跟历史窗口 `this.recent` 比，于是三条全部进 `migrate`。
-      // 实测 `offloadItems([同一内容 ×3])` → `distilled=3, deduped=0`。
-      // 后果：`written` 统计虚高，每次补写多发一次 HTTP；
-      // 一旦 LRC 的相似合并阈值调高，就会真的写入重复记忆、被 recall 反复召回。
-      const sameInBatch = fresh.some((f) => areNearDuplicate(f.content, item.content, this.config.dedupThreshold));
-      if (sameInBatch || isDuplicate(item.content, this.recent, this.config.dedupThreshold)) {
+    const { fresh, dropped } = dedupeFacts(facts, [], (a, b) =>
+      areNearDuplicate(a, b, this.config.dedupThreshold),
+    );
+    const kept: MemoryFact[] = [];
+    let deduped = dropped;
+    for (const fact of fresh) {
+      // 同批也要查重：模型常把同一条约束说三遍
+      if (isDuplicate(fact.statement, this.recent, this.config.dedupThreshold)) {
         deduped += 1;
         continue;
       }
-      fresh.push(item);
+      kept.push(fact);
     }
-    if (fresh.length === 0) {
+    if (kept.length === 0) {
       const empty: OffloadResult = {
         charsSent: 0,
         distilled: 0,
@@ -910,20 +607,20 @@ export class Offloader {
       return empty;
     }
 
-    const migrated = await this.requireClient().migrate(fresh, this.config.project);
-    this.recent.push(...fresh.map((item) => item.content));
+    const migrated = await this.requireClient().migrate(factsToItems(kept) as DistilledItem[], this.config.project);
+    this.recent.push(...kept.map((f) => f.statement));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
     }
     this.recentStore?.save(this.recent);
 
     const result: OffloadResult = {
-      charsSent: fresh.reduce((sum, item) => sum + item.content.length, 0),
-      distilled: fresh.length,
+      charsSent: kept.reduce((sum, f) => sum + f.statement.length, 0),
+      distilled: kept.length,
       written: migrated.written,
       merged: migrated.merged,
       deduped,
-      snapshot: options.intoPool === false ? '' : this.buildPooledSnapshot(fresh, epoch),
+      snapshot: options.intoPool === false ? '' : this.buildPooledSnapshot(kept, epoch),
       reset: false,
     };
     this.record(result);
@@ -937,3 +634,6 @@ export class Offloader {
     this.resetCounters();
   }
 }
+
+/** 供 index.ts 使用的提取入口（保持单一来源）。 */
+export { extractFacts, extractFactsFromReasoning };

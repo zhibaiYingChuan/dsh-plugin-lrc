@@ -17,7 +17,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LrcClient } from '../src/lrc-client.ts';
 import { CursorStore, snapshotChanged } from '../src/cursor.ts';
-import { buildSnapshot, itemsFromTag, Offloader } from '../src/offloader.ts';
+import { buildSnapshot, Offloader } from '../src/offloader.ts';
+import { extractFacts } from '../src/memory-extract.ts';
 
 // ────────────────────────────────────────────────────────────
 // mock LRC：按契约实现，不做真实语义计算
@@ -285,14 +286,17 @@ try {
   const r5 = await offloader.offload('session-a', rewritten);
   check('无新增时返回 null', r5 === null, r5);
 
-  console.log('\n=== 附加：推理兜底 offloadItems（不走行游标） ===');
-  const reasoningItems = itemsFromTag(
-    '结论：推理兜底必须只抽带结论标记的句子\n决策：改用 offloadItems 直接入库',
-  );
-  const r6 = await offloader.offloadItems(reasoningItems);
-  check('offloadItems 直接入库', r6.distilled === 2 && r6.written + r6.merged === 2, r6);
-  const r7 = await offloader.offloadItems(reasoningItems);
-  check('offloadItems 重复内容被本地查重拦下', r7.distilled === 0 && r7.deduped === 2, r7);
+  console.log('\n=== 附加：推理兜底 offloadFacts（不走行游标） ===');
+  const reasoningFacts = extractFacts({
+    text: '推理兜底必须只抽带结论标记的句子。改用 offloadFacts 直接入库。',
+    origin: 'assistant',
+    sessionId: 'session-a',
+  }).facts;
+  check('推理兜底抽取到 2 条', reasoningFacts.length === 2, reasoningFacts.map((f) => f.statement));
+  const r6 = await offloader.offloadFacts(reasoningFacts);
+  check('offloadFacts 直接入库', r6.distilled === 2 && r6.written + r6.merged === 2, r6);
+  const r7 = await offloader.offloadFacts(reasoningFacts);
+  check('offloadFacts 重复内容被本地查重拦下', r7.distilled === 0 && r7.deduped === 2, r7);
 
   console.log('\n=== 附加：沉淀累计统计（lrc_status 用） ===');
   const stats = offloader.stats();
@@ -324,11 +328,20 @@ try {
 
   console.log('\n=== 附加：快照不再截到 40 字符 ===');
   const longBody = '这是一条很长的结论'.repeat(10);
-  const snap = buildSnapshot(
-    [{ content: `[结论] ${longBody}`, memory_type: 'fact', tags: [], importance: 6, source_turns: [0, 0] }],
-    3,
-  );
-  check('快照保留完整结论', snap.includes(longBody), snap.length);
+  const longFact = {
+    kind: 'conclusion' as const,
+    subject: '结论',
+    predicate: '结论是',
+    value: longBody,
+    statement: `${longBody}`,
+    scope: 'project' as const,
+    origin: 'assistant' as const,
+    confidence: 0.9,
+    source: { sessionId: 'session-a' },
+    status: 'active' as const,
+  };
+  const snap = buildSnapshot([longFact], 3);
+  check('快照保留完整结论（120 字以内不截断）', snap.includes(longBody.slice(0, 100)), snap.length);
 
   console.log('\n=== 附加：快照实质变化判定（缓存命中率） ===');
   check(

@@ -31,25 +31,23 @@ import { LrcClient, type DistilledItem } from './lrc-client.ts';
 import { Recoverable, isConnectionError } from './recoverable.ts';
 import { normalizeRecallOptions, formatRecallInjection, topicFingerprint } from './recall-injection.ts';
 import { CursorStore, RecentStore, snapshotChanged } from './cursor.ts';
-import { Offloader, itemsFromTag } from './offloader.ts';
+import { Offloader } from './offloader.ts';
 import {
   hasMalformedTextBlock,
   isRealUserMessage,
-  linesFromSession,
   linesWithOrigin,
   messageContent,
   reasoningBlocksOnly,
   textBlocksOnly,
   userMessageText,
 } from './session-text.ts';
+import { areNearDuplicate, extractMemoryTag } from './memory-filter.ts';
 import {
-  conclusionsFromReasoning,
-  constraintsFromProse,
-  constraintsFromUser,
-  extractMemoryTag,
-  isKeyResourceLocation,
-  isNoUpdate,
-} from './memory-filter.ts';
+  extractFacts,
+  extractFactsFromReasoning,
+  factsFromLlmLines,
+} from './memory-extract.ts';
+import { factKey, factsToItems, makeArtifactFact, renderFact, validateFact, type MemoryFact } from './memory-schema.ts';
 import {
   DEFAULT_KEEP_RECENT,
   DEFAULT_MAX_NODES_PER_RUN,
@@ -61,6 +59,9 @@ import {
   trimContext,
 } from './context-trim.ts';
 import { buildHandoffText, createHandoffSession, extractHandoffSource } from './handoff.ts';
+import { projectHandoff } from './handoff-projection.ts';
+import { ArtifactStore, hashContent, isArtifactWorthy } from './artifact-store.ts';
+import { extractWithLlm, shouldFallbackToLlm } from './llm-extract.ts';
 import { formatCapabilities, probeCapabilities } from './capabilities.ts';
 import { formatBudget, resolveBudget, type ResolvedBudget } from './budget.ts';
 import { formatProfile, profileSurface } from './context-profile.ts';
@@ -140,17 +141,42 @@ export interface Config {
   recallInjectEnabled: boolean;
   /** 最多注入几条 */
   recallInjectMaxItems: number;
-  /** 低于该相关度不注入（0–1） */
+  /** 相对分下限（0–1，`score_norm`，top1 恒为 1.0） */
   recallInjectMinScore: number;
+  /** 绝对分下限（`score`，RRF 融合原始分，实测量级 0.016–0.032） */
+  recallInjectMinRawScore: number;
   /** 单条截断字符数 */
   recallInjectMaxCharsPerItem: number;
+  /**
+   * 规则抽不到关键信息时，是否用一次独立模型调用兜底。
+   *
+   * 默认关闭：这是**唯一会额外产生模型请求**的路径，必须由用户显式开启。
+   * 开启后仍受下面三项配额约束。
+   */
+  llmExtractEnabled: boolean;
+  /** 会话级最大兜底调用次数（0 = 不限制） */
+  llmExtractMaxCalls: number;
+  /**
+   * **进程级**最大兜底调用次数（0 = 不限制）。
+   *
+   * 会话配额是按桶独立的，多窗口场景下总量会成倍放大（21 个会话 × 40 次
+   * = 840 次）。而且会话桶会因 Map 上限被淘汰重建，单靠它约束不住进程总量。
+   * 这是最终的硬上限：打满后任何会话都不再兜底。
+   */
+  llmExtractGlobalMaxCalls: number;
+  /** 两次兜底调用之间的最小间隔（毫秒） */
+  llmExtractMinIntervalMs: number;
+  /** 正文短于此长度不触发兜底（碎片不值得单独问一次） */
+  llmExtractMinChars: number;
+  /** 单次发送给兜底模型的正文上限（字符，超出取尾部） */
+  llmExtractMaxInputChars: number;
 }
 
 export const Config: Schema = Schema.object({
   baseUrl: Schema.string().default(''),
   token: Schema.string().default(''),
   project: Schema.string().default('dsh'),
-  offloadTurns: Schema.number().default(8),
+  offloadTurns: Schema.number().default(4),
   offloadChars: Schema.number().default(6000),
   // 20 步对工具密集型轮次太晚：实测 16 步的会话一次都没触发，
   // 快照始终为空。降到 8 步，让中途也能沉淀出 `[LRC 状态]`。
@@ -210,20 +236,95 @@ export const Config: Schema = Schema.object({
 
   // ── 主动召回注入 ──
   // 实测（2026-11-12，379 步真实会话）：模型从未想起调用 lrc_recall，
-  // 系统提示写了也没用。改为由插件主动把相关记忆推进上下文。
-  // 默认关闭：先让用户按需开启并观察缓存命中率，确认无副作用再改默认值。
+  // 系统提示写了也没用。改为由插件把**相关**记忆推进上下文。
+  //
+  // 默认仍关闭：这是会改动系统提示的路径，需用户在自己的 patch 里显式开启。
+  // 是否启用由 `cordis.patch.yml` 决定（真正生效的是 profile 层那份）。
   /** 是否主动注入相关记忆 */
   recallInjectEnabled: Schema.boolean().default(false),
   /** 最多注入几条 */
   recallInjectMaxItems: Schema.number().default(2),
-  /** 低于该相关度不注入（0–1） */
-  recallInjectMinScore: Schema.number().default(0.5),
+  /** 相对分下限（top1 恒为 1.0，单靠它等于永远放行一条） */
+  recallInjectMinScore: Schema.number().default(0.85),
+  /**
+   * 绝对分下限（RRF 融合分，**名次信号而非语义相关度**）。
+   *
+   * RRF = Σ1/(60+rank)，值域 `(0, 2/61]`。实测三个离散簇：单路 0.0164 /
+   * 双路 0.0301 / 双路靠前 0.0328，无中间值。0.025 等价于「要求至少两路命中」。
+   * 实测区分力：项目内查询 12/12 过线，生活类无关查询 2/12 过线。
+   */
+  recallInjectMinRawScore: Schema.number().default(0.025),
   /** 单条截断字符数 */
   recallInjectMaxCharsPerItem: Schema.number().default(80),
+
+  // ── LLM 兜底提取 ──
+  // 规则层（正则）只能覆盖「见过的措辞」，而模型表达是开放的。
+  // 实测真实日志 214 句含信号句，规则抽出 113 句，边界外仍有真结论。
+  // 兜底路径用**一次独立模型调用**补足 —— 这是结构约束，不是提示词。
+  //
+  // ★默认关闭：这是唯一会额外产生模型请求的路径，必须用户显式开启。
+  // 开启后受「仅规则落空时触发 + 长度下限 + 会话额度 + 最小间隔」四重约束。
+  /** 是否启用 LLM 兜底提取 */
+  llmExtractEnabled: Schema.boolean().default(false),
+  /**
+   * 会话级最大调用次数（0 = 不限制）。
+   *
+   * ## 为什么是 200 而不是 40（★2026-11-14）
+   *
+   * 40 是按「类型缺口偶尔触发」估的。改成「有待裁决句子就触发」后，
+   * 长正文几乎每轮都有待裁决句（实测 7258 字符报告里 79/82 句是待裁决），
+   * 40 次会在一次长任务内用完，之后**静默关闭** —— 表现为「用着用着就不
+   * 提炼了」，用户完全不知道发生了什么。
+   *
+   * 200 的量级：一次长任务约 30–60 次真实调用。压缩侧已经很省（trim 只在
+   * 超阈值时触发），这部分成本换的是信息质量 —— 用户明确要求「既然已经
+   * 节省了，就要保证信息质量」。
+   */
+  llmExtractMaxCalls: Schema.number().default(200),
+  /**
+   * 进程级最大调用次数（0 = 不限制），滑动窗口 1 小时。
+   *
+   * 会话配额按桶独立，多窗口下总量会成倍放大。这是最终硬上限。
+   * 默认 500：约合 2.5 个满额会话/小时，足够单人常驻使用。
+   */
+  llmExtractGlobalMaxCalls: Schema.number().default(500),
+  /**
+   * 两次调用的最小间隔（毫秒）。
+   *
+   * 从 30 秒降到 5 秒：待裁决句是逐条消息产的，30 秒间隔会让同一轮里
+   * 连续几条消息只有第一条能兜底，其余静默跳过。5 秒只用于防异常循环
+   * （真正的总量控制由上面两个配额负责）。
+   */
+  llmExtractMinIntervalMs: Schema.number().default(5000),
+  /** 正文短于此长度不触发（默认 120 字符，短碎片不值得单独问） */
+  llmExtractMinChars: Schema.number().default(120),
+  /** 单次发送的正文上限（默认 6000 字符，超出取尾部） */
+  llmExtractMaxInputChars: Schema.number().default(6000),
+
+  // ── 工件库（长文本落盘）──
+  //
+  // 用户粘贴的几百页文档 / 超长代码若留在对话里，会直接吃满窗口；
+  // 若塞进 LRC，`recall` 会把长文档片段召回来，等于把上下文重新灌满。
+  // 所以单独落盘，只在 LRC 留一条指针 Fact，按 hash 取回。
+  /** 是否启用长文本落盘（默认开启：这是纯收益，无模型调用） */
+  artifactEnabled: Schema.boolean().default(true),
+  /** 超过多少字符才落盘 */
+  artifactMinChars: Schema.number().default(8000),
+  /** 工件库磁盘配额（MB），超额按最久未访问淘汰 */
+  artifactQuotaMb: Schema.number().default(200),
 });
 
 /** 系统提示段落名（全局唯一，避免与宿主段落冲突）。 */
 const PROMPT_SECTION = 'lrc:memory-capture';
+
+/**
+ * 单次取回工件的字符上限。
+ *
+ * 取回的原文直接进上下文，所以必须分段 —— 一个 2MB 文档一次全返回，
+ * 等于立刻把窗口打满，与「省上下文」的目的完全相反。
+ * 8000 字符约 4K tokens，是「够模型看懂结构」与「不挤占推理空间」的折中。
+ */
+const ARTIFACT_CHUNK_CHARS = 8000;
 
 /**
  * 构建系统提示段落。
@@ -236,19 +337,26 @@ const PROMPT_SECTION = 'lrc:memory-capture';
  *
  * # 为什么按配置分两版
  *
- * 开启主动注入后，`[LRC 相关记忆]` 已经出现在上下文里。此时若仍写
+ * 开启主动注入后，`[LRC 历史记忆…]` 段落已经出现在上下文里。此时若仍写
  * 「先调 `lrc_recall` 工具」，模型会面对**两套相互竞争的指令**：
  * 一边已经拿到记忆，一边被要求再去调工具查一遍。实测这类矛盾提示会
  * 让模型两头都不做（既不调工具，也不信任注入内容）。
  *
- * 所以注入开启时，提示改成「记忆已给你，不足才查」，让两条路径互补而非冲突。
+ * # 注入版为什么写成「软提示」
+ *
+ * 注入内容来自历史，可能与当前任务无关、或已被后续决定推翻。若提示写成
+ * 「直接当事实使用」，模型会为了迎合它而改变当前做法 —— 这正是上下文偏移
+ * 与幻觉的来源。所以提示只声明**它是什么**、**什么时候该查**，
+ * 判断权留给正在工作的模型。
  */
 function buildPromptText(recallInjected: boolean): string {
   const recallRule = recallInjected
     ? [
-        '上下文里可能已出现 `[LRC 相关记忆]` 段落，那是插件按当前话题**自动检索**的结果，',
-        '直接当事实使用，不需要再调 `lrc_recall` 确认。',
-        '只有当该段落缺失、或明显不足以回答（例如需要更早的细节）时，才调 `lrc_recall` 补充检索；',
+        '上下文里可能出现 `[LRC 历史记忆（可能过时，与当前任务无关时请忽略）]` 段落，',
+        '那是插件按当前话题自动检索出来的历史记录。**用不用、信不信由你判断**：',
+        '与当前任务相关就参考；明显无关或与已验证事实冲突时直接忽略，不要为了迎合它改变做法。',
+        '若某条记忆与你已知的事实冲突，以**你能当场验证的**为准，并可用 `lrc_recall` 复核。',
+        '遇到需要更早的细节、或该段落缺失时，再调 `lrc_recall` 补充检索；',
         '检索为空时回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。',
       ]
     : [
@@ -264,10 +372,24 @@ function buildPromptText(recallInjected: boolean): string {
     '发现某条记忆与事实不符时，用 `lrc_forget` 撤回（id 从 `lrc_recall` 输出里取），',
     '不要让它继续污染后续对话。',
     '',
+    '## 长文档与工件',
+    '',
+    '超长输入（整份文档、几百行代码）会由插件落盘为「工件」，上下文里只留一条',
+    '`[工件] …（hash=xxxx）` 指针。需要看原文时调 `lrc_fetch_artifact(hash)`，',
+    '它单次返回上限 8000 字符，更长的用 `offset` 分段读。',
+    '**不要凭预览句臆测原文内容**，需要细节就取回。',
+    '',
     '## 长期记忆沉淀',
     '',
-    '插件会自动从你的回答里提取**约束**（"不要用 X"、"必须 Y"）和**决策**（"改用 X"），',
+    '插件会自动从你的回答里提取**约束**、**决策**、**结论**、**目标**、**范围限定**，',
     '所以不需要额外格式化输出。只要在回答里把结论说清楚即可。',
+    '',
+    '**最有价值的是这几类**（会被长期保留、跨会话复用）：',
+    '- 约束：必须 / 禁止 / 只能 / 只支持 / 不要',
+    '- 决策：改用 / 采用 / 定为 / 选型',
+    '- 结论：根因 / 排查结论 / 定位到',
+    '- 目标：压到 N 以下 / 降到 N 以内 / 不超过 N',
+    '- 范围：这次只做什么、明确不做什么',
     '',
     '如果你愿意显式标注，可用下面的块（可选，不是必须）：',
     '',
@@ -286,6 +408,111 @@ function buildPromptText(recallInjected: boolean): string {
 export function apply(ctx: Context, config: Config): void {
   const cacheDir = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'cache', 'lrc-plugin');
   const snapshotPath = join(cacheDir, 'snapshot.json');
+
+  /**
+   * 工件库：长文本落盘（与 LRC 分开，见 `artifact-store.ts` 注释）。
+   *
+   * ## 配额必须防 NaN（★2026-11-14 审查 P0）
+   *
+   * `config.artifactQuotaMb` 来自 `cordis.patch.yml`，而**旧 patch 不会自动
+   * 包含新字段**。上一版写的是：
+   * ```ts
+   * Math.max(1, config.artifactQuotaMb) * 1024 * 1024
+   * ```
+   * `Math.max(1, undefined)` 得到 `NaN`，`NaN * 1024 * 1024` 仍是 `NaN`。
+   * 而 `ArtifactStore.evictIfNeeded()` 里 `usage <= NaN` 恒为 **false** ——
+   * 于是**每次落盘都会把所有工件全部淘汰**（包括刚写的那个），
+   * 且 `lrc_fetch_artifact` 永远返回「未找到」。
+   *
+   * 这是「配置缺失静默失效」的又一种形态，必须显式兜底。
+   */
+  const quotaMb =
+    typeof config.artifactQuotaMb === 'number' && Number.isFinite(config.artifactQuotaMb) && config.artifactQuotaMb > 0
+      ? config.artifactQuotaMb
+      : 200;
+  const artifactStore = new ArtifactStore(join(cacheDir, 'artifacts'), Math.floor(quotaMb * 1024 * 1024));
+  /**
+   * 功能开关：**缺失即视为开启**（★2026-11-14 审查 P1）。
+   *
+   * ## 为什么不能写 `config.artifactEnabled === true`
+   *
+   * `cordis.patch.yml` 是用户侧文件，**旧 patch 不会自动包含新字段**。
+   * 之前所有布尔开关都写 `=== true`，那对「默认关闭」的开关是对的
+   * （`llmExtractEnabled` 要花钱，必须显式开启）。但 artifact 落盘是
+   * **纯收益**：不花模型调用、不改变对话行为、磁盘占用有配额兜底。
+   *
+   * 写成 `=== true` 的后果：升级插件后旧 patch 没有这个键 ⇒ 长文本落盘
+   * 静默不生效，而且**没有任何日志提示**。用户以为功能上线了，实际从未跑过。
+   *
+   * 所以这里用「只有显式 false 才关闭」：缺字段 = 开启。
+   */
+  const artifactEnabled = config.artifactEnabled !== false;
+  const artifactMinChars =
+    typeof config.artifactMinChars === 'number' && config.artifactMinChars > 0
+      ? Math.floor(config.artifactMinChars)
+      : 8000;
+
+  /**
+   * 会话级 **Fact 账本**：交接文档的投影来源。
+   *
+   * ## 为什么需要本地账本
+   *
+   * 交接文档要按 kind 分组渲染，而 LRC 的 `recall` 是**语义检索** ——
+   * 它返回「与某段文字相似的 Top-K」，不是「本会话的全部 Fact」。
+   * 用它来投影交接文档，结果取决于查询词，不可靠。
+   *
+   * 所以本会话写入的每条 Fact 都在这里留一份（上限 200 条，够覆盖
+   * 任意真实会话；超出按最旧淘汰）。会话切换时清空。
+   */
+  const sessionFacts: MemoryFact[] = [];
+  const SESSION_FACTS_MAX = 200;
+
+  /**
+   * 记录一批 Fact 到本会话账本（**upsert 语义**，★2026-11-15 六钥匙裁决）。
+   *
+   * ## 为什么不是 append
+   *
+   * 账本是**世界状态快照**，不是事件日志。append 积累出的是历史：
+   * ```
+   * 图标固定为 16px   ← 已被覆盖
+   * 图标固定为 24px   ← 已被覆盖
+   * 图标固定为 32px   ← 当前有效
+   * ```
+   * 实测 `factKey` 对这三条返回**同一个键** `decision|图标固|定为`，
+   * 于是 3 条过时取值各占 1 个结论槽（15 槽里占 3 个），而摘要读者
+   * 可能照着已废弃的 16px 去改代码 —— **过时取值是负信息**。
+   *
+   * ## 为什么 upsert 也是「压缩稳定性」的前提
+   *
+   * ```
+   * append-only + 取最新 → 账本持续增长 → 每次裁剪的摘要都不同（新条目挤旧条目）
+   * upsert        + 取最新 → 账本长度收敛到「不同 factKey 数」→ 摘要稳定
+   * ```
+   * 用户要求「既要高效压缩，又要信息高浓度」，稳定性是这个要求的直接推论。
+   *
+   * ## 演进历史会丢吗
+   *
+   * 不会。每一次写入都独立走了 `offloader.offloadFacts()` 进 LRC 长期库
+   * （append 语义，可 `recall` 查到全过程），账本只服务于「本轮摘要」。
+   *
+   * ## 为什么对未富集 Fact 安全
+   *
+   * `factKey` 在 `predicate` 为空时退化成 `kind|statement|<全句归一化>`，
+   * 所以两条不同的未富集陈述不会误合并（已实测 4/4 各自独立）。
+   */
+  function recordSessionFacts(facts: readonly MemoryFact[]): void {
+    for (const fact of facts) {
+      const key = factKey(fact);
+      const at = sessionFacts.findIndex((prev) => factKey(prev) === key);
+      // 同键 ⇒ 新值覆盖旧值且**移到末尾**（保持「越新越靠后」的数组不变式，
+      // 摘要侧才能用 `slice(-N)` 取到最新）
+      if (at >= 0) sessionFacts.splice(at, 1);
+      sessionFacts.push(fact);
+    }
+    if (sessionFacts.length > SESSION_FACTS_MAX) {
+      sessionFacts.splice(0, sessionFacts.length - SESSION_FACTS_MAX);
+    }
+  }
 
   /**
    * 复查间隔规范化。
@@ -496,6 +723,7 @@ export function apply(ctx: Context, config: Config): void {
     maxCharsPerItem: config.recallInjectMaxCharsPerItem,
     maxTotalChars: 240,
     minScore: config.recallInjectMinScore,
+    minRawScore: config.recallInjectMinRawScore,
   });
   /**
    * `<lrc_memory>` 命中统计：**按轮计，不按消息计**。
@@ -513,6 +741,40 @@ export function apply(ctx: Context, config: Config): void {
    */
   let proseTurns = 0;
   /**
+   * LLM 兜底提取的调用统计（2026-11-13 新增）。
+   *
+   * 这一层要花真钱（每次一次独立模型请求），必须可观测：
+   * 命中数、跳过原因、累计调用次数。三个计数只用于日志，不影响行为。
+   */
+  let llmExtractCalls = 0;
+  let llmExtractHits = 0;
+  let llmExtractFailures = 0;
+
+  /**
+   * 进程级**滑动窗口**的调用时间戳（毫秒）。
+   *
+   * ## 为什么不能只计总数
+   *
+   * 只计总数时，常驻进程里 5 个满额会话用完后兜底**永久关闭**，只能重启
+   * 恢复 —— 这会让「用了一整天」的进程在下午就彻底失去该能力。
+   *
+   * 滑动窗口只统计最近 `LLM_EXTRACT_GLOBAL_WINDOW_MS` 内的调用，时间一过
+   * 自动恢复额度，语义是「单位时间内的总预算」而不是「终身预算」。
+   */
+  const LLM_EXTRACT_GLOBAL_WINDOW_MS = 60 * 60 * 1000;
+  const llmExtractGlobalStamps: number[] = [];
+
+  /** 清理窗口外的旧时间戳，返回窗口内的调用次数。 */
+  function globalWindowCount(now: number): number {
+    const cutoff = now - LLM_EXTRACT_GLOBAL_WINDOW_MS;
+    // 时间戳天然有序（只在调用时 push），从头砍掉过期的即可
+    while (llmExtractGlobalStamps.length > 0 && (llmExtractGlobalStamps[0] as number) <= cutoff) {
+      llmExtractGlobalStamps.shift();
+    }
+    return llmExtractGlobalStamps.length;
+  }
+
+  /**
    * 未连接时暂存的正文约束（上限 30），**按归属会话分桶**。
    *
    * ## 为什么必须按会话分桶
@@ -525,7 +787,7 @@ export function apply(ctx: Context, config: Config): void {
    * 分桶后：A 会话的残留仍标着 A，补写时按原归属落库；
    * 桶总量仍受 `PROSE_BACKLOG_MAX` 约束（按最旧淘汰）。
    */
-  const proseBacklog = new Map<string, DistilledItem[]>();
+  const proseBacklog = new Map<string, MemoryFact[]>();
   const PROSE_BACKLOG_MAX = 30;
 
   /** 当前 backlog 总条数。 */
@@ -541,7 +803,7 @@ export function apply(ctx: Context, config: Config): void {
    * @param owner - 归属会话 ID（空串表示「未知归属」，补写时按当前会话处理）
    * @param items - 条目
    */
-  function pushProseBacklog(owner: string, items: DistilledItem[]): void {
+  function pushProseBacklog(owner: string, items: MemoryFact[]): void {
     const list = proseBacklog.get(owner) ?? [];
     list.push(...items);
     proseBacklog.set(owner, list);
@@ -663,6 +925,9 @@ export function apply(ctx: Context, config: Config): void {
     // 快照候选池同样是会话级状态：换会话后不能继续用上一场的约束拼快照，
     // 与 `latestSnapshot` 归属判定同源（`bindSnapshotToSession` 的目的）。
     offloader.resetSnapshotPool();
+    // Fact 账本也是会话级：交接文档只应包含**本会话**的结论。
+    // 不清会让新会话的交接文档里混进上一个会话的任务上下文。
+    sessionFacts.length = 0;
     // **proseBacklog 不清**：它按会话分桶，切会话后仍按原归属补写。
     // 上一版在这里整体清空，等于「离线期间攒的约束，用户一切会话就全丢」。
     snapshotGeneration += 1;
@@ -832,7 +1097,7 @@ export function apply(ctx: Context, config: Config): void {
         // 已属于当前会话。若照常入池，当前会话下一次注入会变成
         // 「B 的约束；A 会话私有：不要用 IDM」（实测已复现）。
         // 记忆仍写进 LRC，只是不参与当前会话的快照。
-        .offloadItems(pending, { intoPool: owner === currentSessionId })
+        .offloadFacts(pending, { intoPool: owner === currentSessionId })
         .then((result) => {
           if (result.distilled > 0) {
             // 空归属不落盘：写出去只会变成「无归属快照」，下次启动必被丢弃
@@ -874,25 +1139,30 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
-   * 把一批抽取到的条目送进 LRC，并更新快照。
+   * 把一批**已通过 schema 校验**的记忆送进 LRC，并更新快照。
    *
-   * 正文路径与用户纠正路径共用：两条来源不同，但「未连接先暂存、
-   * 代次闸门防乱序、失败只告警」这套处理完全一样，分开写必然漂移。
+   * 所有来源（正文 / 用户消息 / 推理兜底 / LLM 补全）共用这一个出口：
+   * 「未连接先暂存、代次闸门防乱序、失败只告警」这套处理完全一样，
+   * 分开写必然漂移。
    *
-   * @param items - 已分类条目
+   * @param facts - schema 层产出的记忆
    * @param ownerSessionId - 归属会话（**同步阶段捕获**，不能等 `.then` 再读）
-   * @param label - 日志用来源名（「正文抽取」/「用户纠正」）
+   * @param label - 日志用来源名
    */
   function offloadExtracted(
-    items: DistilledItem[],
+    facts: MemoryFact[],
     ownerSessionId: string,
     label: string,
   ): void {
+    if (facts.length === 0) return;
+    // 账本在**同步阶段**记录：它用于交接文档投影，与写库成功与否无关
+    // （写库失败时用户仍可能在同一会话里要求交接）。
+    recordSessionFacts(facts);
     // **未连接时不直接丢**：这类事件不会被回放，而 LRC 桌面端比 DSH
     // 晚起 20 分钟是已发生过的真实事故。那段时间里若直接 catch 掉，
     // 这批约束就永久丢了。
     if (!offloader.connected) {
-      pushProseBacklog(ownerSessionId, items);
+      pushProseBacklog(ownerSessionId, facts);
       void connection.get();
       return;
     }
@@ -902,14 +1172,14 @@ export function apply(ctx: Context, config: Config): void {
     // 晚完成的那条会用更早的内容覆盖快照 —— 症状是注入内容「倒退」。
     const gen = ++snapshotGeneration;
     void offloader
-      .offloadItems(items)
+      .offloadFacts(facts)
       .then((result) => {
         if (gen !== snapshotGeneration) return; // 有更新的一次在飞，丢弃
         if (result.distilled > 0) {
           if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
             saveSnapshot(result.snapshot, ownerSessionId);
           }
-          ctx.logger.info(`[lrc] ${label} ${result.distilled} 条约束/决策（写入 ${result.written}）`);
+          ctx.logger.info(`[lrc] ${label} ${result.distilled} 条关键信息（写入 ${result.written}）`);
         }
       })
       .catch((error: unknown) => {
@@ -919,6 +1189,259 @@ export function apply(ctx: Context, config: Config): void {
           }`,
         );
       });
+  }
+
+  /**
+   * 把超长文本落盘为工件，并写一条指针 Fact。
+   *
+   * ## 为什么不在上下文里替换原文
+   *
+   * 插件没有「改写用户已发消息」的能力（宿主不允许改 user/message 内容）。
+   * 所以这里的职责是**登记**：把内容存进工件库、在 LRC 留一条可检索的
+   * 指针，让后续轮次的模型能通过 `lrc_fetch_artifact` 取回，而不必
+   * 依赖上下文里那段逐渐被裁掉的长文。
+   *
+   * 真正的「上下文瘦身」由已有的 trim / prune 路径完成 —— 它们会把
+   * 旧的超长消息折进摘要。两条路径互补：trim 负责缩小上下文，
+   * 工件库负责让被缩小的内容**仍然可取回**。
+   *
+   * ## 失败静默
+   *
+   * 落盘是增值功能，磁盘满 / 权限不足都不能影响对话。
+   */
+  function archiveLongText(text: string, sessionId: string): void {
+    try {
+      const { meta, reused } = artifactStore.store(text);
+      const fact = makeArtifactFact({
+        hash: meta.hash,
+        preview: meta.preview,
+        chars: meta.chars,
+        kindLabel: '长文档',
+        origin: 'user',
+        sessionId,
+      });
+      const verdict = validateFact(fact);
+      if (!verdict.ok) {
+        ctx.logger.warn(`[lrc] 工件指针 Fact 未通过校验：${verdict.reason}`);
+        return;
+      }
+      offloadExtracted([fact], sessionId, '工件指针');
+      ctx.logger.info(
+        `[lrc] 长文本已落盘（${meta.chars} 字符，hash=${meta.hash}${reused ? '，复用已有工件' : ''}）：` +
+          `可用 lrc_fetch_artifact 取回`,
+      );
+    } catch (error) {
+      ctx.logger.warn(
+        `[lrc] 长文本落盘失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * LLM 兜底的**配额账本**：按会话 ID 分桶。
+   *
+   * ## 为什么必须是 Map，不能是三个标量
+   *
+   * 审查实测发现两个致命缺陷（`scripts/_probe-review.ts`）：
+   *
+   * 1. **重置永不触发**：原实现把「会话切换就清零」写在 `runLlmFallback`
+   *    内部，而它的前置条件是 `shouldFallback` 返回 true；会话 A 用满 40 次后
+   *    `shouldFallback` 恒为 false ⇒ `runLlmFallback` 永不调用 ⇒ 重置永不执行。
+   *    切到会话 B 也仍被 A 的计数卡死，**直到进程重启**。
+   * 2. **交替即清零**：原实现只有一个标量 + 一个 sessionId，两个会话交替
+   *    产生事件时每次归属变化都清零，实测交替 200 次**一次都没被拦**，
+   *    40 次上限完全失效 —— 成本护栏在真实多窗口场景下等于不存在。
+   *
+   * 分桶后每场会话各自记账，互不影响；并且**不做任何「清零」动作**，
+   * 切回旧会话时它自己的计数仍在（这才是「按会话配额」的本义）。
+   *
+   * ## 为什么要有上限淘汰
+   *
+   * 长跑进程里会话只增不减会让 Map 无界增长。保留最近 N 场即可：
+   * 更早的会话已经结束，它的配额状态没有保留价值。
+   */
+  interface ExtractQuota {
+    count: number;
+    /** 上一次**真正调用模型**的时刻（0 = 从未调用）。只有间隔判据用它。 */
+    lastCallAt: number;
+    /** 上一次**被访问**的时刻。只有 LRU 淘汰用它。 */
+    touchedAt: number;
+  }
+  const LLM_EXTRACT_QUOTA_MAX = 20;
+  const llmExtractQuota = new Map<string, ExtractQuota>();
+
+  /**
+   * 取（或建）某会话的配额条目；超出上限时按最久未访问淘汰。
+   *
+   * ## 为什么必须分成两个时间戳
+   *
+   * - `lastCallAt`：只有最小间隔判据用（`sinceLastMs`）
+   * - `touchedAt`：只有 LRU 淘汰用
+   *
+   * 首版把两者合成一个 `lastAt`，然后在 `quotaFor` 里刷新它做 LRU，
+   * 结果 `sinceLastMs` 恒为 0 ⇒ **最小间隔判据永久失效**。
+   * 反过来若只更新调用时刻，则被配额拦下的**活跃**会话永远不会刷新
+   * `lastAt` ⇒ 被当成「最久未用」删掉重建 ⇒ **配额被反复重置**
+   * （复核实测：21 会话 × 50 轮 = 1050 条事件全部放行）。
+   * 两者目的相反，必须分开。
+   */
+  function quotaFor(sessionId: string): ExtractQuota {
+    const existing = llmExtractQuota.get(sessionId);
+    if (existing !== undefined) {
+      // 只刷新 LRU 时间戳，**不动** `lastCallAt`（否则间隔判据失效）
+      existing.touchedAt = Date.now();
+      return existing;
+    }
+    if (llmExtractQuota.size >= LLM_EXTRACT_QUOTA_MAX) {
+      const maxCalls = Math.max(0, config.llmExtractMaxCalls);
+      let victimKey: string | null = null;
+      let victimAt = Number.POSITIVE_INFINITY;
+      for (const [key, value] of llmExtractQuota) {
+        // 优先淘汰「未达配额上限」的桶：它还会继续花钱，淘汰它损失最小。
+        // 全部达上限时退回「最久未访问」——**必须删掉一个**，否则 Map
+        // 无界增长，且新桶会不断获得全额额度（复核实测：21 会话 × 50 轮
+        // = 1050 次全部放行）。进程级配额是这种情况下的最终防线。
+        const exhausted = maxCalls > 0 && value.count >= maxCalls;
+        const rank = exhausted ? value.touchedAt + 1e15 : value.touchedAt;
+        if (rank < victimAt) {
+          victimAt = rank;
+          victimKey = key;
+        }
+      }
+      if (victimKey !== null) llmExtractQuota.delete(victimKey);
+    }
+    const now = Date.now();
+    const fresh: ExtractQuota = { count: 0, lastCallAt: 0, touchedAt: now };
+    llmExtractQuota.set(sessionId, fresh);
+    return fresh;
+  }
+
+  /**
+   * 是否值得为这条正文花一次模型调用。
+   *
+   * 判据本体在 `llm-extract.ts`（纯函数、可单测）；这里只负责喂入
+   * **该会话自己的**配额状态。
+   *
+   * **必须传 sessionId**：不传就无法分桶，就会退回上一版「全局标量」
+   * 的缺陷（见 `llmExtractQuota` 注释）。
+   */
+  function shouldFallback(
+    text: string,
+    extracted: readonly string[],
+    sessionId: string,
+    extractedKinds?: readonly string[],
+    pending?: readonly string[],
+  ): boolean {
+    const quota = quotaFor(sessionId);
+    return shouldFallbackToLlm({
+      text,
+      extracted,
+      extractedKinds,
+      pending,
+      enabled: config.llmExtractEnabled,
+      minChars: config.llmExtractMinChars,
+      maxCalls: config.llmExtractMaxCalls,
+      usedCalls: quota.count,
+      minIntervalMs: config.llmExtractMinIntervalMs,
+      sinceLastMs: quota.lastCallAt === 0 ? Number.MAX_SAFE_INTEGER : Date.now() - quota.lastCallAt,
+      globalCalls: globalWindowCount(Date.now()),
+      globalMaxCalls: config.llmExtractGlobalMaxCalls,
+    });
+  }
+
+  /**
+   * 走一次独立模型调用提取关键信息。
+   *
+   * **失败必须静默**：兜底层是增值功能，任何异常都不能影响主对话，
+   * 也不能让 pending 状态卡住。所有错误只记一次 warn。
+   *
+   * @param ownerSessionId - 配额归属会话（**调用方在同步阶段捕获**）
+   */
+  async function runLlmFallback(
+    text: string,
+    session: unknown,
+    ownerSessionId: string,
+    alreadyExtracted: readonly string[] = [],
+    candidates: readonly string[] = [],
+    /**
+     * 来源（用户消息路径必须传 `'user'`，★2026-11-15 独立审查 P1）。
+     *
+     * 首版写死 `origin: 'assistant'`，而本函数也被用户消息路径调用 ⇒
+     * 用户说的约束被标成助手说的。后果有两个且都不报错：
+     * - `importanceOf` 的 `origin === 'user'` 加分（+1）永远拿不到
+     * - 写进 LRC 的 `origin` 标签错误，`recall` 侧无法区分来源
+     */
+    origin: 'user' | 'assistant' = 'assistant',
+  ): Promise<void> {
+    // 记账在 await 之前完成：并发事件里两次调用不会共用同一个旧计数
+    const quota = quotaFor(ownerSessionId);
+    quota.count += 1;
+    quota.lastCallAt = Date.now();
+    llmExtractCalls += 1;
+    llmExtractGlobalStamps.push(Date.now());
+
+    try {
+      const lines = await extractWithLlm(ctx, session, text, {
+        maxInputChars: config.llmExtractMaxInputChars,
+        // 有候选时走「判定」模式：模型只做二分类，产物可追溯到原文
+        candidates,
+        // ★失败必须留痕（2026-11-16 发布前审查 P1-3）
+        //
+        // 这是唯一产生额外计费的路径。若不区分「调用失败」与「模型判定无内容」，
+        // 超时 / 401 / 路由拒绝在日志里与「没抽到」完全同形，排查时只能靠
+        // `lrc_status` 的计数间接推断。
+        onFailure: (reason) => {
+          ctx.logger.warn(`[lrc] LLM 兜底调用失败（不影响主流程）：${reason.slice(0, 200)}`);
+        },
+      });
+      if (lines.length === 0) {
+        llmExtractFailures += 1;
+        return;
+      }
+
+      // ## 跨批去重：与规则层已抽到的陈述比较
+      //
+      // 规则层给的是 `不要碰 3099`，LLM 层给的是 `不要再使用 3099 端口`。
+      // 直接比整串会被同义改写骗过 —— 两条都进 `recent` 窗口，白占槽位。
+      // LLM 返回的行仍带 `约束：` 前缀（那是它的输出契约），先剥掉再比。
+      const stripPrefix = (line: string): string => line.replace(/^(约束|决策|结论|事实)：/, '').trim();
+      const fresh = lines.filter((line) => {
+        const body = stripPrefix(line);
+        if (body.length === 0) return false;
+        return !alreadyExtracted.some((prev) => {
+          // 完全包含：`不要碰 3099` ⊂ `不要再使用 3099 端口…` 的常见形态
+          if (prev.length >= 4 && body.includes(prev.slice(0, 8))) return true;
+          return areNearDuplicate(prev, body, 0.85);
+        });
+      });
+      if (fresh.length === 0) {
+        llmExtractFailures += 1;
+        return;
+      }
+      // LLM 只负责「发现候选」，是否入库仍由同一套 schema 校验裁决 ——
+      // 这样规则层与 LLM 层不会有两套语义（这是旧实现的漂移来源）。
+      const extracted = factsFromLlmLines(fresh, {
+        origin,
+        sessionId: ownerSessionId,
+      });
+      if (extracted.facts.length === 0) {
+        llmExtractFailures += 1;
+        ctx.logger.info(
+          `[lrc] LLM 兜底 ${fresh.length} 条候选全部被 schema 拒绝：` +
+            extracted.rejected.map((r) => r.reason).join(','),
+        );
+        return;
+      }
+      llmExtractHits += 1;
+      offloadExtracted(extracted.facts, ownerSessionId, 'LLM 兜底');
+    } catch (error) {
+      llmExtractFailures += 1;
+      ctx.logger.warn(
+        `[lrc] LLM 兜底提取失败（不影响对话）：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   // 预热：不阻塞插件加载，失败只记一次日志；之后由工具调用按需重试
@@ -1072,18 +1595,55 @@ export function apply(ctx: Context, config: Config): void {
       const next = formatRecallInjection(result.memories, recallOptions);
 
       recallFingerprint = fingerprint;
-      if (next === recallText) return;
 
-      recallText = next;
-      // 计数：注入文本每变一次，宿主的前缀缓存就断一次。
-      // 这是评估"注入代价"的唯一实测口径，必须可观测。
-      recallRewrites += 1;
-      ctx.logger.info(
-        next.length === 0
-          ? `[lrc] 本轮无相关记忆，不注入（指纹 ${fingerprint}）`
-          : `[lrc] 注入 ${result.memories.length} 条候选中的 ${recallOptions.maxItems} 条` +
-              `（${next.length} 字符，指纹 ${fingerprint}，累计改写 ${recallRewrites} 次）`,
-      );
+      // ★可观测性必须优先于短路。
+      //
+      // 原实现是「`next === recallText` 就 return」，而双闸门挡掉整批时
+      // `next` 与旧的 `recallText` 都是空串 ⇒ **一条日志都不留**。
+      // 于是「检索到了 2 条候选但被绝对分挡掉」和「压根没检索」在日志里
+      // 完全同形，排查时只能看到「插件没工作」。这是本轮测试抓到的真实缺陷。
+      const changed = next !== recallText;
+      if (changed) {
+        recallText = next;
+        // 计数：注入文本每变一次，宿主的前缀缓存就断一次。
+        // 这是评估"注入代价"的唯一实测口径，必须可观测。
+        recallRewrites += 1;
+      }
+
+      // 实际注入条数以文本里的行数为准：`maxItems` 是上限，过滤后可能更少
+      // （绝对分那一道经常把整批挡掉，日志写 maxItems 会骗人）。
+      const injected = next.length === 0 ? 0 : next.split('\n').length - 1;
+      if (next.length === 0) {
+        // ★必须带上最高绝对分，且「有候选但全被拦」要升为 warn。
+        //
+        // 只写「无相关记忆」会掩盖两种完全不同的情况：
+        //   ① 检索真的没结果（候选 0 条）—— 正常；
+        //   ② 检索到了 6 条，但全部被绝对分闸门挡掉（top1=0.0164 < 0.025）—— 异常。
+        //
+        // ②在 RRF 深度路/语义路不可用的部署里会**持续整场会话**发生（此时
+        // 单路命中的上限就是 1/61≈0.0164，低于任何合理的闸门值）——
+        // 用户会以为「插件没工作」。日志若与①同形，就永远查不出来。
+        const top = result.memories.reduce<number>((max, m) => {
+          const raw = typeof m.score === 'number' && Number.isFinite(m.score) ? m.score : -1;
+          return raw > max ? raw : max;
+        }, -1);
+        const message =
+          `[lrc] 本轮无记忆注入（候选 ${result.memories.length} 条，最高绝对分 ` +
+          `${top >= 0 ? top.toFixed(4) : '缺失'}，阈值 ${recallOptions.minRawScore}，指纹 ${fingerprint}）`;
+        if (result.memories.length > 0 && top >= 0 && top < recallOptions.minRawScore) {
+          ctx.logger.warn(
+            `${message} —— 候选全部被绝对分闸门挡掉。若长期如此，` +
+              `检查 LRC 的通路权重（语义/深度路不可用时单路上限约 0.0164）或调低 recallInjectMinRawScore`,
+          );
+        } else {
+          ctx.logger.info(message);
+        }
+      } else if (changed) {
+        ctx.logger.info(
+          `[lrc] 注入 ${injected}/${result.memories.length} 条候选（${next.length} 字符，` +
+            `指纹 ${fingerprint}，累计改写 ${recallRewrites} 次）`,
+        );
+      }
     } catch (error) {
       // 保留旧值：失败不应让上下文抖动
       const message = error instanceof Error ? error.message : String(error);
@@ -1126,17 +1686,22 @@ export function apply(ctx: Context, config: Config): void {
         }
         // **长任务中途兜底**：工具密集型轮次里 assistant 只有 reasoning + tool-call，
         // 正文要等到最后一条回答才出现。如果这里直接 return，整轮中途快照永远是空的，
-        // `[LRC 状态]` 也就一直不出现。所以从本轮累计推理里抽结论句先沉淀一批。
-        const conclusions = conclusionsFromReasoning(turnReasoning.join('\n'));
-        if (conclusions.length === 0 && turnReasoning.length > 0 && !warnedNoConclusion) {
+        // `[LRC 状态]` 也就一直不出现。所以从本轮累计推理里走**同一个提取器**兜底。
+        const fromReasoning = extractFactsFromReasoning({
+          text: turnReasoning.join('\n'),
+          origin: 'assistant',
+          sessionId,
+        });
+        if (fromReasoning.facts.length === 0 && turnReasoning.length > 0 && !warnedNoConclusion) {
           warnedNoConclusion = true;
           ctx.logger.info(
-            `[lrc] 推理兜底：本轮推理 ${turnReasoningChars} 字符，未抽到结论句（词表未命中）`,
+            `[lrc] 推理兜底：本轮推理 ${turnReasoningChars} 字符，未拆出可用三元组` +
+              `（拒绝原因：${[...new Set(fromReasoning.rejected.map((r) => r.reason))].join(',') || '无候选'}）`,
           );
         }
-        if (conclusions.length > 0) {
+        if (fromReasoning.facts.length > 0) {
           try {
-            const result = await offloader.offloadItems(itemsFromTag(conclusions.join('\n')));
+            const result = await offloader.offloadFacts(fromReasoning.facts);
             if (result.distilled > 0) {
               // ★2026-11-07：只有实质变化才更新快照，避免宿主每轮 append 新 runtime-context
               if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
@@ -1226,7 +1791,10 @@ export function apply(ctx: Context, config: Config): void {
       if (seen % 20 === 0) {
         ctx.logger.info(
           `[lrc] 沉淀来源：显式标签 ${turnHits}/${seen} 轮，正文抽取命中 ${proseTurns} 条消息` +
-            `（另有 ${turnNoText} 轮无正文）`,
+            `（另有 ${turnNoText} 轮无正文）` +
+            (config.llmExtractEnabled
+              ? `；LLM 兜底 ${llmExtractCalls} 次调用，命中 ${llmExtractHits} 次，失败 ${llmExtractFailures} 次`
+              : '；LLM 兜底未启用'),
         );
       }
     } else {
@@ -1244,12 +1812,16 @@ export function apply(ctx: Context, config: Config): void {
     // 2. 主路径：正文行（长任务的最终报告只在这里出现一次）
     await flush(session, 'turn/end');
 
-    // 3. 兜底：本轮没有正文时，从推理里抽结论句
+    // 3. 兜底：本轮没有正文时，从推理里抽结论句（走同一个提取器）
     if (hadText || reasoning.length === 0) return;
-    const conclusions = conclusionsFromReasoning(reasoning);
-    if (conclusions.length === 0) return;
+    const fromReasoning = extractFactsFromReasoning({
+      text: reasoning,
+      origin: 'assistant',
+      sessionId,
+    });
+    if (fromReasoning.facts.length === 0) return;
     try {
-      const result = await offloader.offloadItems(itemsFromTag(conclusions.join('\n')));
+      const result = await offloader.offloadFacts(fromReasoning.facts);
       if (result.distilled > 0) {
         // ★2026-11-07：只有实质变化才更新快照，避免宿主每轮 append 新 runtime-context
         if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
@@ -1304,55 +1876,59 @@ export function apply(ctx: Context, config: Config): void {
       const userText = userMessageText(event);
       void refreshRecallInjection(userText);
 
-      // ★用户**纠正/重申**的约束必须入库。
+      // ★用户消息走**同一个提取器**。
       //
-      // `linesFromSession` 的门槛是 `hasConstraintMarker`（必须/不要/禁止），
-      // 而真实会话里最关键的约束常用反问句表达：
-      // 「不是告诉你音频在的位置了吗？你一点击下载就会调起 IDM…」
-      // 这条既没有命令式词，模型也从未在正文复述 ⇒ 三重落空，
-      // 约束从未入库，下一轮照旧去点下载链接。
-      const corrections = constraintsFromUser(userText);
-      if (corrections.length > 0) {
-        offloadExtracted(
-          itemsFromTag(corrections.join('\n')).map((i) => ({ ...i, origin: 'user' as const })),
+      // 旧实现有两条独立路径：`constraintsFromUser`（纠正句式，要求
+      // 「你」+ 危害词）与 `isKeyResourceLocation`（媒体文件 + 位置词），
+      // 两者判据互不相干，且都收不住「使用 A 目录的音频加 B 目录的文案」
+      // 这类多目录交代（实测 session-c8762e44 三处同时失守，注入 0 次）。
+      //
+      // 现在用户消息与助手正文共用 `extractFacts`，唯一区别是 `origin` ——
+      // 它只影响资源位置这一类是否启用（助手正文里的路径是过程描述，
+      // 用户说的才是交代）。
+      const result = extractFacts({
+        text: userText,
+        origin: 'user',
+        sessionId,
+      });
+      offloadExtracted(result.facts, sessionId, '用户消息');
+
+      // ★用户消息同样要走 LLM 兜底（★2026-11-14 修复）
+      //
+      // ## 为什么这条路径曾经完全漏掉
+      //
+      // 兜底最初是为「助手正文里的结论」设计的，所以只挂在 assistant/message
+      // 分支上。但实测 session-95eaf7e3（新项目开工）：用户粘贴了 16882
+      // 字符的产品文档，切出 **188 条待裁决句**，一条都没送模型 —— 而这
+      // 恰恰是整套系统里信息密度最高的一刻（需求、约束、交互规则全在
+      // 这份文档里）。
+      //
+      // ## 与落盘的关系
+      //
+      // 落盘解决的是「不占上下文」，兜底解决的是「入库」。两者不冲突：
+      // 文档落盘后模型仍需要知道「这份文档里定了哪几条硬约束」，那正是
+      // 兜底产物（Fact）的作用。
+      const userExtractedKinds = result.facts.map((f) => f.kind);
+      if (shouldFallback(userText, result.facts.map((f) => f.statement), sessionId, userExtractedKinds, result.pending)) {
+        void runLlmFallback(
+          userText,
+          session,
           sessionId,
-          '用户纠正',
+          result.facts.map((f) => f.statement),
+          result.pending,
+          'user',
         );
       }
 
-      // ★用户交代的**资源位置**必须入库（事故的另一半）。
+      // ★长文本落盘：用户粘贴的整份文档 / 超长代码不该占着上下文。
       //
-      // 真实会话里最关键的一条是：
-      // `D:\Desktop，score-Dtle1HAU.wav，这是你要打音频。继续任务`
-      // 它既没有约束词（进不了 `hasConstraintMarker` 门槛），
-      // 也不是纠正句式（`constraintsFromUser` 也不收）。
+      // ## 为什么不在助手正文上做
       //
-      // 这条路径比「靠 `linesFromSession` 放行 + `hardFilter` 过滤」可靠：
-      // `hardFilter` 有 20 字门槛，「音频在桌面」这种口语会被直接吞掉
-      // （实测 distilled=0、零 HTTP、零日志）。这里显式收，来源标 `user`。
-      //
-      // **与纠正路径互斥**：同一句用户话若已被 `constraintsFromUser` 收走
-      // （如 IDM 纠正句里也提到「音频在的位置」），不再重复包成 `[事实]`。
-      // 两条独立调用之间没有共享查重窗口，实测会产生语义重复的两条条目
-      // 白占快照槽位。
-      if (corrections.length === 0 && isKeyResourceLocation(userText, true)) {
-        const body = userText.trim();
-        if (body.length > 0) {
-          offloadExtracted(
-            [
-              {
-                content: `[事实] ${body.length > 200 ? `${body.slice(0, 200)}…` : body}`,
-                memory_type: 'fact',
-                tags: ['resource', 'distilled', 'user'],
-                importance: 8,
-                source_turns: [0, 0],
-                origin: 'user',
-              },
-            ],
-            sessionId,
-            '资源位置',
-          );
-        }
+      // 助手的超长输出通常是它自己生成的分析，落盘后模型还可能在后续轮次
+      // 引用它 —— 那会变成「引用了一个不存在于上下文里的东西」。用户的
+      // 输入是**素材**，落盘后由用户自己决定何时取回，语义更清晰。
+      if (artifactEnabled && isArtifactWorthy(userText, artifactMinChars)) {
+        archiveLongText(userText, sessionId);
       }
       return;
     }
@@ -1362,7 +1938,7 @@ export function apply(ctx: Context, config: Config): void {
     if (type !== 'assistant/message') return;
 
     const content = messageContent(event);
-    // **口径必须与 linesFromSession 一致**：只取正文块。
+    // **口径必须与 linesWithOrigin 一致**：只取正文块。
     const text = textBlocksOnly(content);
     const reasoning = reasoningBlocksOnly(content);
 
@@ -1371,28 +1947,51 @@ export function apply(ctx: Context, config: Config): void {
       if (extractMemoryTag(text) !== null) turnTagSeen = true;
       offloader.observe(text);
 
-      // ★2026-11-12：**不等 turn 结束**，正文里出现约束/决策就立刻收走。
+      // ★2026-11-12：**不等 turn 结束**，正文里出现关键信息就立刻收走。
       //
       // 为什么必须另开一条路：系统提示要求模型每轮输出 `<lrc_memory>`，
-      // 实测 56 条正文里只有 1 条带标签（1.8%）。于是沉淀几乎全靠
-      // 推理流兜底，抽到的是「CLI 已安装」这类过程记录。
+      // 实测 56 条正文里只有 1 条带标签（1.8%）。而 turn 可能被用户中止
+      // （实测 turn 2/3 都是 aborted by user），中止时不会走到轮末兜底。
       //
-      // 模型其实一直在正文里说约束（「不要用 IDM 下载」「已改用 --stdin」），
-      // 只是没按要求的格式重写。这里直接抓它已经说出口的话。
+      // ## 与旧实现的区别
       //
-      // 为什么在事件里而不是 turn/end：turn 可能被用户中止（实测 turn 2/3
-      // 都是 aborted by user），中止时不会走到轮末兜底，那批约束就丢了。
-      const prose = constraintsFromProse(text);
-      if (prose.length > 0) {
-        // **在同步阶段捕获 sessionId**：下面的 `.then` 是异步的（要等 distill +
-        // migrate 两次 HTTP），期间用户可能已切到别的会话。若那时才读
-        // `currentSessionId`，会把 A 的约束写成 B 的归属 —— 正是上一轮
-        // 在 `flush()` 里修过的同一个坑，不能在新路径上重犯。
-        offloadExtracted(
-          itemsFromTag(prose.join('\n')).map((i) => ({ ...i, origin: 'assistant' as const })),
-          sessionId,
-          '正文抽取',
-        );
+      // 旧路径是 `constraintsFromProse`（正则二分类），它只回答
+      // 「这句像不像约束」。新路径是 `extractFacts`（schema 三元组），
+      // 它回答「这句能不能拆成 subject + predicate + value」——
+      // 后者有界（谓词词表可枚举），前者无界（措辞无穷）。
+      const extracted = extractFacts({
+        text,
+        origin: 'assistant',
+        sessionId,
+      });
+      offloadExtracted(extracted.facts, sessionId, '正文抽取');
+
+      // ★2026-11-13：规则层抽得不够时，用一次独立模型调用补全。
+      //
+      // ## 为什么规则层不可能靠继续加正则解决
+      //
+      // 正则的能力边界是「我见过的措辞」，而模型的表达是开放的。
+      // 每补一条正则就会有新措辞漏过去 —— 这是结构缺陷，不是覆盖不足。
+      //
+      // ## 注意这里**不是** else 分支
+      //
+      // 首版写成 `else`（规则 0 条才兜底），端到端实测立刻暴露漏洞：
+      // ```
+      // 正文 3 句 → 规则抽出 1 条「以后不要再碰 3099」
+      // 但因为 ≥1 条，兜底不触发 ⇒ 漏掉「旧进程未退出」这条真结论
+      // ```
+      // 抽到一条不等于抽全。判据由 `shouldFallbackToLlm` 统一裁决。
+      //
+      // `alreadyExtracted` 用 statement 的列表（schema 之后不再有
+      // `约束：` 这种人工前缀）。
+      const alreadyExtracted = extracted.facts.map((f) => f.statement);
+      // 类型缺口必须按**类别**判：`alreadyExtracted` 是 schema 生成的裸陈述，
+      // 不含 `结论：` 这类中文前缀（见 `missingKinds` 注释）。
+      const extractedKinds = extracted.facts.map((f) => f.kind);
+      // ★2026-11-14：`pending` 是「结构合格但没命中谓词表」的句子。
+      // 它们是兜底的主要输入 —— 实测这类句子占长正文的 96%。
+      if (shouldFallback(text, alreadyExtracted, sessionId, extractedKinds, extracted.pending)) {
+        void runLlmFallback(text, session, sessionId, alreadyExtracted, extracted.pending);
       }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       // 只有「声明了 text/reasoning 块但 text 不是字符串」才是结构异常。
@@ -1569,10 +2168,20 @@ export function apply(ctx: Context, config: Config): void {
           const surfaceNodes = (agent as { session?: { surface?: { nodes?: unknown } } })?.session
             ?.surface?.nodes;
           const nodeCount = Array.isArray(surfaceNodes) ? surfaceNodes.length : 0;
-          const force = nodeCount > config.trimMaxNodes;
+          // ## 必须显式兜底（★2026-11-16 发布前审查 P1-2）
+          //
+          // 宿主**不会**为老 patch 补齐新字段，`config.trimMaxNodes` 可能是
+          // `undefined`，而 `nodeCount > undefined` **恒为 false** ⇒ 这条
+          // 「token 计量失真时的最后一道硬上限」会**静默失效**，不报错、
+          // 日志也正常。与 `artifactQuotaMb` 的 NaN 是同一类缺陷。
+          const trimMaxNodes =
+            typeof config.trimMaxNodes === 'number' && Number.isFinite(config.trimMaxNodes) && config.trimMaxNodes > 0
+              ? config.trimMaxNodes
+              : 120;
+          const force = nodeCount > trimMaxNodes;
           if (force) {
             ctx.logger.info(
-              `[lrc][trim] 节点数 ${nodeCount} 超过上限 ${config.trimMaxNodes}，跳过 token 阈值强制裁剪`,
+              `[lrc][trim] 节点数 ${nodeCount} 超过上限 ${trimMaxNodes}，跳过 token 阈值强制裁剪`,
             );
           }
           const outcome = await trimContext({
@@ -1595,6 +2204,9 @@ export function apply(ctx: Context, config: Config): void {
               // 节点数硬上限只是个「兜底触发器」；真正决定「一次裁多少」的
               // 是这里。所以两条路径统一用一个上限：见 `trimMaxNodesPerRun`。
               maxNodesPerRun: trimMaxNodesPerRun,
+              // 摘要的「助手结论」段从这里投影，而不是靠 role 猜。
+              // 不传的话，摘要会把「我先去仓库看看」这类过程叙述当结论。
+              facts: sessionFacts,
             },
             log: (message) => ctx.logger.info(message),
           });
@@ -1721,34 +2333,35 @@ export function apply(ctx: Context, config: Config): void {
         }
         const { client } = acquired;
         try {
-          // 与自动沉淀路径保持一致：标签内容直接成条目，**绕过 distill**。
-          // 否则 `- 决策：…` 会被 LRC 的规则式打分丢掉（DECISION_WORDS 无「决策」）。
-          const tag = extractMemoryTag(args.text);
-          if (tag !== null) {
-            if (isNoUpdate(tag)) {
-              return { snapshot: '本轮无新增，未沉淀', distilled: 0, written: 0, merged: 0 };
-            }
-            const items = itemsFromTag(tag);
-            const migrated = await client.migrate(items, config.project);
-            ctx.logger.info(
-              `[lrc][tool] lrc_remember_now 沉淀 ${items.length} 条（写入 ${migrated.written}，合并 ${migrated.merged}）`,
-            );
+          // 与自动沉淀路径**完全同一套**：extractFacts → validateFact → migrate。
+          //
+          // 旧实现这里有第三条分支（`client.migrateText` 走服务端 distill 透传），
+          // 那是本插件最大的污染源，已随 schema 化一并移除。
+          const extracted = extractFacts({
+            text: args.text,
+            origin: 'assistant',
+            sessionId: currentSessionId,
+          });
+          if (extracted.facts.length === 0) {
+            const reasons = [...new Set(extracted.rejected.map((r) => r.reason))].join(',');
+            ctx.logger.info(`[lrc][tool] lrc_remember_now 无可入库内容（${reasons || '无候选'}）`);
             return {
-              snapshot: `已沉淀 ${items.length} 条（写入 ${migrated.written}，其中合并 ${migrated.merged}）`,
-              distilled: items.length,
-              written: migrated.written,
-              merged: migrated.merged,
+              snapshot: `未沉淀：没有可拆成「主体+关系+取值」的关键信息${reasons.length > 0 ? `（${reasons}）` : ''}`,
+              distilled: 0,
+              written: 0,
+              merged: 0,
             };
           }
-          const result = await client.migrateText(args.text, config.project, config.maxItems);
+          const items = factsToItems(extracted.facts) as DistilledItem[];
+          const migrated = await client.migrate(items, config.project);
           ctx.logger.info(
-            `[lrc][tool] lrc_remember_now 沉淀 ${result.distilled} 条（写入 ${result.written}，合并 ${result.merged}）`,
+            `[lrc][tool] lrc_remember_now 沉淀 ${items.length} 条（写入 ${migrated.written}，合并 ${migrated.merged}）`,
           );
           return {
-            snapshot: result.indexLine,
-            distilled: result.distilled,
-            written: result.written,
-            merged: result.merged,
+            snapshot: extracted.facts.map(renderFact).join('\n'),
+            distilled: items.length,
+            written: migrated.written,
+            merged: migrated.merged,
           };
         } catch (error) {
           return {
@@ -1952,25 +2565,55 @@ export function apply(ctx: Context, config: Config): void {
         const session = (lastAgent as { session?: unknown } | undefined)?.session;
         const source = extractHandoffSource(session);
 
-        // LRC 归档索引：拿不到就跳过，不影响交接
-        let indexLines: string[] = [];
-        const client = connection.peek();
-        if (client !== null) {
+        // ── 从 Fact 账本投影交接文档（不是让模型写）──
+        //
+        // 详见 `handoff-projection.ts` 顶部注释：提示词要求模型输出三段式
+        // 实测命中率 1.8%；而 arXiv 2608.11242 证明约束若埋在摘要散文里
+        // 合规率只有 31.8%，独立列出则升到 99.7%。所以这里完全由结构化
+        // Fact 渲染，零模型依赖。
+        let text: string;
+        if (sessionFacts.length > 0) {
+          const projected = projectHandoff({
+            facts: sessionFacts,
+            task: source.lastUserRequest,
+            note: args.note ?? '',
+          });
+          text = projected.text;
+          ctx.logger.info(
+            `[lrc][tool] lrc_handoff 从 ${sessionFacts.length} 条 Fact 投影：` +
+              `事实 ${projected.sections.confirmed.length} / 进展 ${projected.sections.progress.length} / ` +
+              `下一步 ${projected.sections.next.length}`,
+          );
+        } else if (connection.peek() !== null) {
+          // 账本为空（插件中途加载 / 刚重启）：退回按索引行拼装。
+          //
+          // 这里**不能**假装有 Fact —— 索引行是记忆预览，不是本会话结论。
+          // 明确降级并在日志里说明，比编造一份「看起来完整」的交接文档安全。
+          let indexLines: string[] = [];
           try {
-            const index = await client.index(config.project, 10);
+            const index = await connection.peek()!.index(config.project, 10);
             indexLines = index.items.map((item) => item.content_preview);
           } catch {
-            // 忽略：索引只是锦上添花
+            // 索引只是锦上添花
           }
+          text = buildHandoffText({
+            lastUserRequest: source.lastUserRequest,
+            recentAssistant: source.recentAssistant,
+            snapshot: latestSnapshot,
+            indexLines,
+            note: args.note ?? '',
+          });
+          ctx.logger.info('[lrc][tool] lrc_handoff 本会话 Fact 账本为空，退回索引拼装');
+        } else {
+          text = buildHandoffText({
+            lastUserRequest: source.lastUserRequest,
+            recentAssistant: source.recentAssistant,
+            snapshot: latestSnapshot,
+            indexLines: [],
+            note: args.note ?? '',
+          });
+          ctx.logger.info('[lrc][tool] lrc_handoff 无 Fact 账本且 LRC 未连接，退回纯文本交接');
         }
-
-        const text = buildHandoffText({
-          lastUserRequest: source.lastUserRequest,
-          recentAssistant: source.recentAssistant,
-          snapshot: latestSnapshot,
-          indexLines,
-          note: args.note ?? '',
-        });
 
         const result = await createHandoffSession({
           ctx,
@@ -1987,6 +2630,82 @@ export function apply(ctx: Context, config: Config): void {
           sessionId: result.sessionId ?? '',
           mode: result.mode,
           text: result.text,
+        };
+      },
+    }),
+  );
+
+  // 工件取回：长文本落盘后的**唯一读取入口**。
+  //
+  // ## 为什么需要独立工具
+  //
+  // 落盘后上下文里只剩一条 `[工件] 长文档已存入工件库（… hash=abc123）：首行预览`。
+  // 模型要读原文，必须有一个按 hash 取回的通道 —— 否则「存进去就再也取不回来」，
+  // 比不落盘更糟。
+  //
+  // ## 为什么限制单次返回长度
+  //
+  // 取回的原文会直接进上下文。用户可能贴了 2MB 文档，一次全返回等于
+  // 立刻把窗口打满，与本功能的目的相反。默认只返回前 N 字符，
+  // 并明确告知总长度与偏移，让模型可以分段取。
+  registerTool('lrc_fetch_artifact', () =>
+    defineTool({
+      name: 'lrc_fetch_artifact',
+      description:
+        '取回此前落盘的长文档 / 超长代码原文。' +
+        '当上下文里出现「[工件] 长文档已存入工件库（… hash=xxx）」而你需要看原文时调用。' +
+        `单次最多返回 ${ARTIFACT_CHUNK_CHARS} 字符，超长内容用 offset 分段读。`,
+      parameters: {
+        hash: {
+          type: 'string',
+          required: true,
+          description: '工件 hash（从 [工件] 记忆条目里取 hash= 后面的值）',
+        },
+        offset: {
+          type: 'number',
+          description: '起始字符偏移，默认 0',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            text: { type: 'string', required: true },
+            found: { type: 'boolean', required: true },
+            total: { type: 'number', required: true },
+          },
+        },
+        render: (_args: unknown, value: { text: string }) => [{ type: 'text', text: value.text }],
+      },
+      async execute(args: { hash: string; offset?: number }) {
+        const hash = typeof args.hash === 'string' ? args.hash.trim() : '';
+        if (hash.length === 0) {
+          return { text: 'lrc_fetch_artifact 需要非空的 hash。', found: false, total: 0 };
+        }
+        const body = artifactStore.fetch(hash);
+        if (body === null) {
+          return {
+            text:
+              `未找到工件 ${hash}。可能已被配额淘汰，或 hash 有误。` +
+              `可用 lrc_recall 检索「工件」类记忆确认可用的 hash。`,
+            found: false,
+            total: 0,
+          };
+        }
+        const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : 0;
+        const chunk = body.slice(offset, offset + ARTIFACT_CHUNK_CHARS);
+        const more = offset + chunk.length < body.length;
+        const head =
+          offset === 0
+            ? `工件 ${hash}（共 ${body.length} 字符）`
+            : `工件 ${hash}（共 ${body.length} 字符，从 ${offset} 开始）`;
+        const tail = more ? `\n\n--- 还有 ${body.length - offset - chunk.length} 字符，用 offset=${offset + chunk.length} 继续读 ---` : '';
+        ctx.logger.info(`[lrc][tool] lrc_fetch_artifact ${hash} → ${chunk.length}/${body.length} 字符`);
+        return {
+          text: `${head}\n\n${chunk}${tail}`,
+          found: true,
+          total: body.length,
         };
       },
     }),
@@ -2085,6 +2804,27 @@ export function apply(ctx: Context, config: Config): void {
         }
         lines.push('');
 
+        lines.push('## 工件库');
+        {
+          // 这一节是排查「长文档为什么取不回」的唯一入口：
+          // 配额撞 NaN 时工件会被全部淘汰，届时这里 usage 会显示 0。
+          if (!artifactEnabled) {
+            lines.push('已关闭（artifactEnabled=false）：长文本按原样留在上下文。');
+          } else {
+            const items = artifactStore.list();
+            lines.push(
+              `启用：阈值 ${artifactMinChars} 字符 / 配额 ${quotaMb} MB / 现有 ${items.length} 个` +
+                ` / 占用 ${(artifactStore.usageBytes() / 1024 / 1024).toFixed(2)} MB`,
+            );
+            for (const item of items.slice(0, 5)) {
+              lines.push(`- ${item.hash}（${item.chars} 字符）：${item.preview}`);
+            }
+            if (items.length > 5) lines.push(`- …另有 ${items.length - 5} 个`);
+          }
+          lines.push(`本会话 Fact 账本：${sessionFacts.length} 条（交接文档的数据源）`);
+        }
+        lines.push('');
+
         lines.push('## 预算');
         lines.push(budget === null ? '尚未解析' : formatBudget(budget));
         lines.push('');
@@ -2117,12 +2857,13 @@ export function apply(ctx: Context, config: Config): void {
           lines.push('');
           lines.push('### 主动召回注入未启用');
           lines.push(
-            `在 \`${patchPath}\` 的 \`id: dsh-plugin-lrc\` → \`config:\` 下补以下四行，然后重启 DSH：`,
+            `在 \`${patchPath}\` 的 \`id: dsh-plugin-lrc\` → \`config:\` 下补以下五行，然后重启 DSH：`,
           );
           lines.push('```yaml');
           lines.push('        recallInjectEnabled: true');
           lines.push('        recallInjectMaxItems: 2');
-          lines.push('        recallInjectMinScore: 0.5');
+          lines.push('        recallInjectMinScore: 0.85');
+          lines.push('        recallInjectMinRawScore: 0.025');
           lines.push('        recallInjectMaxCharsPerItem: 80');
           lines.push('```');
           lines.push('（上溯路径来自本插件实际使用的缓存目录；多 profile 时请确认当前 profile 名。）');
@@ -2147,9 +2888,19 @@ export function apply(ctx: Context, config: Config): void {
               : `本轮无匹配，未注入｜指纹 ${recallFingerprint || '(空)'}`,
           );
           lines.push(
-            `配置：最多 ${recallOptions.maxItems} 条｜阈值 ${recallOptions.minScore}` +
+            `配置：最多 ${recallOptions.maxItems} 条｜相对分 ≥${recallOptions.minScore}` +
+              `｜绝对分 ≥${recallOptions.minRawScore}` +
               `｜单条 ${recallOptions.maxCharsPerItem} 字符｜总长 ${recallOptions.maxTotalChars}`,
           );
+          // 绝对分闸门在单路部署里不可满足：RRF 单路上限 1/61≈0.0164，
+          // 任何 >0.0164 的阈值都会让整场会话 0 注入，而状态栏若不说明，
+          // 用户只会看到「本轮无匹配」并误判成插件失效。
+          if (recallOptions.minRawScore > 0.0164) {
+            lines.push(
+              '（绝对分阈值为 RRF 名次分：单路命中上限约 0.0164。' +
+                '若 LRC 的语义/深度通路不可用，该阈值会导致整场不注入 —— 见日志 warn。）',
+            );
+          }
           lines.push(`累计改写 ${recallRewrites} 次（每次改写会打断一次前缀缓存）`);
           if (recallText.length > 0) {
             lines.push('内容：');

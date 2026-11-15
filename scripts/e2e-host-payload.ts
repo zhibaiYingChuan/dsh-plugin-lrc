@@ -26,6 +26,7 @@ import {
   linesFromSession,
   reasoningBlocksOnly,
 } from '../src/session-text.ts';
+import { extractFacts } from '../src/memory-extract.ts';
 
 let passed = 0;
 let failed = 0;
@@ -69,10 +70,22 @@ const session = {
 };
 
 const lines = linesFromSession(session);
-check('session.log 能投影出文本行', lines.length === 2, `实际 ${lines.length} 行：${JSON.stringify(lines)}`);
+// ★2026-11-14 语义变更：收集阶段不再做「值不值得记」的语义筛选。
+//
+// 旧实现在这里用 `hasConstraintMarker` + `carriesResourceLocation` 过滤用户
+// 消息 —— 那等于在收集阶段就做价值判断，而判据与提取阶段不一致，两处漂移
+// 必然漏（实测用户的「音频在桌面」因此从未进入沉淀源）。
+//
+// 现在收集阶段只排除「肯定不是用户说的话」（技能目录 / 运行时上下文），
+// 价值判断统一交给 `memory-schema.ts` 的三元组契约。
+check('session.log 能投影出文本行', lines.length === 3, `实际 ${lines.length} 行：${JSON.stringify(lines)}`);
 check('含强约束词的用户消息被收录', lines[0] === '必须用 3099 作为正式端口，帮我看看怎么配', lines[0]);
-check('无强约束词的用户指令不进沉淀源', !lines.some((l) => l.includes('视觉配色')), JSON.stringify(lines));
-check('正文消息被收录', lines[1] === '决定用 3099 作为正式端口', lines[1]);
+check(
+  '无约束词的用户指令也进入收集（是否入库由 schema 裁决）',
+  lines.some((l) => l.includes('视觉配色')),
+  JSON.stringify(lines),
+);
+check('正文消息被收录', lines.some((l) => l === '决定用 3099 作为正式端口'), JSON.stringify(lines));
 check(
   '推理块不进沉淀源（否则内部思考会被写成长期记忆）',
   !lines.some((l) => l.includes('先确认现有端口约定') || l.includes('测试环境统一用 3111')),
@@ -164,22 +177,27 @@ const gated = {
 };
 
 const gatedLines = linesFromSession(gated);
+// 收集阶段已不做语义筛选，所以这组断言改为验证**下游 schema 的判定**：
+// 哪些句子最终能变成一条记忆。
+const gatedFacts = gatedLines
+  .flatMap((text) => extractFacts({ text, origin: 'user', sessionId: 'session-gated' }).facts)
+  .map((f) => f.statement);
 check(
-  '路径里的「禁止」不再骗过门槛',
-  !gatedLines.some((l) => l.includes('禁止事项')),
-  JSON.stringify(gatedLines),
+  '路径里的「禁止」不会被当成约束（schema 拆不出三元组）',
+  !gatedFacts.some((s) => s.includes('禁止事项')),
+  JSON.stringify(gatedFacts),
 );
 check(
-  '「别用」类约束进入沉淀源',
-  gatedLines.some((l) => l.includes('别用 npm')),
-  JSON.stringify(gatedLines),
+  '「别用」类约束成为记忆',
+  gatedFacts.some((s) => s.includes('别用') && s.includes('npm')),
+  JSON.stringify(gatedFacts),
 );
 check(
-  '英文约束进入沉淀源',
-  gatedLines.some((l) => l.includes('must use 3111')),
-  JSON.stringify(gatedLines),
+  '英文约束成为记忆',
+  gatedFacts.some((s) => s.includes('must use') && s.includes('3111')),
+  JSON.stringify(gatedFacts),
 );
-check('无约束任务描述仍被挡', !gatedLines.some((l) => l.includes('视觉配色')));
+check('无约束任务描述不成为记忆', !gatedFacts.some((s) => s.includes('视觉配色')), JSON.stringify(gatedFacts));
 
 // ────────────────────────────────────────────────────────────
 // 2. 旧实现读 session.lines —— 必须证明它不存在

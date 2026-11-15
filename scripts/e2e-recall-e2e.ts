@@ -60,13 +60,17 @@ const server = createServer(async (req, res) => {
     const body = JSON.parse(raw) as { query: string; top_k: number };
     enrichCalls.push(body);
     if (enrichDelayMs > 0) await new Promise((r) => setTimeout(r, enrichDelayMs));
-    // 按关键词给出可区分的记忆，让"注入了哪个话题"可断言
+    // 按关键词给出可区分的记忆，让"注入了哪个话题"可断言。
+    //
+    // ★ 必须同时给 `score`（绝对分）与 `score_norm`（相对分）：
+    // 真实 LRC 两者都返回，而插件的准入是**双闸门** —— 只给相对分
+    // 会走"旧版兼容"路径，测不到真实行为。
     if (body.query.includes('视频')) {
       return send(res, 200, {
         total: 2,
         memories: [
-          { id: 'v1', content: '视频偏好纸质拼贴风格，不要渐变', memory_type: 'preference', score_norm: 0.95, importance: 7 },
-          { id: 'v2', content: '视频时长确定为 60 秒', memory_type: 'decision', score_norm: 0.82, importance: 6 },
+          { id: 'v1', content: '视频偏好纸质拼贴风格，不要渐变', memory_type: 'preference', score: 0.0321, score_norm: 1.0, importance: 7 },
+          { id: 'v2', content: '视频时长确定为 60 秒', memory_type: 'decision', score: 0.0308, score_norm: 0.96, importance: 6 },
         ],
       });
     }
@@ -74,7 +78,33 @@ const server = createServer(async (req, res) => {
       return send(res, 200, {
         total: 1,
         memories: [
-          { id: 'd1', content: '数据库选 PostgreSQL，因为需要事务', memory_type: 'decision', score_norm: 0.9, importance: 8 },
+          { id: 'd1', content: '数据库选 PostgreSQL，因为需要事务', memory_type: 'decision', score: 0.0312, score_norm: 1.0, importance: 8 },
+        ],
+      });
+    }
+    if (body.query.includes('无关话题')) {
+      // 话题无关、且**双路命中**（真实环境的高危形态）。
+      //
+      // ★这里原先是 0.0151（单路簇），那是理想化的输入。实测真实无关查询
+      // 如「红烧肉怎么做」「量子纠缠的退相干时间」的 top1 是 0.0309/0.0315
+      // —— 落在双路簇里，**当前闸门挡不住**。这组数据把这个已知盲区
+      // 显式固化成回归线：将来若引入真正的语义相关度判据，这条会变绿。
+      return send(res, 200, {
+        total: 2,
+        memories: [
+          { id: 'x1', content: '无关但双路命中的历史 A', memory_type: 'fact', score: 0.0311, score_norm: 1.0, importance: 3 },
+          { id: 'x2', content: '无关但双路命中的历史 B', memory_type: 'fact', score: 0.0305, score_norm: 0.98, importance: 3 },
+        ],
+      });
+    }
+    if (body.query.includes('单路话题')) {
+      // 单路命中（0.0164 = 1/61）：RRF 意义下"只有一条通路撞上"，
+      // 是闸门应当挡掉的形态。模拟语义/深度路不可用的部署。
+      return send(res, 200, {
+        total: 2,
+        memories: [
+          { id: 's1', content: '单路候选 A', memory_type: 'fact', score: 0.0164, score_norm: 1.0, importance: 3 },
+          { id: 's2', content: '单路候选 B', memory_type: 'fact', score: 0.0161, score_norm: 0.98, importance: 3 },
         ],
       });
     }
@@ -197,7 +227,7 @@ try {
   await emit(userEvent('根据 compression-account.md 生成视频'));
   const afterVideo = probe();
   check('enrich 被调用', enrichCalls.length === 1, enrichCalls);
-  check('注入出现在上下文中', afterVideo.includes('[LRC 相关记忆]'), afterVideo.slice(0, 120));
+  check('注入出现在上下文中', afterVideo.includes('[LRC 历史记忆（可能过时'), afterVideo.slice(0, 120));
   check('注入含视频话题记忆', afterVideo.includes('纸质拼贴'), afterVideo.slice(0, 200));
   check('最多注入 2 条（缺字段时兜底生效）', afterVideo.split('\n').filter((l) => l.startsWith('- ')).length === 2, afterVideo);
   check('top_k 按 maxItems*3 计算', enrichCalls[0]?.top_k === 6, enrichCalls[0]);
@@ -205,6 +235,10 @@ try {
   // 系统提示必须与"已注入"状态一致（不能一边推一边要求再查）
   check('系统提示告知记忆已自动注入', sectionText.includes('自动检索'), sectionText.slice(0, 200));
   check('系统提示不再强制"先调 lrc_recall"', !sectionText.includes('**先调 `lrc_recall` 工具**'), sectionText.slice(0, 200));
+  // 注入版提示必须写成软提示：判断权交给正在工作的模型，
+  // 否则它会为了迎合历史而改变做法（上下文偏移 / 幻觉）。
+  check('系统提示声明判断权在模型', sectionText.includes('由你判断'), sectionText.slice(0, 300));
+  check('系统提示允许忽略无关记忆', sectionText.includes('直接忽略'), sectionText.slice(0, 300));
 
   // ── 2) 同话题追问：不得重复改写（缓存友好）──
   console.log('=== 2) 同话题不重复注入 ===');
@@ -257,7 +291,7 @@ try {
     await emit(userEvent('量子纠缠的退相干时间怎么测'));
     const afterMiss = probe();
     check('未命中后不再保留旧话题记忆', !afterMiss.includes('PostgreSQL'), afterMiss.slice(0, 120));
-    check('未命中后不注入新内容', !afterMiss.includes('[LRC 相关记忆]'), afterMiss.slice(0, 120));
+    check('未命中后不注入新内容', !afterMiss.includes('[LRC 历史记忆'), afterMiss.slice(0, 120));
 
     // 同一未命中话题内继续追问：可以再检索一次（措辞变化会换指纹），
     // 但**绝不能产生改写** —— 改写才是缓存断裂，检索只是一次本地 HTTP。
@@ -271,8 +305,52 @@ try {
     );
   }
 
+  // ── 7) 绝对分闸门：单路命中（0.0164）不注入 ──
+  //
+  // 这是本轮改造的核心。改造前只有 `score_norm >= 0.5` 一道闸门，
+  // 而 `score_norm` 是相对 top1 归一化的 —— top1 恒为 1.0，
+  // 于是**任何话题都会注入一条**，模型把无关历史当成当前事实。
+  console.log('=== 7) 绝对分闸门（单路）===');
+  {
+    const rewritesBefore = logs.filter((l) => l.includes('累计改写')).length;
+    await emit(userEvent('单路话题：只有一条通路命中'));
+    const t = probe();
+    check('单路候选时不注入', !t.includes('[LRC 历史记忆'), t.slice(0, 160));
+    check('单路候选时不产生改写', logs.filter((l) => l.includes('累计改写')).length === rewritesBefore);
+    check(
+      '日志带上最高绝对分（可区分"没检索到"与"被闸门挡掉"）',
+      logs.some((l) => l.includes('最高绝对分 0.0164')),
+      logs.filter((l) => l.includes('无记忆注入')),
+    );
+    check(
+      '全部被挡时升为 warn（否则用户以为插件没工作）',
+      logs.some((l) => l.startsWith('warn:') && l.includes('全部被绝对分闸门挡掉')),
+      logs.filter((l) => l.startsWith('warn:')),
+    );
+  }
+
+  // ── 7b) 已知盲区：双路命中的无关话题挡不住（记录，不要求通过）──
+  //
+  // `score` 是 RRF 名次分（Σ1/(60+rank)），只反映"几路命中、排第几"，
+  // **不是语义相关度**。实测真实无关查询「红烧肉怎么做」「量子纠缠退相干」
+  // 的 top1 是 0.0309/0.0315，落在双路簇里，当前 0.025 的闸门挡不住。
+  // 这条断言刻意写成"记录当前行为"，用来防止将来误以为闸门是万能的。
+  console.log('=== 7b) 已知盲区（双路无关话题）===');
+  {
+    await emit(userEvent('无关话题：双路命中的生活类查询'));
+    const t = probe();
+    const leaked = t.includes('[LRC 历史记忆');
+    console.log(
+      leaked
+        ? '  注意：双路命中的无关话题被放行了（已知盲区，RRF 分不是相关度）'
+        : '  已修复：双路命中的无关话题也被挡住（引入了真正的相关度判据）',
+    );
+    // 不强断言 leaked === true/false —— 只记录，避免把已知缺陷固化成"期望行为"
+    check('该场景不产生异常（可正常走到注入或拦断任一路径）', typeof t === 'string');
+  }
+
   // ── 8) 注入与快照共用同一注入点，不得重复 append ──
-  console.log('=== 7) 单一注入点 ===');
+  console.log('=== 8) 单一注入点 ===');
   {
     let callCount = 0;
     const original = contextText!;

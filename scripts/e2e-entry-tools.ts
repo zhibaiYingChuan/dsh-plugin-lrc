@@ -41,8 +41,10 @@ interface State {
   recallMode: 'ok' | 'empty' | 'http500';
   forgot: string[];
   migrated: unknown[];
+  /** distill 被调用次数（用于验证标签路径**绕过**了 distill）。 */
+  distillCalls: number;
 }
-const state: State = { healthy: false, recallMode: 'ok', forgot: [], migrated: [] };
+const state: State = { healthy: false, recallMode: 'ok', forgot: [], migrated: [], distillCalls: 0 };
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
@@ -79,6 +81,7 @@ const server = createServer(async (req, res) => {
     return send(res, 200, { deleted: true });
   }
   if (url.pathname === '/v1/context/distill') {
+    state.distillCalls += 1;
     return send(res, 200, { items: [], count: 0, index_line: '' });
   }
   if (url.pathname === '/v1/context/migrate') {
@@ -244,13 +247,21 @@ check('请求真的发到服务端', state.forgot.includes('mem-b'), state.forgo
 // ────────────────────────────────────────────────────────────────
 console.log('=== 6) 手动沉淀：标签路径绕过 distill ===');
 state.migrated.length = 0;
+// 记下进入本节的 distill 调用次数，之后必须「一条都没增加」
+const distillBefore = state.distillCalls;
 const tagText = '<lrc_memory>\n- 决策：数据库选 PostgreSQL，因为需要事务\n</lrc_memory>';
 const m2 = (await tool('lrc_remember_now').execute({ text: tagText })) as {
   snapshot: string;
   distilled: number;
 };
 check('标签内容被沉淀', state.migrated.length > 0, state.migrated.length);
-check('绕过 distill（未产生 distill 调用即可）', m2.distilled >= 0, m2.distilled);
+// 原断言 `distilled >= 0` 恒真（★2026-11-16 发布前审查 P2）。
+// 真实意图是「标签路径不走 distill」——直接数服务端被调用了几次。
+check(
+  '绕过 distill（服务端 distill 调用次数未增加）',
+  state.distillCalls === distillBefore,
+  { before: distillBefore, after: state.distillCalls },
+);
 
 // ────────────────────────────────────────────────────────────────
 console.log('=== 7) 服务中途崩溃 → 恢复（入口层）===');

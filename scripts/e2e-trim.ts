@@ -371,6 +371,82 @@ check(
   ),
 );
 
+// 回归 2b-2：来源构成标注必须无歧义且**不得出现负数**（★2026-11-15）
+//
+// 旧写法 `请求 8（真实 0）` 在真实日志里连出 18 次，读起来像「8 条请求
+// 里 0 条是真的」——被误判成「统计坏了 / 用户发言全丢」。
+// 实测用 shadowedSeqs 回查后确认：那 8 条全是旧摘要继承，统计本身是对的。
+// 所以修的是**措辞**。
+//
+// ★但首版改成了 `(=0新+8旧)`，隐含 `real ≤ total`，而 `realCounts` 在
+// **截断之前**快照、`调用`段 weight=0 最先被砍 ⇒ 真实会出现 real=30、
+// total=26，算出 `调用 26(=30新+-4旧)`。生产日志确有此形状。
+// 这三条断言锁住三种关系各自的正确输出。
+{
+  const header = '## 已裁剪的历史（确定性摘要，无 LLM）';
+  const body = [
+    header,
+    '### 用户请求',
+    '- 继承1',
+    '- 继承2',
+    '### 助手结论',
+    '- 新结论',
+    '### 工具调用与结果',
+    '- 调用1',
+  ].join('\n');
+
+  // real < total：差额来自旧摘要继承
+  const inherited = summaryStats(body, { requests: 0, conclusions: 1, errors: 0, calls: 1 });
+  check('全继承时标出「0新+N继承」', inherited.includes('请求 2(0新+2继承)'), inherited);
+
+  // real > total：被字符预算截断（★P0 回归：绝不能出现负数）
+  const truncated = summaryStats(body, { requests: 5, conclusions: 1, errors: 0, calls: 1 });
+  check('真实多于末尾时标「截断自 N」', truncated.includes('请求 2(截断自 5)'), truncated);
+  check('绝不输出负数', !/\+\s*-|-\d+继承/.test(truncated), truncated);
+
+  // real === total：不加注（校验**完整字符串**，避免关键词黑名单式的脆弱断言）
+  const equal = summaryStats(body, { requests: 2, conclusions: 1, errors: 0, calls: 1 });
+  check(
+    '真实等于末尾时完全不加注',
+    equal === '请求 2 / 结论 1 / 错误 0 / 调用 1',
+    equal,
+  );
+}
+
+// 回归 2b-3：用户请求超 12 条时必须保留**最新**的（★2026-11-16 发布前审查 P1-1）
+//
+// 首版 `collect(requests, requestSeen, ..., 12)` 用的是默认「满额即丢」，
+// 保留的是**最旧的 12 条** —— 探针实测 20 条只留第 1–12 条，最新 8 条被丢弃，
+// 用户刚说的话进不了摘要。
+//
+// 这与本项目已修的三处同属「取最旧」缺陷族（账本投影 / prune 补位 /
+// handoff 投影），方向必须统一为「留最新」。这条断言锁住方向。
+{
+  const many = Array.from({ length: 20 }, (_, i) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `第 ${i + 1} 条用户请求：用来验证保留方向的样本` }],
+  }));
+  const s = buildDeterministicSummary(many, 6000);
+  const lines = s.split('\n').filter((l) => l.startsWith('- '));
+  check('请求超 12 条时只保留 12 条', lines.length === 12, lines.length);
+  check('保留的是最新一条（第 20 条）', s.includes('第 20 条'), s.slice(0, 200));
+  check('最旧一条（第 1 条）已被丢弃', !s.includes('第 1 条'), s.slice(0, 200));
+}
+
+// 回归 2b-4：maxChars 缺失不得让摘要退化成「…」（★2026-11-16 发布前审查 P1-2）
+//
+// 宿主不会为老 patch 补齐新字段。`Math.min(undefined, n)` 得 NaN，
+// 随后所有 `text.length > NaN` 恒 false ⇒ 摘要被截到只剩 `"…"`。
+const nanSummary = buildDeterministicSummary(
+  [
+    { role: 'user', content: [{ type: 'text', text: '变更后的摘要长度上限缺失时不能把内容全丢掉' }] },
+    { role: 'assistant', content: [{ type: 'text', text: '结论：这个字段必须有兜底，否则摘要会退化成省略号' }] },
+  ],
+  Number.NaN,
+);
+check('maxChars=NaN 时摘要不是单个省略号', nanSummary.length > 20, nanSummary);
+check('maxChars=NaN 时正文仍被保留', nanSummary.includes('变更后的摘要长度上限'), nanSummary);
+
 // 回归 2c：过程叙述（「接下来我要…」）不是结论，不能进 `### 助手结论`
 const narrationSummary = buildDeterministicSummary(
   [
