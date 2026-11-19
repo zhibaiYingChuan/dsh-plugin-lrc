@@ -1,9 +1,9 @@
 // src/index.ts
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
-import { dirname as dirname3, join as join3 } from "node:path";
+import { dirname as dirname3, join as join4 } from "node:path";
 import { homedir as homedir2 } from "node:os";
-import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync4 } from "node:fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "node:fs";
 
 // src/runtime.ts
 import { createHash } from "node:crypto";
@@ -518,6 +518,9 @@ var LrcClient = class {
     if (options.project !== void 0 && options.project.length > 0) {
       body.project = options.project;
     }
+    if (options.tags !== void 0 && options.tags.length > 0) {
+      body.tags = options.tags;
+    }
     const data = await this.request(
       "/v1/memories/enrich",
       { method: "POST", body: JSON.stringify(body) }
@@ -553,6 +556,55 @@ var LrcClient = class {
       merged: migrated.merged,
       indexLine: distilled.index_line
     };
+  }
+  /**
+   * 写入**单条**记忆，可携带真实发生时间（`source_timestamp_ms`）。
+   *
+   * ## 为什么不能用 `migrate` 代替（2026-11-17 实测）
+   *
+   * `migrate` 的请求体没有时间字段，LRC 侧在 `v1_api.rs` 里把
+   * `source_timestamp` 硬编码为 `None` ⇒ 落库时间恒为**摄入时刻**。
+   * 实测对照（写入一条「声称发生在 2026-01-01」的记忆）：
+   * ```
+   * /v1/memories/remember  → created_at = 2026-01-01  ✅ 偏差 0.0 秒
+   * /v1/context/migrate    → created_at = 写入当天    ❌ 偏差 319.9 天
+   * ```
+   * 会话纪要的价值完全依赖真实时间（「什么时候定的这个方案」），
+   * 用摄入时刻等于把 65.8 小时的会话压成一个瞬间 —— 时序信息永久丢失。
+   *
+   * ## `event_id` **不是**覆盖语义（十二轮审查 M4，已核对 LRC 源码）
+   *
+   * LRC 的去重完全基于**内容相似度**，与 `event_id` 无关：
+   * - `memory_store.rs` 的 `build_candidates` / `find_similar_in_snapshot`
+   *   都**不读** `event_id`
+   * - `memory_write.rs` 的 `apply_merge` 只在合并后把 `event_id` 更新成新值
+   *
+   * 实测矩阵（同一 `event_id` 连续写两次）：
+   * ```
+   * 内容 Jaccard ≥ 0.5 ⇒ 合并 ⇒ 返回同一个 memory_id，库内 1 条
+   * 内容 Jaccard < 0.5 ⇒ 新建 ⇒ 返回新的 memory_id，库内 **2 条**
+   * ```
+   *
+   * 所以「一份对话一份纪要」不能靠 `event_id` 保证，必须由调用方
+   * 记住上次返回的 `memory_id`，在 id 变化时主动 `forget(旧 id)`。
+   * 参会见 `session-minutes.ts` 的 `MinutesLedgerState.memoryId`。
+   */
+  async remember(input) {
+    const body = {
+      content: input.content,
+      memory_type: input.memoryType
+    };
+    if (input.project !== void 0) body.project = input.project;
+    if (input.tags !== void 0) body.tags = input.tags;
+    if (input.importance !== void 0) body.importance = input.importance;
+    if (input.eventId !== void 0) body.event_id = input.eventId;
+    if (input.sourceTimestampMs !== void 0) body.source_timestamp_ms = input.sourceTimestampMs;
+    if (input.entities !== void 0) body.entities = input.entities;
+    const data = await this.request(
+      "/v1/memories/remember",
+      { method: "POST", body: JSON.stringify(body) }
+    );
+    return { memoryId: data.memory_id ?? "" };
   }
 };
 
@@ -685,6 +737,87 @@ function isConnectionError(error) {
 }
 
 // src/recall-injection.ts
+var STRONG_SIGNAL = new RegExp(
+  [
+    // ── 本身无歧义 ──
+    //
+    // `上次`/`当初` 在中文里**只指过去**，不存在「当前指令」用法：
+    // 「上次部署失败了，这次注意点」「当初那个 bug 又出现了」都是需要
+    // 历史上下文的真实场景，不是误触发（第五轮审查 critical 1 判断有误）。
+    "上次",
+    "当初",
+    "继续上次",
+    // 「接着之前的代码往下写」是续写指令 ⇒ 必须带回顾宾语
+    "接着(?:上次|之前)(?:的)?(?:那个|方案|决定|结论|进度|问题|讨论|思路|重构|工作)",
+    // 「这个参数不是定了 5 秒吗」是确认当前配置 ⇒ 必须带选型宾语
+    "不是定(?:过|了)(?:要|用|的|吗|呢|？|\\?)",
+    // 「还记得要加 try-catch」「记不记得要加 try-catch」都是叮嘱
+    // ⇒ 必须带回顾宾语或疑问（第五轮审查 critical 2：两种说法口径必须一致）
+    "(?:你|还|记不)记得(?:我们|之前|上次|那个|当时|吗|什么|怎么|为什么|是)",
+    // 「那个方案」必须带疑问/回顾词：「按那个方案实现就行」是当前指令。
+    "那个方案(?:是什么|怎么样|后来|是啥|呢|吗)",
+    // 「我们决定过」是回顾；「我们决定用 pnpm 吧」「我们约定一下接口格式」
+    // 是当前决策 ⇒ 必须有「过」（第五轮审查 critical 3）。
+    "我们(?:决定过|定过|说好过|约定过)",
+    // 「之前不是这样的」「之前不是这个报错」是当前排障 ⇒ 必须带回顾动词
+    // （第五轮审查 major 5）。
+    "之前不是(?:说|定|讲|提|约定|商量)",
+    "之前(?:提|聊|讨论|讲)过",
+    // 「我提过 PR 了」是当前动作 ⇒ 第一人称必须带「之前/以前」
+    "(?:我们|你)(?:讨论|聊|讲)过|我(?:之前|以前)(?:提|讲)过",
+    "前面说过",
+    // 「翻一下之前的记录」「查一下历史记录」是明确的回顾请求
+    "(?:之前|以前)的(?:记录|纪要|对话|讨论|决定|方案|结论|工作|进展|思路|历史)",
+    // 「清空 git 历史记录」是 git 操作 ⇒ 必须带回顾动词
+    // ⚠ `历史记录表/字段/索引/列` 是数据库对象名，不是回顾（第四轮审查 major 2）
+    "(?:查|翻|看|找)(?:一下)?历史(?:记录|纪要|对话)(?!表|字段|索引|列)",
+    "回忆(?:一下|当时|之前)",
+    // ## 「回顾 / 梳理」——实测漏判（2026-11-19）
+    //
+    // 真实提示词「回顾梳理我们前面所有的方案和项目的状态，查看还有哪些需要
+    // 补齐的地方」是**典型的回顾请求**，但旧信号表一条都不命中。
+    //
+    // ## 为什么只认「历史专属名词」（两轮独立审查 M1/M-a/M-c）
+    //
+    // `之前/以前/项目/方案/状态/整个/所有` 都**不是**历史专属：
+    // 「回顾一下之前改的那行代码」「回顾一下项目结构」「回顾一下整个流程」
+    // 「梳理一下所有依赖关系」全是当前工作。中文里无法用正则区分
+    // 「回顾之前的方案」（历史）与「回顾之前的改动」（当前）—— 故按
+    // 「宁可漏触发」原则，只保留高精度形态，其余交给模型主动调 lrc_recall。
+    //
+    // `历史` 也必须排除定语用法：「历史数据迁移」「历史订单」「历史提交」
+    // 是当前任务，只有「历史上/历史中/历史的记录」才是回顾。
+    "回顾(?:一下|梳理)?(?:历史(?:上|中|(?:记录|纪要|对话)(?!表|字段|索引|列)|的(?:对话|记录|纪要|讨论|决定|方案|结论|工作|进展))|过往|做过的|走过的|历程)",
+    // 「回顾梳理我们前面所有的方案」是连用形态。
+    // ⚠ `我们` 与 `所有/整个` 都不构成消歧（第三/四轮审查）：
+    // 「回顾一下我们之前那个报错」「梳理一下我们前面所有的接口」都是当前工作
+    // ⇒ 必须 `我们前面 + 所有/整个 + 历史宾语白名单`。
+    "回顾(?:一下|梳理)?我们前面(?:所有|整个)(?:的)?(?:方案|决定|结论|讨论|工作|进展|思路)",
+    // `梳理` 同理；`前面` 必须接 `所有/整个` + 历史宾语（第四轮审查 major 1）
+    "梳理(?:一下)?(?:我们)?(?:前面(?:所有|整个)(?:的)?(?:方案|决定|结论|讨论|工作|进展|思路)|历史(?:上|中|(?:记录|纪要|对话)(?!表|字段|索引|列)|的(?:对话|记录|纪要|讨论|决定|方案|结论|工作|进展))|过往)",
+    // 「git diff 看看改过什么」「看看我改了什么」是看工作区 ⇒ 必须有「之前/以前」
+    // （第五轮审查 critical 4）。
+    "(?:我们|你|我)(?:之前|以前)(?:改过什么|改了什么)",
+    // ## 「为什么 + 设计/用/选」必须带设计名词**且收在句末/停顿处**
+    //
+    // 「为什么用这个方案」是问决策理由（查历史有益）；
+    // 「为什么用这个锁会死锁」「为什么用这个 API 会 404」是当前故障排查。
+    // ⚠ 只限定宾语类别挡不住后者（`锁`/`数据库`/`接口` 正是故障句高频宾语），
+    // 必须再要求它后面没有继续接谓语。
+    "为什么(?:这么|这样)(?:设计|用|选)(?:呢|吗|？|\\?|$|，|,)",
+    "为什么(?:设计|用|选)(?:这个|那个|这种|那种)(?:方案|库|框架|技术|架构|做法|思路|方式|工具|语言|数据库|锁|结构|设计|接口|协议|模式)(?:呢|吗|？|\\?|$|，|,)"
+  ].join("|")
+);
+var WEAK_SIGNAL = new RegExp(
+  ["当时", "先前", "早先", "之前", "以前", "历史上", "按?老规矩", "照旧"].join("|")
+);
+var QUESTION_MARK = /(?<!为)什么|啥|哪个|哪些|多少|哪次|哪回|如何|是不是|有没有|在哪|怎么(?:改|做|写|配|定|选|用|弄|搞|处理|修|查|解决|约定|商量|谈|来|产生)|为什么(?:选|用|定|改|做)/;
+var NOT_HISTORY = /都行|随便|你定|你来定|无所谓|看着办/;
+function isHistoryQuery(text) {
+  if (NOT_HISTORY.test(text)) return false;
+  if (STRONG_SIGNAL.test(text)) return true;
+  return WEAK_SIGNAL.test(text) && QUESTION_MARK.test(text);
+}
 var INJECTION_HEADER = "[LRC 历史记忆（可能过时，与当前任务无关时请忽略）]";
 var DEFAULT_RECALL_INJECTION = {
   // 2 条足够覆盖"用户偏好 + 关键决定"这类最常见场景，再多就是噪音
@@ -696,7 +829,16 @@ var DEFAULT_RECALL_INJECTION = {
   minScore: 0.85,
   // RRF 分：单路 ≈0.0164 / 双路 ≈0.0301。0.025 等价于「要求至少两路命中」。
   // 注意它是名次信号而非相关度，见字段注释里的实测数据。
-  minRawScore: 0.025
+  minRawScore: 0.025,
+  // 只收「无主语改写句」这一种最确定的形态。实测 dsh 项目 2037 条未折叠
+  // 碎片里命中 58 条（2.8%），全部是真残句（「改用 edit 工具」「改成逐行状态机处理」）。
+  //
+  // ⚠ 不要加 `先|再|现在|但|不过|而|并且|这是|这个|那个|它`：
+  // 实测会把「先确认宿主如何处理 assistant/message」「现在改写探针脚本，
+  // 让基线日志合法」这类**完整句子**一起挡掉（宽口径误伤 344 条）。
+  fragmentPrefixes: "^(?:改成|改用|换成|改为|换掉|删掉|去掉|只保留)",
+  // 9：只豁免「用户约束」和「关键路径」这类高价值短句
+  fragmentExemptImportance: 9
 };
 function isRelevant(memory, options) {
   const norm = typeof memory.score_norm === "number" && Number.isFinite(memory.score_norm) ? memory.score_norm : 1;
@@ -709,6 +851,29 @@ function absoluteScore(memory) {
   const raw = memory.score;
   if (typeof raw === "number" && Number.isFinite(raw)) return raw;
   return null;
+}
+var fragmentReCache = { source: "\0", re: null };
+function fragmentRegex(source) {
+  if (fragmentReCache.source === source) return fragmentReCache.re;
+  let re = null;
+  try {
+    re = new RegExp(source);
+  } catch {
+    re = null;
+  }
+  fragmentReCache = { source, re };
+  return re;
+}
+function isSubstantial(memory, options) {
+  if (options.fragmentPrefixes.length === 0) return true;
+  const body = typeof memory.content === "string" ? memory.content.trim() : "";
+  const stripped = body.replace(/^\[[^\]]{1,6}\]\s*/, "");
+  if (stripped.length === 0) return false;
+  const importance = typeof memory.importance === "number" && Number.isFinite(memory.importance) ? memory.importance : 0;
+  if (importance >= options.fragmentExemptImportance) return true;
+  const re = fragmentRegex(options.fragmentPrefixes);
+  if (re === null) return true;
+  return !re.test(stripped.slice(0, 200));
 }
 function normalizeRecallOptions(input) {
   const raw = input ?? {};
@@ -729,12 +894,49 @@ function normalizeRecallOptions(input) {
     // 绝对分是 RRF 分（值域 (0, 2/61]），**不能**夹到 [0,1]：
     // 夹上限到 1 会让所有候选都被判为不相关 ⇒ 永不注入。
     // 夹下限到 0 则是「显式关闭绝对闸门」，这是合法配置，不做拦截。
-    minRawScore: Math.max(0, num(raw.minRawScore, DEFAULT_RECALL_INJECTION.minRawScore))
+    minRawScore: Math.max(0, num(raw.minRawScore, DEFAULT_RECALL_INJECTION.minRawScore)),
+    // ## 碎片前缀判据的规范化（独立审查 major 2）
+    //
+    // 三种输入必须区分：
+    // - `undefined`（老 patch 没这个字段）⇒ 落默认（开启）
+    // - `null` / `''`（显式关闭）⇒ 空串
+    // - 字符串 ⇒ trim 后**必须以 `^` 开头**，否则落默认
+    //
+    // 为什么强制 `^`：`new RegExp(' ')` 能编译成功，但会匹配任何含空格的
+    // 正文 ⇒ 几乎全库被挡；`'改成'`（漏写 `^`）会挡掉句中含该词的完整句。
+    // 这与「配置写错就放行」的 fail-open 原则相反，必须在入口拦住。
+    fragmentPrefixes: (() => {
+      if (raw.fragmentPrefixes === void 0) return DEFAULT_RECALL_INJECTION.fragmentPrefixes;
+      if (raw.fragmentPrefixes === null) return "";
+      if (typeof raw.fragmentPrefixes !== "string") return DEFAULT_RECALL_INJECTION.fragmentPrefixes;
+      if (raw.fragmentPrefixes === "") return "";
+      const trimmed = raw.fragmentPrefixes.trim();
+      if (trimmed.length === 0) return DEFAULT_RECALL_INJECTION.fragmentPrefixes;
+      return trimmed.startsWith("^") ? trimmed : DEFAULT_RECALL_INJECTION.fragmentPrefixes;
+    })(),
+    // 夹到 [0,10]：超出范围会让豁免恒真或恒假
+    fragmentExemptImportance: Math.min(
+      10,
+      Math.max(
+        0,
+        num(raw.fragmentExemptImportance, DEFAULT_RECALL_INJECTION.fragmentExemptImportance)
+      )
+    )
   };
 }
 function formatRecallInjection(memories, options = DEFAULT_RECALL_INJECTION) {
   if (options.maxItems <= 0) return "";
-  const picked = memories.filter((m) => typeof m.content === "string" && m.content.trim().length > 0).filter((m) => isRelevant(m, options)).sort((a, b) => sortScoreOf(b) - sortScoreOf(a)).slice(0, options.maxItems);
+  const survivors = memories.filter((m) => typeof m.content === "string" && m.content.trim().length > 0).filter((m) => (m.memory_type ?? "") !== "conversation").filter((m) => isSubstantial(m, options));
+  const filtered = survivors.length < memories.length;
+  const maxRaw = filtered ? survivors.reduce((max, m) => {
+    const raw = absoluteScore(m);
+    return raw !== null && raw > max ? raw : max;
+  }, 0) : 0;
+  const rescored = filtered && maxRaw > 0 ? survivors.map((m) => {
+    const raw = absoluteScore(m);
+    return raw === null ? m : { ...m, score_norm: raw / maxRaw };
+  }) : survivors;
+  const picked = rescored.filter((m) => isRelevant(m, options)).sort((a, b) => sortScoreOf(b) - sortScoreOf(a)).slice(0, options.maxItems);
   if (picked.length === 0) return "";
   const render = (list) => {
     const lines = list.map((m) => {
@@ -1306,7 +1508,14 @@ var PREDICATES = {
     "是一种",
     "支持",
     "是"
-  ]
+  ],
+  /**
+   * 工件不走谓词表：它由 `makeArtifactFact` 直接从落盘元信息构造，
+   * 没有「从句子切前后两半」的过程。这里必须显式登记空表 ——
+   * `Record<Exclude<FactKind, 'location' | 'fact'>, …>` 要求每个键都在，
+   * 漏写会让 tsc 直接失败（这正是引入 tsc 想要的效果）。
+   */
+  artifact: []
 };
 var OBSERVATIONAL_GOAL_VERB = /^(?:降|减)到$/;
 var GOAL_QUANTITY = /[0-9]|以内|以下|之内|不超过|不低于|不少于|不大于|不小于|上限|下限/;
@@ -1698,6 +1907,27 @@ function makeArtifactFact(input) {
     status: "active"
   };
 }
+var TOPIC_MAX_CHARS = 40;
+function extractTopic(text) {
+  const lines = [];
+  let inFence = false;
+  for (const raw of text.split("\n")) {
+    if (raw.trim().startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+    if (!inFence) lines.push(raw);
+  }
+  const body = lines.join("\n");
+  const heading = /^#{1,6}\s+(.+)$/m.exec(body);
+  const candidate = heading?.[1] ?? // 否则取第一句：截到第一个句末标点或换行
+  /^[^。！？\n]+/.exec(body.replace(/^[#>\-*+\s]+/gm, "").trim())?.[0];
+  if (candidate === void 0) return void 0;
+  const flat = candidate.replace(/`([^`]*)`/g, "$1").replace(/\*\*/g, "").replace(/\s+/g, " ").trim();
+  if (flat.length < 4) return void 0;
+  const chars = Array.from(flat);
+  return chars.length > TOPIC_MAX_CHARS ? `${chars.slice(0, TOPIC_MAX_CHARS).join("")}…` : flat;
+}
 function makeFact(input) {
   const raw = input.statement.trim().replace(/^[-*+\d.)\s]+/, "");
   if (raw.length === 0) return null;
@@ -1719,13 +1949,13 @@ function makeFact(input) {
       enriched: false
     };
   }
-  const join4 = (left, right) => {
+  const join5 = (left, right) => {
     if (left.length === 0) return right;
     const needSpace = /[A-Za-z0-9]$/.test(left) || /^[A-Za-z0-9]/.test(right);
     return needSpace ? `${left} ${right}` : `${left}${right}`;
   };
-  const head = join4(claim.subject, claim.predicate === "位于" ? "位于" : claim.predicate);
-  const statement = join4(head, claim.value);
+  const head = join5(claim.subject, claim.predicate === "位于" ? "位于" : claim.predicate);
+  const statement = join5(head, claim.value);
   const scope = TEMPORARY_MARKER.test(raw) ? "session" : "project";
   return {
     kind: claim.kind,
@@ -1780,14 +2010,33 @@ function importanceOf(fact) {
   return Math.max(1, Math.min(10, score));
 }
 function factsToItems(facts) {
-  return facts.map((fact) => ({
+  return facts.map(
+    (fact) => factToItem(
+      fact,
+      [fact.kind, "distilled", "lrc_schema", `scope:${fact.scope}`],
+      importanceOf(fact)
+    )
+  );
+}
+function topicTags(topic) {
+  if (topic === void 0) return [];
+  const flat = topic.replace(/\s+/g, " ").trim();
+  if (flat.length === 0) return [];
+  const chars = Array.from(flat);
+  if (chars.length > TOPIC_MAX_CHARS + 1) {
+    return [`topic:${chars.slice(0, TOPIC_MAX_CHARS).join("")}`];
+  }
+  return [`topic:${flat}`];
+}
+function factToItem(fact, baseTags, importance) {
+  return {
     content: renderFact(fact),
     memory_type: MEMORY_TYPE[fact.kind],
-    tags: [fact.kind, "distilled", "lrc_schema", `scope:${fact.scope}`],
-    importance: importanceOf(fact),
+    tags: [...baseTags, ...topicTags(fact.topic)],
+    importance,
     source_turns: [fact.source.turn ?? 0, fact.source.turn ?? 0],
     origin: fact.origin
-  }));
+  };
 }
 
 // src/memory-extract.ts
@@ -1950,6 +2199,7 @@ function extractFacts(input) {
     }
     facts.push(fact);
   }
+  if (input.origin === "assistant") attachTopic(facts, body);
   return { facts, rejected, pending };
 }
 function extractFactsFromReasoning(input) {
@@ -1983,6 +2233,14 @@ function factsFromLlmLines(lines, base) {
   }
   return { facts, rejected, pending: [] };
 }
+function attachTopic(facts, source) {
+  if (source === void 0 || source.length === 0) return;
+  const topic = extractTopic(source);
+  if (topic === void 0) return;
+  for (const fact of facts) {
+    if (fact.topic === void 0) fact.topic = topic;
+  }
+}
 function dedupeKey(fact) {
   return maskPaths(fact.statement).replace(/\s+/g, "");
 }
@@ -2001,6 +2259,110 @@ function dedupeFacts(incoming, existing, isNear) {
   return { fresh, dropped };
 }
 
+// src/fold.ts
+var FOLD_MIN_FACTS_DEFAULT = 4;
+var FOLD_MAX_CHARS = 2e3;
+var PRIORITY = {
+  constraint: 0,
+  goal: 0,
+  location: 0,
+  artifact: 0,
+  decision: 1,
+  conclusion: 2,
+  statement: 3,
+  fact: 3
+};
+var FOLD_TOPIC_TAG_LIMIT = 5;
+function foldFacts(facts, options = {}) {
+  const minFacts = options.minFacts ?? FOLD_MIN_FACTS_DEFAULT;
+  const maxChars = options.maxChars ?? FOLD_MAX_CHARS;
+  if (facts.length < minFacts || minFacts <= 0) return null;
+  const unique2 = [];
+  for (const fact2 of facts) {
+    const statement = fact2.statement.trim();
+    if (statement.length === 0) continue;
+    if (unique2.some((prev) => areNearDuplicate(prev.statement, statement, 0.85))) continue;
+    unique2.push(fact2);
+  }
+  if (unique2.length < 2) return null;
+  const counts = /* @__PURE__ */ new Map();
+  for (const fact2 of unique2) counts.set(fact2.kind, (counts.get(fact2.kind) ?? 0) + 1);
+  const dominantKind = [...counts.entries()].sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return (PRIORITY[a[0]] ?? 9) - (PRIORITY[b[0]] ?? 9);
+  })[0]?.[0] ?? "conclusion";
+  const ordered = [...unique2].sort((a, b) => {
+    const pa = PRIORITY[a.kind] ?? 9;
+    const pb = PRIORITY[b.kind] ?? 9;
+    if (pa !== pb) return pa - pb;
+    return b.statement.trim().length - a.statement.trim().length;
+  });
+  const DISTINCT_TOPICS = new Set(
+    unique2.map((f) => f.topic).filter((t) => t !== void 0 && t.length > 0)
+  );
+  const singleTopic = DISTINCT_TOPICS.size === 1 ? [...DISTINCT_TOPICS][0] : void 0;
+  const head = singleTopic !== void 0 ? `【${singleTopic}】` : `本批 ${unique2.length} 条：`;
+  const parts = [];
+  let used = head.length;
+  let omitted = 0;
+  for (const fact2 of ordered) {
+    const statement = fact2.statement.trim();
+    if (used + statement.length + 1 > maxChars) {
+      omitted += 1;
+      continue;
+    }
+    parts.push(statement);
+    used += statement.length + 1;
+  }
+  if (parts.length === 0) return null;
+  const body = head + parts.join("；") + (omitted > 0 ? `…（另有 ${omitted} 条因长度上限未列出）` : "");
+  const topic = singleTopic;
+  const topics = [];
+  for (const f of unique2) {
+    if (f.topic === void 0 || f.topic.length === 0) continue;
+    if (topics.includes(f.topic)) continue;
+    if (topics.length >= FOLD_TOPIC_TAG_LIMIT) break;
+    topics.push(f.topic);
+  }
+  const origin = unique2.some((f) => f.origin === "user") ? "user" : "assistant";
+  const scope = unique2.every((f) => f.scope === "session") ? "session" : "project";
+  const importance = Math.max(
+    ...unique2.map((f) => importanceOf({ ...f, kind: f.kind, origin: f.origin, scope: f.scope }))
+  );
+  const turn = unique2.reduce((max, f) => Math.max(max, f.source.turn ?? 0), 0);
+  const fact = {
+    kind: dominantKind,
+    subject: "",
+    predicate: "",
+    value: "",
+    statement: body,
+    scope,
+    origin,
+    confidence: 0.9,
+    source: { sessionId: unique2[0].source.sessionId, turn: turn > 0 ? turn : void 0 },
+    status: "active",
+    // 摘要不是三元组，不可参与冲突判定 —— 显式标 false，
+    // 让 `factKey` 退化为按整句比对（避免与真结论误合并）。
+    enriched: false,
+    // 摘要继承批次主题 ⇒ `factToItem` 会把它落成 `topic:xxx` 标签，
+    // 让这条摘要在库里也能被主题检索到（★2026-11-17）
+    ...topic === void 0 ? {} : { topic }
+  };
+  return { fact, covered: unique2.length, omitted, importance, topics };
+}
+function foldTags(batch) {
+  return [
+    batch.fact.kind,
+    "folded",
+    `fold:${batch.covered}`,
+    "lrc_schema",
+    "distilled",
+    `scope:${batch.fact.scope}`,
+    // 全部成员主题落成标签（正文不重复它们，避免膨胀）
+    ...batch.topics.flatMap((t) => topicTags(t))
+  ];
+}
+
 // src/offloader.ts
 var DEFAULT_OFFLOAD_CONFIG = {
   turnsThreshold: 8,
@@ -2010,7 +2372,10 @@ var DEFAULT_OFFLOAD_CONFIG = {
   maxItems: 40,
   snapshotItems: 3,
   dedupThreshold: DEFAULT_DEDUP_THRESHOLD,
-  recentWindow: 50
+  recentWindow: 50,
+  foldEnabled: true,
+  foldMinFacts: FOLD_MIN_FACTS_DEFAULT,
+  foldMaxChars: FOLD_MAX_CHARS
 };
 function keepPriority(fact) {
   switch (fact.kind) {
@@ -2140,6 +2505,8 @@ var Offloader = class {
   lastFlushAt = 0;
   lastFlushWritten = 0;
   lastFlushMerged = 0;
+  totalFolded = 0;
+  foldBatches = 0;
   constructor(client, cursors, config = {}, recentStore) {
     this.client = client;
     this.cursors = cursors;
@@ -2256,11 +2623,17 @@ var Offloader = class {
       lastFlushAt: this.lastFlushAt,
       lastFlushWritten: this.lastFlushWritten,
       lastFlushMerged: this.lastFlushMerged,
-      recentWindow: this.recent.length
+      recentWindow: this.recent.length,
+      totalFolded: this.totalFolded,
+      foldBatches: this.foldBatches
     };
   }
   record(result) {
     this.totalDeduped += result.deduped;
+    if (result.folded !== void 0 && result.folded > 0) {
+      this.totalFolded += result.folded;
+      this.foldBatches += 1;
+    }
     if (result.written === 0 && result.merged === 0) return;
     this.flushCount += 1;
     this.totalWritten += result.written;
@@ -2268,6 +2641,36 @@ var Offloader = class {
     this.lastFlushAt = Date.now();
     this.lastFlushWritten = result.written;
     this.lastFlushMerged = result.merged;
+  }
+  /**
+   * 把一批已查重的 Fact 转成待写入条目 —— **写入前先做同批折叠**。
+   *
+   * ## 为什么折叠只在写入侧
+   *
+   * 快照（注入下一轮的那 1~3 行）仍用**原始 Fact**：它服务的是
+   * 「本会话当前的约束/位置」，需要具体到「音频在 D:\Desktop」这种粒度；
+   * 批次摘要只适合存进 LRC 供日后 recall。两个消费者需求相反，
+   * 因此折叠只作用于 `migrate` 的入参，不改快照。
+   *
+   * ## 为什么条数不足时原样返回
+   *
+   * `foldFacts` 在条数 < `foldMinFacts` 时返回 `null`，这里退回逐条映射，
+   * 行为与本模块引入折叠前**逐字一致**。
+   *
+   * @returns `items` 待写入条目；`folded` 折叠覆盖的原始条数（0 = 未折叠）
+   */
+  toItems(facts) {
+    if (this.config.foldEnabled) {
+      const batch = foldFacts(facts, {
+        minFacts: this.config.foldMinFacts,
+        maxChars: this.config.foldMaxChars
+      });
+      if (batch !== null) {
+        const item = factToItem(batch.fact, foldTags(batch), batch.importance);
+        return { items: [item], folded: batch.covered };
+      }
+    }
+    return { items: factsToItems(facts), folded: 0 };
   }
   /**
    * 执行一次卸载：从 transcript 的新增切片提取记忆并落库。
@@ -2330,7 +2733,25 @@ var Offloader = class {
       this.record(empty);
       return empty;
     }
-    const migrated = await this.requireClient().migrate(factsToItems(kept), this.config.project);
+    if (this.config.foldEnabled && kept.length > 0) {
+      this.accumulate(kept);
+      this.commitCursor(sessionId, plain, slice.fromLine);
+      const deferred = {
+        charsSent,
+        distilled: kept.length,
+        written: 0,
+        merged: 0,
+        deduped,
+        folded: 0,
+        deferred: kept.length,
+        snapshot: this.buildPooledSnapshot(kept, epoch),
+        reset: slice.reset
+      };
+      this.record(deferred);
+      return deferred;
+    }
+    const { items, folded } = this.toItems(kept);
+    const migrated = await this.requireClient().migrate(items, this.config.project);
     this.commitCursor(sessionId, plain, slice.fromLine);
     this.recent.push(...kept.map((f) => f.statement));
     if (this.recent.length > this.config.recentWindow) {
@@ -2343,6 +2764,7 @@ var Offloader = class {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
+      folded,
       snapshot: this.buildPooledSnapshot(kept, epoch),
       reset: slice.reset
     };
@@ -2350,7 +2772,117 @@ var Offloader = class {
     return result;
   }
   /**
-   * 直接沉淀一批已提取的记忆（**不走行游标**）。
+   * 本轮累积器（按**轮次**为边界，不是按条数）。
+   *
+   * ## 为什么边界是「轮」而不是「N 条」
+   *
+   * 折叠的主旨是让「一批」成为**语义批次**。`assistant/message` 是逐条触发的，
+   * 若每条都立即写库，实测按分钟切分时 **845/993 批不足 4 条**
+   * （其中 448 批只有 1 条）—— 折叠只在约 36% 的事实上生效。
+   *
+   * 而一轮对话（5~15 分钟）天然把「同一次排查/同一件事」圈在一起：
+   * 实测按 5/10/60 分钟窗，折叠覆盖的事实占比分别为
+   * **71.8% / 87.4% / 99.0%**。
+   *
+   * ## 为什么**不**按 topic 再分桶（实测否决）
+   *
+   * 曾按 `轮 × topic` 分桶，想避免「整轮摘要被标成第一条消息的主题」。
+   * 实测该 session（42 轮 / 238 条有产出的消息 / 266 条 Fact）：
+   * ```
+   * 分桶数 238，其中能折叠（≥4 条）的只有 2 个
+   * ⇒ 条数 266 → 260（97.7%），折叠等于没做
+   * ```
+   * 根因：平均每条消息只产 1.1 条 Fact，topic 几乎等于消息唯一标识，
+   * 按 topic 分桶**退化为按消息分桶**，折叠永远凑不满。
+   *
+   * 正确做法是：仍按轮分桶，但在**摘要正文里逐条保留各自的主题**
+   * （见 `foldFacts` 的 topic 处理），让主题信息不丢，同时保住折叠率。
+   *
+   * ## 与「攒 8 条」的区别
+   *
+   * 8 是魔法数字 —— 它既不对应任何语义边界，又会让某些轮次不触发、
+   * 某些轮次提前触发。轮次是宿主已有的真实边界。
+   */
+  turnFacts = /* @__PURE__ */ new Map();
+  /**
+   * 把 Fact **暂存到本轮**（不落库），等 [`Self::flushTurn`] 统一折叠写入。
+   *
+   * ## 调用方必须保证「轮末一定冲刷」
+   *
+   * 暂存意味着数据只在内存里。调用方要在这三个时机冲刷：
+   * 1. `turn/end`
+   * 2. **下一次 `turn/start`**（用户中止上一轮时走不到 turn/end ——
+   *    实测 turn 2/3 都是 aborted by user）
+   * 3. 切换会话（旧会话不会再收到 turn/end）
+   *
+   * @returns 当前暂存总条数（便于调用方判断是否触达上限）
+   */
+  accumulate(facts) {
+    if (facts.length === 0) return 0;
+    for (const fact of facts) {
+      const owner = fact.source.sessionId ?? "";
+      const list = this.turnFacts.get(owner) ?? [];
+      list.push(fact);
+      this.turnFacts.set(owner, list);
+    }
+    return this.turnPending();
+  }
+  /** 本轮已暂存但未写库的条数（`lrc_status` 用）。 */
+  turnPending(owner) {
+    if (owner !== void 0) return this.turnFacts.get(owner)?.length ?? 0;
+    let total = 0;
+    for (const list of this.turnFacts.values()) total += list.length;
+    return total;
+  }
+  /**
+   * 冲刷本轮暂存的 Fact（**折叠后一次写库**）。
+   *
+   * @param owner - 只冲刷该会话的桶；缺省冲刷全部
+   * @param options.intoPool - 是否并入快照池。**切会话后补写旧会话时必须传
+   *   `false`** —— 与 `offloadFacts` 同口径：那时池子已属于新会话，
+   *   把旧会话的约束推进去会让新会话下一次注入出现「B 的约束；A 私有：…」。
+   * @returns 合并后的写入结果；无暂存时返回零值结果
+   */
+  async flushTurn(owner, options = {}) {
+    const empty = {
+      charsSent: 0,
+      distilled: 0,
+      written: 0,
+      merged: 0,
+      deduped: 0,
+      folded: 0,
+      snapshot: "",
+      reset: false
+    };
+    const keys = owner === void 0 ? [...this.turnFacts.keys()] : [owner];
+    const results = [];
+    for (const key of keys) {
+      const list = this.turnFacts.get(key);
+      if (list === void 0 || list.length === 0) continue;
+      this.turnFacts.delete(key);
+      try {
+        results.push(await this.offloadFacts(list, options));
+      } catch (error) {
+        const current = this.turnFacts.get(key) ?? [];
+        this.turnFacts.set(key, [...list, ...current]);
+        continue;
+      }
+    }
+    if (results.length === 0) return empty;
+    return {
+      charsSent: results.reduce((s, r) => s + r.charsSent, 0),
+      distilled: results.reduce((s, r) => s + r.distilled, 0),
+      written: results.reduce((s, r) => s + r.written, 0),
+      merged: results.reduce((s, r) => s + r.merged, 0),
+      deduped: results.reduce((s, r) => s + r.deduped, 0),
+      folded: results.reduce((s, r) => s + (r.folded ?? 0), 0),
+      // 多桶时取最后一个非空快照（最新状态）
+      snapshot: [...results].reverse().find((r) => r.snapshot.length > 0)?.snapshot ?? "",
+      reset: false
+    };
+  }
+  /**
+   * 直接沉淀一批已提取的记忆（**立即写库，不走轮内累积**）。
    *
    * 用于推理兜底与 LLM 补全：这些内容不在 transcript 行流里，
    * 无法用行号游标追踪，只能按内容查重。
@@ -2382,13 +2914,31 @@ var Offloader = class {
         written: 0,
         merged: 0,
         deduped,
+        folded: 0,
         snapshot: "",
         reset: false
       };
       this.record(empty);
       return empty;
     }
-    const migrated = await this.requireClient().migrate(factsToItems(kept), this.config.project);
+    if (options.deferToTurn === true && this.config.foldEnabled) {
+      this.accumulate(kept);
+      const deferred = {
+        charsSent: kept.reduce((sum, f) => sum + f.statement.length, 0),
+        distilled: kept.length,
+        written: 0,
+        merged: 0,
+        deduped,
+        folded: 0,
+        deferred: kept.length,
+        snapshot: options.intoPool === false ? "" : this.buildPooledSnapshot(kept, epoch),
+        reset: false
+      };
+      this.record(deferred);
+      return deferred;
+    }
+    const { items, folded } = this.toItems(kept);
+    const migrated = await this.requireClient().migrate(items, this.config.project);
     this.recent.push(...kept.map((f) => f.statement));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
@@ -2400,6 +2950,7 @@ var Offloader = class {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
+      folded,
       snapshot: options.intoPool === false ? "" : this.buildPooledSnapshot(kept, epoch),
       reset: false
     };
@@ -2971,10 +3522,7 @@ function appendReplace(session, content, seq) {
   return true;
 }
 function pruneToolCallArguments(deps) {
-  const { agent, log } = deps;
-  const thresholdChars = deps.options?.thresholdChars ?? 4e3;
-  const headChars = deps.options?.headChars ?? 2e3;
-  const keepRecentNodes = normalizeCount(deps.options?.keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
+  const { agent } = deps;
   const session = agent?.session;
   if (session === void 0) return { ok: false, reason: "no-session" };
   const nodes = session?.surface?.nodes;
@@ -3401,10 +3949,484 @@ function projectHandoff(input) {
   return { text: renderHandoff(sections), sections };
 }
 
+// src/session-minutes.ts
+import { existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync3, readdirSync, statSync as statSync2, unlinkSync, writeFileSync as writeFileSync3 } from "node:fs";
+import { join as join2 } from "node:path";
+var DEFAULT_MINUTES_CONFIG = {
+  maxTurnLines: 40,
+  maxConclusions: 24,
+  lineChars: 120
+};
+var WHY_SIGNAL = /因为|由于|所以|否则|原因是|根因|问题出在|导致|为了避免|这样才能|不然|其实|实际上是/;
+var ENGLISH_HEAD = /^(?:Let me|Let's|I |I'll|I've|The |This |That |Now |So |But |Actually|Wait|Hmm|OK|Okay|First|Next)/;
+var MACHINE_OUTPUT = /^(?:pwsh|edit|read|read_image|grep|skill|lrc_recall|write|glob|bash|shell|exec)\(\{|^结果[:：]|^执行结果[:：]|^已读取文件[:：]|^已修改文件[:：]|^共(?:修改|读取|扫描|命中) ?\d+|^Error:|^\[stderr\]|^\{.*\}$|^<path>|^<skill_content/;
+var CJK_MATCH = /[\u4e00-\u9fa5]/g;
+function cjkRatio(text) {
+  if (text.length === 0) return 0;
+  const hits = text.match(CJK_MATCH);
+  return (hits === null ? 0 : hits.length) / text.length;
+}
+function oneLine3(text, max) {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.length <= max) return flat;
+  return `${flat.slice(0, max - 1)}…`;
+}
+function isUsableConclusion(raw, minChars = 12) {
+  const flat = raw.trim();
+  if (flat.length < minChars) return false;
+  if (flat.length > 300) return false;
+  if (MACHINE_OUTPUT.test(flat)) return false;
+  if (ENGLISH_HEAD.test(flat)) return false;
+  if (cjkRatio(flat) < 0.25) return false;
+  return true;
+}
+function formatWhen(ms) {
+  if (ms <= 0) return "?";
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function parseMinutesStartedAt(content) {
+  const m = /^时间[:：]\s*(.+?)\s*→/m.exec(content);
+  if (m === null) return null;
+  const t = Date.parse(`${m[1]}:00`);
+  return Number.isFinite(t) ? t : null;
+}
+function parseMinutesEndedAt(content) {
+  const m = /^时间[:：].*?→\s*(.+?)（/m.exec(content);
+  if (m === null) return null;
+  const t = Date.parse(`${m[1]}:00`);
+  return Number.isFinite(t) ? t : null;
+}
+function parseTurnLines(content) {
+  const lines = content.split("\n");
+  const out = [];
+  let inSection = false;
+  for (const line of lines) {
+    if (line.startsWith("## ")) {
+      inSection = line.trim() === "## 诉求演进";
+      continue;
+    }
+    if (inSection && line.startsWith("- ")) out.push(line);
+  }
+  return out;
+}
+function parseConclusionLines(content) {
+  const lines = content.split("\n");
+  const out = [];
+  let inSection = false;
+  for (const line of lines) {
+    if (line.startsWith("## ")) {
+      inSection = line.trim() === "## 关键结论";
+      continue;
+    }
+    if (inSection && line.startsWith("- ")) out.push(line);
+  }
+  return out;
+}
+function splitTurnLine(line) {
+  const m = /^- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.*)$/.exec(line);
+  if (m === null) return null;
+  const at = Date.parse(`${m[1]}:00`);
+  if (!Number.isFinite(at)) return null;
+  return { at, text: m[2] ?? "" };
+}
+var TURN_MARK = /（(?:in-progress|aborted|error|no-end|switched)）$/;
+function stripTurnMark(text) {
+  return text.replace(TURN_MARK, "").trim();
+}
+function mergeTurnLines(baseline, current, maxLines) {
+  const baseRows = [];
+  for (const line of baseline) {
+    const parsed = splitTurnLine(line);
+    if (parsed === null) continue;
+    baseRows.push({
+      at: parsed.at,
+      text: stripTurnMark(parsed.text),
+      line,
+      marked: TURN_MARK.test(parsed.text)
+    });
+  }
+  const used = /* @__PURE__ */ new Set();
+  const out = [];
+  let added = 0;
+  let replaced = 0;
+  for (const line of current) {
+    const parsed = splitTurnLine(line);
+    if (parsed === null) continue;
+    const text = stripTurnMark(parsed.text);
+    let idx = baseRows.findIndex((r, i) => !used.has(i) && !r.marked && r.text === text);
+    if (idx < 0) {
+      idx = baseRows.findIndex(
+        (r, i) => !used.has(i) && r.marked && r.at === parsed.at && text.startsWith(r.text)
+      );
+    }
+    if (idx < 0) {
+      added += 1;
+      out.push({ at: parsed.at, line });
+      continue;
+    }
+    const row = baseRows[idx];
+    used.add(idx);
+    if (row.marked) {
+      replaced += 1;
+      out.push({ at: row.at, line: `- ${formatWhen(row.at)} ${parsed.text}` });
+    } else {
+      out.push({ at: row.at, line: row.line });
+    }
+  }
+  for (let i = 0; i < baseRows.length; i += 1) {
+    if (used.has(i)) continue;
+    const row = baseRows[i];
+    out.push({ at: row.at, line: row.line });
+  }
+  out.sort((a, b) => a.at - b.at);
+  const kept = out.length > maxLines ? out.slice(-maxLines) : out;
+  return {
+    lines: kept.map((r) => r.line),
+    added,
+    replaced,
+    truncated: out.length > maxLines
+  };
+}
+function buildMinutes(sessionId, turns, config = DEFAULT_MINUTES_CONFIG, startedAtOverride, baselineContent) {
+  if (turns.length === 0) return null;
+  const ordered = [...turns].sort((a, b) => a.startedAt - b.startedAt);
+  const baselineStart = baselineContent === void 0 ? null : parseMinutesStartedAt(baselineContent);
+  const earliest = ordered[0]?.startedAt ?? 0;
+  let earliestStart = startedAtOverride !== void 0 && startedAtOverride > 0 && startedAtOverride < earliest ? startedAtOverride : earliest;
+  if (baselineStart !== null && baselineStart > 0 && baselineStart < earliestStart) {
+    earliestStart = baselineStart;
+  }
+  const baselineEnd = baselineContent === void 0 ? null : parseMinutesEndedAt(baselineContent);
+  const lastEndRaw = ordered[ordered.length - 1]?.endedAt ?? 0;
+  const lastEnd = baselineEnd !== null && baselineEnd > lastEndRaw ? baselineEnd : lastEndRaw;
+  const curLines = [];
+  for (const t of ordered) {
+    const text = oneLine3(t.userText, config.lineChars);
+    if (text.length === 0) continue;
+    const mark = t.reason === "completed" || t.reason === "" ? "" : `（${t.reason}）`;
+    curLines.push(`- ${formatWhen(t.startedAt)} ${text}${mark}`);
+  }
+  const baseLines = baselineContent === void 0 ? [] : parseTurnLines(baselineContent);
+  const merged = mergeTurnLines(baseLines, curLines, config.maxTurnLines);
+  const turnLines = merged.lines;
+  const cands = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const t of ordered) {
+    for (const raw of t.conclusions) {
+      if (!isUsableConclusion(raw)) continue;
+      const norm = raw.replace(/[\s，。；：、！？"'`（）()]/g, "");
+      const key = norm.length <= 120 ? norm : `${norm.slice(0, 60)}\0${norm.slice(-60)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const text = oneLine3(raw, config.lineChars);
+      cands.push({ text, why: WHY_SIGNAL.test(text), when: t.startedAt });
+    }
+  }
+  cands.sort((a, b) => {
+    if (a.why !== b.why) return a.why ? -1 : 1;
+    return b.when - a.when;
+  });
+  const baseConclusions = baselineContent === void 0 ? [] : parseConclusionLines(baselineContent);
+  const normConclusion = (line) => line.replace(/^-\s*/, "").replace(/[\s，。；：、！？"'`（）(),;:!?]/g, "");
+  const baseSet = new Set(baseConclusions.map(normConclusion));
+  const newConclusions = cands.slice(0, config.maxConclusions).map((c) => `- ${c.text}`).filter((line) => !baseSet.has(normConclusion(line)));
+  const conclusionLines = [...baseConclusions, ...newConclusions].slice(-config.maxConclusions);
+  if (turnLines.length === 0 && conclusionLines.length === 0) return null;
+  if (merged.added === 0 && merged.replaced === 0 && newConclusions.length === 0 && baselineContent !== void 0) {
+    const baseDraftTurns = parseMinutesTurns(baselineContent);
+    return {
+      content: baselineContent,
+      startedAt: baselineStart ?? earliestStart,
+      endedAt: baselineEnd ?? lastEnd,
+      turns: baseDraftTurns ?? turnLines.length,
+      conclusions: parseConclusionLines(baselineContent).length
+    };
+  }
+  const rawTurns = baselineContent === void 0 ? ordered.length : (parseMinutesTurns(baselineContent) ?? 0) + merged.added;
+  const totalTurns = merged.truncated ? Math.min(rawTurns, turnLines.length) : rawTurns;
+  const firstKeptAt = turnLines.length > 0 ? splitTurnLine(turnLines[0])?.at : null;
+  const hasOverride = startedAtOverride !== void 0 && startedAtOverride > 0;
+  const baseStart = hasOverride ? Math.min(startedAtOverride, baselineStart ?? Number.POSITIVE_INFINITY) : firstKeptAt !== null && firstKeptAt !== void 0 && firstKeptAt > earliestStart ? firstKeptAt : earliestStart;
+  const startedAt = Number.isFinite(baseStart) ? baseStart : earliestStart;
+  const endedAt = lastEnd;
+  const hours = ((endedAt - startedAt) / 36e5).toFixed(1);
+  const lines = [];
+  lines.push(`【会话纪要】${sessionId}`);
+  lines.push(
+    `时间：${formatWhen(startedAt)} → ${formatWhen(endedAt)}（${hours} 小时 / ${totalTurns} 轮，本地时间）`
+  );
+  if (turnLines.length > 0) {
+    lines.push("");
+    lines.push("## 诉求演进");
+    lines.push(...turnLines);
+  }
+  if (conclusionLines.length > 0) {
+    lines.push("");
+    lines.push("## 关键结论");
+    lines.push(...conclusionLines);
+  }
+  return {
+    content: lines.join("\n"),
+    startedAt,
+    endedAt,
+    // ## 返回**拼接后**的轮数（不是本次观测到的轮数）
+    //
+    // 调用方（`persistLedgerInner`）用它刷新 `probedMinutes.turns`，
+    // 那是下一次写入的完整性基准。若这里返回 `ordered.length`（如 1），
+    // 基准会被错误地降到 1 ⇒ 下一份更残缺的稿也能通过。
+    turns: totalTurns,
+    // ## 用**实际写入**的结论条数（十一轮审查 minor 5）
+    //
+    // `picked.length` 只是本稿自身的结论数；拼接后正文里可能有
+    // 「基线 5 条 + 新增 3 条 = 8 条」，报 3 会让日志与正文对不上。
+    conclusions: conclusionLines.length
+  };
+}
+function minutesTags(sessionId) {
+  return ["session-minutes", "minutes", `session:${sessionId}`, "timeline"];
+}
+function minutesEventId(sessionId) {
+  return `session-minutes:${sessionId}`;
+}
+function safeFileName(sessionId) {
+  return sessionId.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+var MinutesLedgerStore = class {
+  dir;
+  constructor(dir) {
+    this.dir = dir;
+  }
+  pathOf(sessionId) {
+    return join2(this.dir, `minutes-${safeFileName(sessionId)}.json`);
+  }
+  /** 读取账本；文件不存在/损坏返回 `null`（调用方当作新会话）。 */
+  load(sessionId) {
+    try {
+      const path = this.pathOf(sessionId);
+      if (!existsSync3(path)) return null;
+      const parsed = JSON.parse(readFileSync3(path, "utf8"));
+      if (parsed === null || typeof parsed !== "object") return null;
+      const raw = parsed;
+      if (raw.sessionId !== sessionId || !Array.isArray(raw.turns)) return null;
+      const turns = raw.turns.filter((t) => {
+        if (t === null || typeof t !== "object") return false;
+        const r = t;
+        return typeof r.idx === "number" && typeof r.startedAt === "number" && typeof r.endedAt === "number" && typeof r.reason === "string" && typeof r.userText === "string" && Array.isArray(r.conclusions);
+      });
+      return {
+        sessionId,
+        turns,
+        archivedTurns: typeof raw.archivedTurns === "number" ? raw.archivedTurns : turns.length,
+        writtenAtArchived: typeof raw.writtenAtArchived === "number" ? raw.writtenAtArchived : -1,
+        startedAt: typeof raw.startedAt === "number" ? raw.startedAt : 0,
+        writtenTurns: typeof raw.writtenTurns === "number" ? raw.writtenTurns : 0,
+        // 旧版账本没有这个字段：空串表示「不知道之前写的是哪一条」，
+        // 清理逻辑会因此跳过（宁可多一条，也不误删别人的记忆）
+        memoryId: typeof raw.memoryId === "string" ? raw.memoryId : "",
+        // ## 三态：键缺失 ⇒ undefined（来源未知，保守不删）
+        //
+        // 不能折成 `false` —— 旧版账本的 id 可能是探查来的，折成
+        // 「自己写的」会让它被误删（九轮审查 M-1 的反例）。
+        memoryIdFromProbe: raw.memoryIdFromProbe === true ? true : raw.memoryIdFromProbe === false ? false : void 0,
+        pendingForget: Array.isArray(raw.pendingForget) ? raw.pendingForget.filter((id) => typeof id === "string") : [],
+        // ## 漏掉这个字段会让整个阶段稿机制在重启后失效（十轮审查 C1）
+        //
+        // `save()` 是 `{...state}` 全量写入，磁盘上一直有这个键；
+        // 但若 `load()` 不读回来，`applyLedgerState` 拿到 undefined ⇒
+        // `minutesStageWrittenTurnIdx = 0` ⇒ `stageNeedsFinalize` 恒假 ⇒
+        // 库里那份 in-progress 阶段稿再也等不到正式稿收尾。
+        // 更糟的是所有 `{...onDisk}` 重写点会顺手把它从磁盘抹掉。
+        stageWrittenTurnIdx: typeof raw.stageWrittenTurnIdx === "number" ? raw.stageWrittenTurnIdx : 0,
+        updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : 0
+      };
+    } catch {
+      return null;
+    }
+  }
+  save(state) {
+    try {
+      mkdirSync3(this.dir, { recursive: true });
+      const payload = { ...state, updatedAt: Date.now() };
+      writeFileSync3(this.pathOf(state.sessionId), JSON.stringify(payload), "utf8");
+    } catch {
+    }
+  }
+  /** 删除某会话的账本（纪要已完整写入后不再需要）。 */
+  clear(sessionId) {
+    try {
+      const path = this.pathOf(sessionId);
+      if (existsSync3(path)) unlinkSync(path);
+    } catch {
+    }
+  }
+  /**
+   * 只保留最近 `maxFiles` 个账本文件（按 mtime）。
+   *
+   * 不清理会无界增长：每个会话一个文件，长期使用会积累上百个小 JSON。
+   *
+   * ## 有未补写增量的文件**优先保留**（五轮审查 M2）
+   *
+   * 反例：用户有 41 个会话，最老那个还有 2 轮没写进 LRC。
+   * 只按 mtime 淘汰会删掉它 ⇒ 用户回到该会话时 `load` 返回 null
+   * ⇒ `resetMinutesState`（`writtenAtArchived = -1`）⇒ 闸门放行首轮稿
+   * ⇒ 同一 `event_id` 因 Jaccard 低而**新增第二条**，库里原多轮纪要
+   * 从此失去更新入口（内容永久停在旧的短版本）。
+   *
+   * ## 边界：待补写文件数 > `maxFiles` 时仍会淘汰（六轮审查 m-b）
+   *
+   * 「优先保留」不等于「永不淘汰」：若 LRC 长期不可用、50 个会话都攒着
+   * 待补写，`maxFiles = 40` 时仍会删掉一部分。这是有意的 ——
+   * 无界增长会让磁盘占用失控。超出时打 warn 留痕，便于判断
+   * 「是不是 LRC 长期不可用」。
+   */
+  prune(maxFiles) {
+    if (maxFiles <= 0) return;
+    try {
+      if (!existsSync3(this.dir)) return;
+      const files = readdirSync(this.dir).filter((f) => f.startsWith("minutes-") && f.endsWith(".json")).map((f) => {
+        const path = join2(this.dir, f);
+        const at = statSync2(path).mtimeMs;
+        return { name: f, at, pendingToWrite: this.hasPendingWrite(path) };
+      }).sort((a, b) => {
+        if (a.pendingToWrite !== b.pendingToWrite) return a.pendingToWrite ? -1 : 1;
+        return b.at - a.at;
+      });
+      const pendingCount = files.filter((f) => f.pendingToWrite).length;
+      if (pendingCount > maxFiles) {
+        console.warn(
+          `[lrc] 纪要账本待补写文件 ${pendingCount} 个 > 保留上限 ${maxFiles}，将淘汰其中 ${pendingCount - maxFiles} 个（LRC 是否长期不可用？）`
+        );
+      }
+      for (const file of files.slice(maxFiles)) {
+        try {
+          unlinkSync(join2(this.dir, file.name));
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+  /** 该账本文件是否还有「已归档但没写进 LRC」的轮次。 */
+  hasPendingWrite(path) {
+    try {
+      const parsed = JSON.parse(readFileSync3(path, "utf8"));
+      if (Array.isArray(parsed.pendingForget) && parsed.pendingForget.length > 0) return true;
+      if (typeof parsed.stageWrittenTurnIdx === "number" && parsed.stageWrittenTurnIdx > 0) {
+        return true;
+      }
+      const turnsLen = Array.isArray(parsed.turns) ? parsed.turns.length : 0;
+      const archived = typeof parsed.archivedTurns === "number" ? parsed.archivedTurns : turnsLen;
+      const written = typeof parsed.writtenAtArchived === "number" ? parsed.writtenAtArchived : -1;
+      return archived > 0 && written < archived;
+    } catch {
+      return true;
+    }
+  }
+};
+function canOverwriteMinutes(writtenArchived, nextArchived, maxTurns) {
+  if (writtenArchived < 0) return true;
+  if (nextArchived >= maxTurns) return true;
+  return nextArchived >= writtenArchived;
+}
+function shouldRewriteMinutes(archivedTurns, writtenAtArchived) {
+  if (writtenAtArchived < 0) return archivedTurns > 0;
+  return archivedTurns > writtenAtArchived;
+}
+function parseMinutesTurns(content) {
+  const m = /\/\s*(\d+)\s*轮/.exec(content);
+  if (m === null) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+function minutesSimilarity(a, b) {
+  const toTerms = (text) => {
+    const lower = text.toLowerCase();
+    const chars = [...lower];
+    const hasCjk = chars.some((c) => {
+      const code = c.codePointAt(0) ?? 0;
+      return code >= 19968 && code <= 40959;
+    });
+    const bigrams = /* @__PURE__ */ new Set();
+    for (let i = 0; i + 1 < chars.length; i += 1) bigrams.add(`${chars[i]}${chars[i + 1]}`);
+    const words = hasCjk ? /* @__PURE__ */ new Set() : new Set(lower.split(/\s+/).filter((w) => w.length > 0));
+    return { hasCjk, bigrams, words };
+  };
+  const ta = toTerms(a);
+  const tb = toTerms(b);
+  const useBigram = ta.hasCjk || tb.hasCjk;
+  const sa = useBigram ? ta.bigrams : ta.words;
+  const sb = useBigram ? tb.bigrams : tb.words;
+  if (sa.size === 0 && sb.size === 0) return 1;
+  let inter = 0;
+  for (const g of sa) if (sb.has(g)) inter += 1;
+  const union = sa.size + sb.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+var MINUTES_MERGE_THRESHOLD = 0.5;
+async function writeMinutes(client, sessionId, turns, options = {}) {
+  const config = options.config ?? DEFAULT_MINUTES_CONFIG;
+  const bare = buildMinutes(sessionId, turns, config, options.startedAt);
+  if (bare === null) {
+    return {
+      written: false,
+      memoryId: "",
+      chars: 0,
+      content: "",
+      turns: 0,
+      conclusions: 0
+    };
+  }
+  const segments = options.existingSegments ?? [];
+  const baseline = segments.map((seg) => ({ seg, sim: minutesSimilarity(seg.content, bare.content) })).filter((x) => x.sim >= MINUTES_MERGE_THRESHOLD).sort((a, b) => b.sim - a.sim)[0];
+  const draft = baseline === void 0 ? bare : buildMinutes(sessionId, turns, config, options.startedAt, baseline.seg.content);
+  if (draft === null) {
+    return {
+      written: false,
+      memoryId: "",
+      chars: 0,
+      content: "",
+      turns: 0,
+      conclusions: 0
+    };
+  }
+  if (baseline !== void 0 && draft.content === baseline.seg.content) {
+    return {
+      written: false,
+      memoryId: "",
+      chars: draft.content.length,
+      content: draft.content,
+      turns: draft.turns,
+      conclusions: draft.conclusions,
+      unchanged: true
+    };
+  }
+  const { memoryId } = await client.remember({
+    content: draft.content,
+    memoryType: "conversation",
+    ...options.project === void 0 ? {} : { project: options.project },
+    tags: minutesTags(sessionId),
+    // 纪要是整段对话的最高价值产物，给最高重要性
+    importance: 9,
+    eventId: minutesEventId(sessionId),
+    // ★ 真实发生时间，不是写入时刻
+    sourceTimestampMs: draft.startedAt
+  });
+  return {
+    written: memoryId.length > 0,
+    memoryId,
+    chars: draft.content.length,
+    content: draft.content,
+    turns: draft.turns,
+    conclusions: draft.conclusions
+  };
+}
+
 // src/artifact-store.ts
 import { createHash as createHash3 } from "node:crypto";
-import { existsSync as existsSync3, mkdirSync as mkdirSync3, readdirSync, readFileSync as readFileSync3, statSync as statSync2, unlinkSync, utimesSync as utimesSync2, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { existsSync as existsSync4, mkdirSync as mkdirSync4, readdirSync as readdirSync2, readFileSync as readFileSync4, statSync as statSync3, unlinkSync as unlinkSync2, utimesSync as utimesSync2, writeFileSync as writeFileSync4 } from "node:fs";
+import { dirname as dirname2, join as join3 } from "node:path";
 var MIN_ARTIFACT_CHARS = 8e3;
 var MAX_ARTIFACT_CHARS = 2e6;
 var DEFAULT_QUOTA_BYTES = 200 * 1024 * 1024;
@@ -3428,17 +4450,17 @@ var ArtifactStore = class {
     this.quotaBytes = typeof quotaBytes === "number" && Number.isFinite(quotaBytes) && quotaBytes > 0 ? Math.floor(quotaBytes) : DEFAULT_QUOTA_BYTES;
   }
   indexPath() {
-    return join2(this.root, "index.json");
+    return join3(this.root, "index.json");
   }
   bodyPath(hash) {
-    return join2(this.root, `${hash}.txt`);
+    return join3(this.root, `${hash}.txt`);
   }
   /** 载入索引（文件损坏时按空索引处理，不阻断主流程）。 */
   load() {
     if (this.index !== null) return this.index;
     try {
-      if (existsSync3(this.indexPath())) {
-        const parsed = JSON.parse(readFileSync3(this.indexPath(), "utf8"));
+      if (existsSync4(this.indexPath())) {
+        const parsed = JSON.parse(readFileSync4(this.indexPath(), "utf8"));
         this.index = parsed !== null && typeof parsed === "object" ? parsed : {};
       } else {
         this.index = {};
@@ -3450,8 +4472,8 @@ var ArtifactStore = class {
   }
   persist() {
     try {
-      mkdirSync3(dirname2(this.indexPath()), { recursive: true });
-      writeFileSync3(this.indexPath(), JSON.stringify(this.load(), null, 2), "utf8");
+      mkdirSync4(dirname2(this.indexPath()), { recursive: true });
+      writeFileSync4(this.indexPath(), JSON.stringify(this.load(), null, 2), "utf8");
     } catch {
     }
   }
@@ -3477,8 +4499,8 @@ var ArtifactStore = class {
       createdAt: Date.now()
     };
     try {
-      mkdirSync3(this.root, { recursive: true });
-      writeFileSync3(this.bodyPath(hash), body, "utf8");
+      mkdirSync4(this.root, { recursive: true });
+      writeFileSync4(this.bodyPath(hash), body, "utf8");
     } catch {
     }
     index[hash] = meta;
@@ -3491,7 +4513,7 @@ var ArtifactStore = class {
     const index = this.load();
     if (index[hash] === void 0) return null;
     try {
-      const body = readFileSync3(this.bodyPath(hash), "utf8");
+      const body = readFileSync4(this.bodyPath(hash), "utf8");
       this.touch(hash);
       return body;
     } catch {
@@ -3514,7 +4536,7 @@ var ArtifactStore = class {
   touch(hash) {
     try {
       const path = this.bodyPath(hash);
-      if (existsSync3(path)) {
+      if (existsSync4(path)) {
         const now = /* @__PURE__ */ new Date();
         utimesSync2(path, now, now);
       }
@@ -3524,12 +4546,12 @@ var ArtifactStore = class {
   /** 当前占用字节数（按实际文件大小，不是字符数）。 */
   usageBytes() {
     try {
-      if (!existsSync3(this.root)) return 0;
+      if (!existsSync4(this.root)) return 0;
       let total = 0;
-      for (const name2 of readdirSync(this.root)) {
+      for (const name2 of readdirSync2(this.root)) {
         if (!name2.endsWith(".txt")) continue;
         try {
-          total += statSync2(join2(this.root, name2)).size;
+          total += statSync3(join3(this.root, name2)).size;
         } catch {
         }
       }
@@ -3551,7 +4573,7 @@ var ArtifactStore = class {
     const candidates = Object.values(index).map((meta) => {
       let atimeMs = meta.createdAt;
       try {
-        atimeMs = statSync2(this.bodyPath(meta.hash)).atimeMs;
+        atimeMs = statSync3(this.bodyPath(meta.hash)).atimeMs;
       } catch {
       }
       return { meta, atimeMs };
@@ -3560,8 +4582,8 @@ var ArtifactStore = class {
       if (usage <= this.quotaBytes) break;
       try {
         const path = this.bodyPath(meta.hash);
-        const size = existsSync3(path) ? statSync2(path).size : 0;
-        if (existsSync3(path)) unlinkSync(path);
+        const size = existsSync4(path) ? statSync3(path).size : 0;
+        if (existsSync4(path)) unlinkSync2(path);
         delete index[meta.hash];
         usage -= size;
       } catch {
@@ -4233,6 +5255,42 @@ var Config = Schema.object({
   // 快照始终为空。降到 8 步，让中途也能沉淀出 `[LRC 状态]`。
   offloadSteps: Schema.number().default(8),
   maxItems: Schema.number().default(40),
+  // ★2026-11-16：同批折叠。实测一个会话写入 1515 条、长度中位数仅 33 字，
+  // 19.3% ≤ 20 字 —— 抽取器是句子级的，同一次推理被切成一串互不相关的碎片。
+  // 开启后同一批（一次 flush）的 N 条先压成 1 条摘要再入库，原文仍进工件库。
+  foldEnabled: Schema.boolean().default(true),
+  // 低于 4 条不折叠：2~3 条本就是一次完整表述，折叠反而损失精度。
+  foldMinFacts: Schema.number().default(4),
+  // 摘要字符上限：正常批次（10~14 条 × 35 字）约 500 字，远低于此值，
+  // 该上限只用于挡住异常长的批次（如一次贴进整份报告）。
+  foldMaxChars: Schema.number().default(2e3),
+  // ── 会话纪要（★2026-11-17）──
+  //
+  // ## 为什么纪要必须单独做，不能复用压缩摘要（实测）
+  //
+  // 把 247 次 compaction 的摘要全存进库：966,414 字符，其中 **92% 是工具调用
+  // 回显**；剩下的「助手结论」段 1161 条、p50 仅 27 字，含因果理由的比例
+  // 11.5% —— 反而低于正文直抽（15.4%）。所以纪要要**重新生成**。
+  //
+  // ## 一份对话一份纪要
+  //
+  // `event_id = session-minutes:<sessionId>` 恒定；两侧（插件写入闸门 +
+  // LRC 内容相似度合并）共同保证库里恒为 1 条完整纪要。
+  minutesEnabled: Schema.boolean().default(true),
+  // 每满多少轮落一次纪要。
+  //
+  // ★2026-11-17：20 → 5。实测每会话轮数 **p50 仅 2 轮**，20 轮的门槛
+  // 意味着绝大多数会话永远不会产出纪要 —— 而短会话恰恰最需要它
+  // （用户不再回来，时间线再也没机会落库）。
+  minutesEveryTurns: Schema.number().default(5),
+  // 空闲多久强制落一次（毫秒，0 = 关闭）。兜住「短会话不再有新轮次」。
+  minutesIdleMs: Schema.number().default(6e5),
+  // 一轮未结束时的阶段写入间隔（毫秒，0 = 关闭）。
+  //
+  // ★2026-11-17 实测：单轮可跑 30 分钟 / 72 步仍未 turn/end。
+  // 而纪要的触发点（turn/end、idle、dispose）全部在轮末 ⇒ 这一整轮
+  // 没有任何可回溯的中间状态。给「进行中」的轮次留一份阶段稿。
+  minutesStageMs: Schema.number().default(6e5),
   pruneEnabled: Schema.boolean().default(true),
   pruneResultThreshold: Schema.number().default(4096),
   // ★2026-11-07：默认关闭。宿主 surface 校验不允许替换含 tool-call 的
@@ -4303,6 +5361,18 @@ var Config = Schema.object({
   recallInjectMinRawScore: Schema.number().default(0.025),
   /** 单条截断字符数 */
   recallInjectMaxCharsPerItem: Schema.number().default(80),
+  /**
+   * 碎片前缀判据（正则源码，空串 = 关闭）。
+   *
+   * 实测 dsh 项目 2217 条记忆里 2037 条（92%）是未折叠碎片，会挤占
+   * top2 注入槽位。判据是「以悬空词开头」（主语被切掉），不是长度 ——
+   * 长度会误伤「用户偏好纸质拼贴风格」这类完整短句。
+   */
+  recallInjectFragmentPrefixes: Schema.string().default(
+    "^(?:改成|改用|换成|改为|换掉|删掉|去掉|只保留)"
+  ),
+  /** 碎片豁免的重要性门槛（1–10）：够重要就不受前缀判据限制 */
+  recallInjectFragmentExemptImportance: Schema.number().default(9),
   // ── LLM 兜底提取 ──
   // 规则层（正则）只能覆盖「见过的措辞」，而模型表达是开放的。
   // 实测真实日志 214 句含信号句，规则抽出 113 句，边界外仍有真结论。
@@ -4366,7 +5436,13 @@ function buildPromptText(recallInjected) {
     "那是插件按当前话题自动检索出来的历史记录。**用不用、信不信由你判断**：",
     "与当前任务相关就参考；明显无关或与已验证事实冲突时直接忽略，不要为了迎合它改变做法。",
     "若某条记忆与你已知的事实冲突，以**你能当场验证的**为准，并可用 `lrc_recall` 复核。",
-    "遇到需要更早的细节、或该段落缺失时，再调 `lrc_recall` 补充检索；",
+    "",
+    "**必须主动调 `lrc_recall` 的情形**（不要凭印象回答）：",
+    "- 用户提到「上次」「之前」「以前」「当初」「我们决定过」「不是定过吗」",
+    "- 用户问「为什么这么设计」「为什么用这个」「那个方案是什么」",
+    "- 用户说「继续上次」「接着之前那个」",
+    "- 需要引用具体的历史数字、路径、结论，而当前上下文里没有",
+    "",
     "检索为空时回退内置搜索，并在回复中说明「LRC 未命中，已回退内置搜索」。"
   ] : [
     "涉及项目历史、用户偏好、之前做过的决定、上次怎么改的，**先调 `lrc_recall` 工具**，",
@@ -4413,14 +5489,809 @@ function buildPromptText(recallInjected) {
   ].join("\n");
 }
 function apply(ctx, config) {
-  const cacheDir = join3(process.env.DSH_HOME ?? join3(homedir2(), ".dsh"), "cache", "lrc-plugin");
-  const snapshotPath = join3(cacheDir, "snapshot.json");
+  const cacheDir = join4(process.env.DSH_HOME ?? join4(homedir2(), ".dsh"), "cache", "lrc-plugin");
+  const snapshotPath = join4(cacheDir, "snapshot.json");
   const quotaMb = typeof config.artifactQuotaMb === "number" && Number.isFinite(config.artifactQuotaMb) && config.artifactQuotaMb > 0 ? config.artifactQuotaMb : 200;
-  const artifactStore = new ArtifactStore(join3(cacheDir, "artifacts"), Math.floor(quotaMb * 1024 * 1024));
+  const artifactStore = new ArtifactStore(join4(cacheDir, "artifacts"), Math.floor(quotaMb * 1024 * 1024));
   const artifactEnabled = config.artifactEnabled !== false;
   const artifactMinChars = typeof config.artifactMinChars === "number" && config.artifactMinChars > 0 ? Math.floor(config.artifactMinChars) : 8e3;
+  const TURN_LEDGER_MAX = 40;
+  const minutesEnabled = config.minutesEnabled !== false;
+  const minutesEveryTurns = (() => {
+    const raw = Math.floor(config.minutesEveryTurns);
+    if (!Number.isFinite(raw) || raw <= 0) return 5;
+    return Math.min(raw, TURN_LEDGER_MAX);
+  })();
+  const MINUTES_IDLE_DEFAULT_MS = 10 * 60 * 1e3;
+  const minutesIdleMs = (() => {
+    const raw = typeof config.minutesIdleMs === "number" ? config.minutesIdleMs : Number.NaN;
+    if (!Number.isFinite(raw)) return MINUTES_IDLE_DEFAULT_MS;
+    return Math.max(0, Math.floor(raw));
+  })();
+  const MINUTES_STAGE_DEFAULT_MS = 10 * 60 * 1e3;
+  const minutesStageMs = (() => {
+    const raw = typeof config.minutesStageMs === "number" ? config.minutesStageMs : Number.NaN;
+    if (!Number.isFinite(raw)) return MINUTES_STAGE_DEFAULT_MS;
+    return Math.max(0, Math.floor(raw));
+  })();
+  if (!minutesEnabled) {
+    ctx.logger.info("[lrc] 会话纪要已关闭（minutesEnabled=false），不会生成任何纪要");
+  }
   const sessionFacts = [];
   const SESSION_FACTS_MAX = 200;
+  const turnLedger = [];
+  let archivedTurns = 0;
+  let minutesWrittenAtArchived = -1;
+  let minutesWrittenTurns = 0;
+  let minutesMemoryId = "";
+  let minutesMemoryIdFromProbe = void 0;
+  let minutesStartedAt = 0;
+  let minutesStageWrittenTurnIdx = 0;
+  let minutesOwnerSessionId = "";
+  const minutesLedgerStore = new MinutesLedgerStore(join4(cacheDir, "minutes"));
+  const MINUTES_LEDGER_MAX_FILES = 40;
+  let liveTurnSessionId = "";
+  let liveTurn;
+  const finishingTurns = [];
+  const FINISHING_TURN_TTL_MS = 5 * 60 * 1e3;
+  function expireStuckFinishingTurns() {
+    if (finishingTurns.length === 0) return;
+    const now = Date.now();
+    for (let i = finishingTurns.length - 1; i >= 0; i -= 1) {
+      const slot = finishingTurns[i];
+      if (slot === void 0) continue;
+      const last = slot.lastActivityAt > 0 ? slot.lastActivityAt : slot.startedAt;
+      if (now - last < FINISHING_TURN_TTL_MS) continue;
+      finishingTurns.splice(i, 1);
+      archiveTurn(slot, "no-end");
+      ctx.logger.warn(
+        `[lrc] 轮次收尾超过 ${Math.round(FINISHING_TURN_TTL_MS / 6e4)} 分钟未完成，已按 no-end 归档（第 ${slot.idx} 轮，${slot.sessionId}）`
+      );
+    }
+  }
+  const minutesBacklog = /* @__PURE__ */ new Map();
+  const MINUTES_BACKLOG_MAX = 8;
+  function trimTurnLedger() {
+    if (turnLedger.length > TURN_LEDGER_MAX) {
+      turnLedger.splice(0, turnLedger.length - TURN_LEDGER_MAX);
+    }
+  }
+  function currentLedgerState() {
+    return {
+      sessionId: minutesOwnerSessionId,
+      turns: [...turnLedger],
+      archivedTurns,
+      writtenAtArchived: minutesWrittenAtArchived,
+      startedAt: minutesStartedAt,
+      writtenTurns: minutesWrittenTurns,
+      memoryId: minutesMemoryId,
+      // ## 必须带上待删列表（八轮审查 M-3）
+      //
+      // `MinutesLedgerStore.save()` 是 `{...state}` **全量覆盖**。
+      // 若这里不带 `pendingForget`，任何一次 `saveCurrentLedger()`
+      // （每轮归档都会调）都会把磁盘上的待删 id 抹掉 ——
+      // 而 `queueForget` 刚写进去的那份只活在内存里，进程一重启就永久失联。
+      // M-2 的持久化保证会被这条路径完全绕过。
+      pendingForget: [...minutesPendingForget.get(minutesOwnerSessionId) ?? []],
+      // ## `memoryId` 的来源必须落盘（七轮审查 critical 1）
+      //
+      // 「探查来的 id 永不 forget」这条规则只存在进程内 Set 里时，
+      // 重启后集合清空而账本仍指向那个 id ⇒ 下次写入会把它当「本稿
+      // 旧版本」删掉（真实历史不可逆丢失）。所以来源随账本一起落盘。
+      memoryIdFromProbe: minutesMemoryIdFromProbe,
+      // 阶段稿进度必须随账本走：漏带会让「本轮已阶段写过」这件事在
+      // 任何一次 `saveCurrentLedger()`（每轮归档都会调）后失忆。
+      stageWrittenTurnIdx: minutesStageWrittenTurnIdx,
+      updatedAt: Date.now()
+    };
+  }
+  function saveCurrentLedger() {
+    if (minutesOwnerSessionId.length === 0) return;
+    minutesLedgerStore.save(currentLedgerState());
+  }
+  function applyLedgerState(state) {
+    turnLedger.length = 0;
+    for (const turn of state.turns) turnLedger.push(turn);
+    trimTurnLedger();
+    minutesOwnerSessionId = state.sessionId;
+    archivedTurns = Math.max(state.archivedTurns, state.turns.length);
+    minutesWrittenAtArchived = state.writtenAtArchived;
+    minutesWrittenTurns = state.writtenTurns;
+    minutesMemoryId = state.memoryId;
+    minutesMemoryIdFromProbe = state.memoryIdFromProbe;
+    minutesPendingForget.set(state.sessionId, [...state.pendingForget ?? []]);
+    minutesStageWrittenTurnIdx = state.stageWrittenTurnIdx ?? 0;
+    minutesStartedAt = state.startedAt > 0 ? state.startedAt : state.turns[0]?.startedAt ?? Date.now();
+  }
+  function resetMinutesState(sessionId) {
+    turnLedger.length = 0;
+    archivedTurns = 0;
+    minutesWrittenAtArchived = -1;
+    minutesWrittenTurns = 0;
+    minutesMemoryId = "";
+    minutesMemoryIdFromProbe = void 0;
+    minutesStageWrittenTurnIdx = 0;
+    lastMinutesStageAt = 0;
+    lastMinutesStageConclusionCount = 0;
+    minutesStartedAt = Date.now();
+    minutesOwnerSessionId = sessionId;
+  }
+  function bindMinutesSession(sessionId) {
+    if (sessionId.length === 0) return;
+    if (sessionId === minutesOwnerSessionId) return;
+    saveCurrentLedger();
+    const restored = minutesLedgerStore.load(sessionId);
+    const hasStageWork = (restored?.stageWrittenTurnIdx ?? 0) > 0 || (restored?.archivedTurns ?? 0) > 0;
+    if (restored !== null && (restored.turns.length > 0 || hasStageWork)) {
+      applyLedgerState(restored);
+      ctx.logger.info(
+        `[lrc] 纪要账本已恢复（${sessionId}）：${restored.turns.length} 轮 / 累计归档 ${restored.archivedTurns} 轮 / 已写入 ${restored.writtenTurns} 轮`
+      );
+      if (restored.turns.length > 0 && shouldRewriteMinutes(restored.archivedTurns, restored.writtenAtArchived)) {
+        stashMinutes(currentLedgerState(), `恢复出未写入的 ${restored.turns.length} 轮，待补写`);
+        void maybeWriteMinutes(sessionId, "恢复补写", true);
+      }
+      return;
+    }
+    resetMinutesState(sessionId);
+  }
+  function mergeTurns(sources) {
+    const unique2 = /* @__PURE__ */ new Map();
+    for (const turns of sources) {
+      for (const turn of turns) {
+        const key = `${turn.idx}@${turn.startedAt}`;
+        if (!unique2.has(key)) unique2.set(key, turn);
+      }
+    }
+    return [...unique2.values()].sort((a, b) => a.startedAt - b.startedAt);
+  }
+  function earliestPositive(values) {
+    let best = 0;
+    for (const value of values) {
+      if (value > 0 && (best === 0 || value < best)) best = value;
+    }
+    return best;
+  }
+  const probedMinutes = /* @__PURE__ */ new Map();
+  const PROBED_MINUTES_MAX = 40;
+  function setProbedMinutes(sessionId, value) {
+    probedMinutes.delete(sessionId);
+    probedMinutes.set(sessionId, value);
+    while (probedMinutes.size > PROBED_MINUTES_MAX) {
+      const oldest = probedMinutes.keys().next();
+      if (oldest.done === true) break;
+      probedMinutes.delete(oldest.value);
+    }
+  }
+  async function probeExistingMinutes(client, sessionId) {
+    if (!minutesEnabled) return false;
+    if (sessionId.length === 0) return false;
+    const diskBefore = minutesLedgerStore.load(sessionId);
+    const diskMemoryIdBefore = diskBefore?.memoryId ?? "";
+    const diskWrittenBefore = diskBefore?.writtenAtArchived ?? -1;
+    try {
+      const result = await client.recall("会话纪要 时间线 诉求演进", {
+        topK: 30,
+        tags: [`session:${sessionId}`]
+      });
+      const expected = minutesEventId(sessionId);
+      const found = result.memories.filter((m) => m.event_id === expected);
+      if (found.length === 0) {
+        setProbedMinutes(sessionId, {
+          turns: 0,
+          content: "",
+          memoryId: "",
+          segments: []
+        });
+        return true;
+      }
+      const latestTs = (m) => {
+        const raw = m.created_at ?? "";
+        const t = Date.parse(raw);
+        return Number.isFinite(t) ? t : 0;
+      };
+      const sorted = [...found].sort((a, b) => {
+        const diff = latestTs(b) - latestTs(a);
+        return diff !== 0 ? diff : b.content.length - a.content.length;
+      });
+      const primary = sorted[0];
+      if (primary === void 0) return true;
+      if (sessionId !== minutesOwnerSessionId) return true;
+      const diskNow = minutesLedgerStore.load(sessionId);
+      const diskWrittenNow = diskNow?.writtenAtArchived ?? -1;
+      if (diskWrittenNow > diskWrittenBefore || (diskNow?.memoryId ?? "") !== diskMemoryIdBefore) {
+        setProbedMinutes(sessionId, {
+          turns: 0,
+          content: "",
+          memoryId: "",
+          segments: []
+        });
+        return true;
+      }
+      const segments = sorted.map((m) => ({
+        turns: parseMinutesTurns(m.content),
+        content: m.content,
+        id: m.id
+      }));
+      const primaryTurns = parseMinutesTurns(primary.content);
+      setProbedMinutes(sessionId, {
+        turns: primaryTurns ?? 0,
+        content: primary.content,
+        memoryId: primary.id,
+        segments
+      });
+      if (primaryTurns === null) {
+        ctx.logger.warn(
+          `[lrc] 库里那段纪要格式无法解析轮数（${primary.id.slice(0, 8)}），本次不作完整性保护（宁可多一条，也不误删）`
+        );
+      }
+      const shouldSwitch = minutesMemoryId !== primary.id;
+      if (!shouldSwitch) {
+        if (minutesMemoryIdFromProbe !== true) {
+          const localTurns = minutesWrittenTurns;
+          if (primaryTurns !== null && localTurns < primaryTurns) {
+            minutesMemoryIdFromProbe = true;
+            saveCurrentLedger();
+            ctx.logger.info(
+              `[lrc] 账本指向的纪要（${primary.id.slice(0, 8)}，${primaryTurns} 轮）比本地已写的 ${localTurns} 轮更完整 ⇒ 判定为探查来的历史，标记为不删`
+            );
+          }
+        }
+        return true;
+      }
+      minutesMemoryId = primary.id;
+      minutesMemoryIdFromProbe = true;
+      clearForget(sessionId, primary.id);
+      saveCurrentLedger();
+      ctx.logger.info(
+        `[lrc] 会话纪要已从库中回填（${sessionId}）：采用最新一段 ${primary.id.slice(0, 8)}（${primaryTurns ?? "?"} 轮，起点 ${String(primary.created_at ?? "?").slice(0, 19)}）` + (sorted.length > 1 ? `；另保留 ${sorted.length - 1} 段历史记录` : "")
+      );
+      return true;
+    } catch (error) {
+      ctx.logger.warn(
+        `[lrc] 会话纪要探查失败（将重试，不影响对话）：${error instanceof Error ? error.message : String(error)}`
+      );
+      return false;
+    }
+  }
+  function archiveTurn(slot, reason) {
+    if (slot.userText.length === 0 && slot.conclusions.length === 0) return;
+    if (slot.sessionId !== minutesOwnerSessionId) {
+      const existing = minutesLedgerStore.load(slot.sessionId);
+      const turns = mergeTurns([existing?.turns ?? [], [toTurnRecord(slot, reason)]]);
+      const merged = {
+        sessionId: slot.sessionId,
+        turns,
+        // ## 归档计数必须 +1，不能用 `turns.length`（二轮审查 X1）
+        //
+        // 旧写法 `Math.max(existing.archivedTurns, turns.length)` 在账本饱和后
+        // 恒等于 40 —— 而每一轮归档都会挤掉最旧一轮（内容确实在变）。
+        // 计数不增 ⇒ `shouldRewriteMinutes` 永远返回 false ⇒ 永不补写。
+        archivedTurns: (existing?.archivedTurns ?? 0) + 1,
+        writtenAtArchived: existing?.writtenAtArchived ?? -1,
+        startedAt: earliestPositive([existing?.startedAt ?? 0, slot.startedAt]),
+        writtenTurns: existing?.writtenTurns ?? 0,
+        memoryId: existing?.memoryId ?? "",
+        // 来源同样随行，否则 `save()` 全量覆盖会把「从库里捡来的」抹成 false
+        // （三态必须原样带过：`undefined` = 未知，不能折成 false）
+        memoryIdFromProbe: existing?.memoryIdFromProbe,
+        // 待删列表必须随账本一起走，否则 `save()` 全量覆盖会抹掉它（八轮审查 M-3）
+        pendingForget: existing?.pendingForget ?? [],
+        // 阶段稿进度同样随行（十轮审查 C1）
+        stageWrittenTurnIdx: existing?.stageWrittenTurnIdx ?? 0,
+        updatedAt: Date.now()
+      };
+      if (merged.turns.length > TURN_LEDGER_MAX) {
+        merged.turns.splice(0, merged.turns.length - TURN_LEDGER_MAX);
+      }
+      minutesLedgerStore.save(merged);
+      if (shouldRewriteMinutes(merged.archivedTurns, merged.writtenAtArchived)) {
+        minutesBacklog.delete(merged.sessionId);
+        minutesBacklog.set(merged.sessionId, merged);
+        trimMinutesBacklog();
+      }
+      return;
+    }
+    turnLedger.push(toTurnRecord(slot, reason));
+    archivedTurns += 1;
+    trimTurnLedger();
+    saveCurrentLedger();
+    scheduleMinutesIdle();
+  }
+  function toTurnRecord(slot, reason) {
+    return {
+      idx: slot.idx,
+      startedAt: slot.startedAt,
+      // 取最后一次实际活动，而不是归档那一刻（审查 M6）
+      endedAt: slot.lastActivityAt > 0 ? slot.lastActivityAt : slot.startedAt,
+      reason,
+      userText: slot.userText,
+      conclusions: slot.conclusions
+    };
+  }
+  let minutesIdleTimer = null;
+  function clearMinutesIdle() {
+    if (minutesIdleTimer !== null) {
+      clearTimeout(minutesIdleTimer);
+      minutesIdleTimer = null;
+    }
+  }
+  function scheduleMinutesIdle() {
+    clearMinutesIdle();
+    if (!minutesEnabled || minutesIdleMs <= 0) return;
+    minutesIdleTimer = setTimeout(() => {
+      minutesIdleTimer = null;
+      const owner = minutesOwnerSessionId;
+      if (owner.length === 0) return;
+      if (liveTurn !== void 0 && liveTurn.sessionId === owner) {
+        scheduleMinutesIdle();
+        return;
+      }
+      void maybeWriteMinutes(owner, "idle", true);
+    }, minutesIdleMs);
+    minutesIdleTimer.unref?.();
+  }
+  async function maybeWriteMinutes(sessionId, reason, force = false) {
+    if (!minutesEnabled) return;
+    if (sessionId.length === 0) return;
+    if (sessionId !== minutesOwnerSessionId) {
+      const state = minutesBacklog.get(sessionId);
+      if (state !== void 0) await persistLedger(state, reason);
+      return;
+    }
+    const hasInflight = liveTurn !== void 0 && liveTurn.sessionId === sessionId || finishingTurns.some((t) => t.sessionId === sessionId);
+    if (turnLedger.length === 0 && !hasInflight && !minutesBacklog.has(sessionId)) return;
+    if (!force) {
+      const stageTurnStillActive = liveTurn !== void 0 && liveTurn.sessionId === sessionId && liveTurn.idx === minutesStageWrittenTurnIdx || finishingTurns.some(
+        (t) => t.sessionId === sessionId && t.idx === minutesStageWrittenTurnIdx
+      );
+      if (minutesStageWrittenTurnIdx > 0 && !stageTurnStillActive) {
+      } else if (minutesWrittenAtArchived < 0) {
+        if (archivedTurns < 1) return;
+      } else if (archivedTurns - minutesWrittenAtArchived < minutesEveryTurns) {
+        return;
+      }
+    }
+    await persistMinutes(sessionId, reason);
+  }
+  function nextStageMarker(keptTurns, stage, previous) {
+    if (stage !== void 0) return Math.max(previous, stage.slot.idx);
+    let marker = 0;
+    for (const t of keptTurns) {
+      if (t.reason === "in-progress" && t.idx > marker) marker = t.idx;
+    }
+    if (marker > 0) return Math.max(previous, marker);
+    return 0;
+  }
+  async function persistMinutes(sessionId, reason, stage) {
+    if (!minutesEnabled) return "skipped";
+    if (sessionId !== minutesOwnerSessionId) {
+      ctx.logger.warn(`[lrc] 纪要写入会话不一致（${sessionId}），已跳过`);
+      return "skipped";
+    }
+    const backlog = minutesBacklog.get(sessionId);
+    const sources = [turnLedger, backlog?.turns ?? []];
+    const inflightSlot = stage !== void 0 ? stage.slot : liveTurn !== void 0 && liveTurn.sessionId === sessionId ? liveTurn : void 0;
+    if (inflightSlot !== void 0) sources.push([toTurnRecord(inflightSlot, "in-progress")]);
+    for (const slot of finishingTurns) {
+      if (slot.sessionId === sessionId && slot !== inflightSlot) {
+        sources.push([toTurnRecord(slot, "in-progress")]);
+      }
+    }
+    const merged = mergeTurns(sources);
+    if (merged.length === 0) return "skipped";
+    const kept = merged.length > TURN_LEDGER_MAX ? merged.slice(-TURN_LEDGER_MAX) : merged;
+    const state = {
+      sessionId,
+      turns: kept,
+      archivedTurns: Math.max(archivedTurns, backlog?.archivedTurns ?? 0),
+      writtenAtArchived: Math.max(minutesWrittenAtArchived, backlog?.writtenAtArchived ?? -1),
+      startedAt: earliestPositive([
+        minutesStartedAt,
+        backlog?.startedAt ?? 0,
+        merged[0]?.startedAt ?? 0
+      ]),
+      // ## `writtenTurns` 只增不减，不能 clamp（三段审查 M1）
+      //
+      // 曾经写成 `Math.min(max(...), kept.length)`，本意是「保证闸门不自锁」。
+      // 但它在「恢复出较短账本」时把计数压小：
+      // ```
+      // 库里已有 40 轮纪要，本地账本被外部清空/旧版本文件只有 6 轮
+      // clamp ⇒ writtenTurns = 6 ⇒ 闸门 canOverwriteMinutes(6, 6) 放行
+      // ⇒ 6 轮稿覆盖 40 轮（Jaccard≈0.15 不合并 ⇒ 同 event_id 两条）❌
+      // ```
+      // 现在保持单调，让 `canOverwriteMinutes` 拦住更短稿；
+      // 饱和情形（`nextTurns >= maxTurns`）已由闸门内置放行，不需要 clamp 兜底。
+      writtenTurns: Math.max(minutesWrittenTurns, backlog?.writtenTurns ?? 0),
+      // 上次写入的记忆 ID：优先用非空值（backlog 可能来自旧版文件）
+      memoryId: minutesMemoryId.length > 0 ? minutesMemoryId : backlog?.memoryId ?? "",
+      // ## 来源必须跟着走（七轮审查 critical 1）
+      //
+      // 漏带会让这次写入把账本里的 `true` 抹成 `false` ⇒ 下次写入时
+      // 账本指向的「库里那段历史」被当成本稿旧版本删掉。
+      memoryIdFromProbe: minutesMemoryId.length > 0 ? minutesMemoryIdFromProbe : backlog?.memoryIdFromProbe,
+      // 待删列表同样要随行（八轮审查 M-3）
+      //
+      // 用入参 `sessionId` 而不是 `minutesOwnerSessionId`（十一轮 minor-2）：
+      // 当前 `persistMinutes` 只被 owner 调用，两者恒等；但 `persistLedger`
+      // 明确支持非当前会话，这行随时会被踩成「把 A 的待办写给 B」。
+      pendingForget: [
+        .../* @__PURE__ */ new Set([
+          ...minutesPendingForget.get(sessionId) ?? [],
+          ...backlog?.pendingForget ?? []
+        ])
+      ],
+      // ## 阶段标记的清除条件：只有「那一轮真的写完了」才清（十一轮审查 M-1）
+      //
+      // 早先写成 `stage === undefined ? 0 : ...` —— 任何一次非阶段写入
+      // 都会清零。而清零会让「阶段稿抢跑后放行正式稿」的收尾机制失效：
+      // ```
+      // t0 第 5 轮阶段稿成功 ⇒ 库=t1..t4+t5(in-progress)，marker=5
+      // t1 某次 force 正式稿（重连补写/dispose）⇒ marker 被清成 0
+      // t2 第 5 轮 turn/end ⇒ 增量 1 < everyTurns(5) ⇒ 正式稿被拦
+      // ⇒ 库里永久停在带 (in-progress) 的那一行 ❌
+      // ```
+      // 正确语义：标记代表「库里有一份未收尾的稿」。只要本次写入的内容里
+      // 该 `idx` 仍是 `in-progress`，标记就必须留着。
+      stageWrittenTurnIdx: nextStageMarker(kept, stage, backlog?.stageWrittenTurnIdx ?? 0),
+      updatedAt: Date.now()
+    };
+    return await persistLedger(state, reason, stage);
+  }
+  let lastMinutesStageAt = 0;
+  let lastMinutesStageConclusionCount = 0;
+  let lastMinutesStageUserChars = 0;
+  function maybeWriteStageMinutes() {
+    expireStuckFinishingTurns();
+    if (!minutesEnabled || minutesStageMs <= 0) return;
+    const slot = liveTurn;
+    if (slot === void 0) return;
+    if (slot.sessionId !== minutesOwnerSessionId) return;
+    if (slot.userText.length === 0 && slot.conclusions.length === 0) return;
+    const now = Date.now();
+    if (lastMinutesStageAt > 0 && now - lastMinutesStageAt < minutesStageMs) return;
+    if (now - slot.startedAt < minutesStageMs) return;
+    const grew = minutesStageWrittenTurnIdx !== slot.idx || slot.conclusions.length !== lastMinutesStageConclusionCount || slot.userText.length !== lastMinutesStageUserChars;
+    if (!grew) return;
+    const prevConclusions = lastMinutesStageConclusionCount;
+    const prevUserChars = lastMinutesStageUserChars;
+    const prevAt = lastMinutesStageAt;
+    lastMinutesStageAt = now;
+    lastMinutesStageConclusionCount = slot.conclusions.length;
+    lastMinutesStageUserChars = slot.userText.length;
+    void persistMinutes(minutesOwnerSessionId, "轮内阶段", { slot }).then((outcome) => {
+      if (outcome !== "failed") return;
+      lastMinutesStageConclusionCount = prevConclusions;
+      lastMinutesStageUserChars = prevUserChars;
+      lastMinutesStageAt = prevAt;
+    });
+  }
+  async function persistLedger(state, reason, stage) {
+    const sessionId = state.sessionId;
+    if (state.turns.length === 0) return "skipped";
+    const previous = minutesWriteQueue.get(sessionId) ?? Promise.resolve();
+    let outcome = "failed";
+    const current = previous.catch(() => {
+    }).then(async () => {
+      outcome = await persistLedgerInner(state, reason, stage);
+    }).catch((error) => {
+      outcome = "failed";
+      ctx.logger.warn(
+        `[lrc] 会话纪要写入收尾异常（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+    minutesWriteQueue.set(sessionId, current);
+    try {
+      await current;
+    } finally {
+      if (minutesWriteQueue.get(sessionId) === current) {
+        minutesWriteQueue.delete(sessionId);
+      }
+    }
+    return outcome;
+  }
+  const minutesWriteQueue = /* @__PURE__ */ new Map();
+  const minutesPendingForget = /* @__PURE__ */ new Map();
+  const MINUTES_PENDING_FORGET_MAX = 20;
+  const forgetInFlight = /* @__PURE__ */ new Set();
+  function queueForget(sessionId, memoryId) {
+    const list = minutesPendingForget.get(sessionId) ?? [];
+    if (!list.includes(memoryId)) list.push(memoryId);
+    if (list.length > MINUTES_PENDING_FORGET_MAX) {
+      list.splice(0, list.length - MINUTES_PENDING_FORGET_MAX);
+    }
+    minutesPendingForget.set(sessionId, list);
+    const onDisk = minutesLedgerStore.load(sessionId);
+    if (onDisk !== null) {
+      const merged = [.../* @__PURE__ */ new Set([...onDisk.pendingForget ?? [], ...list])].slice(
+        -MINUTES_PENDING_FORGET_MAX
+      );
+      minutesLedgerStore.save({ ...onDisk, pendingForget: merged });
+    } else if (sessionId === minutesOwnerSessionId) {
+      saveCurrentLedger();
+    }
+  }
+  function clearForget(sessionId, memoryId) {
+    const list = (minutesPendingForget.get(sessionId) ?? []).filter((id) => id !== memoryId);
+    if (list.length === 0) minutesPendingForget.delete(sessionId);
+    else minutesPendingForget.set(sessionId, list);
+    const onDisk = minutesLedgerStore.load(sessionId);
+    if (onDisk !== null) {
+      minutesLedgerStore.save({
+        ...onDisk,
+        pendingForget: (onDisk.pendingForget ?? []).filter((id) => id !== memoryId)
+      });
+    }
+  }
+  function forgetWithRetry(client, sessionId, memoryId) {
+    if (forgetInFlight.has(memoryId)) return;
+    forgetInFlight.add(memoryId);
+    void client.forget(memoryId).then(
+      (outcome) => {
+        if (outcome.deleted || outcome.alreadyDeleted) {
+          clearForget(sessionId, memoryId);
+          if (outcome.deleted) {
+            ctx.logger.info(
+              `[lrc] 会话纪要去重：删除过时版本 ${memoryId.slice(0, 8)}（新稿与它内容差异过大，LRC 未自动合并）`
+            );
+          }
+          return;
+        }
+        queueForget(sessionId, memoryId);
+      },
+      () => {
+        queueForget(sessionId, memoryId);
+        ctx.logger.info(
+          `[lrc] 会话纪要去重推迟：${memoryId.slice(0, 8)} 删除失败，已记入待办`
+        );
+      }
+    ).catch((error) => {
+      ctx.logger.warn(
+        `[lrc] 纪要去重收尾异常（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+      );
+    }).finally(() => {
+      forgetInFlight.delete(memoryId);
+    });
+  }
+  function retryPendingForget(client, sessionId) {
+    const inMemory = minutesPendingForget.get(sessionId) ?? [];
+    const onDisk = minutesLedgerStore.load(sessionId)?.pendingForget ?? [];
+    const currentId = sessionId === minutesOwnerSessionId ? minutesMemoryId : minutesLedgerStore.load(sessionId)?.memoryId ?? "";
+    for (const id of /* @__PURE__ */ new Set([...inMemory, ...onDisk])) {
+      if (id.length === 0) continue;
+      if (id === currentId) {
+        clearForget(sessionId, id);
+        continue;
+      }
+      forgetWithRetry(client, sessionId, id);
+    }
+  }
+  async function persistLedgerInner(state, reason, stage) {
+    const sessionId = state.sessionId;
+    {
+      const client = connection.peek();
+      if (client !== null) retryPendingForget(client, sessionId);
+    }
+    const diskWritten = minutesLedgerStore.load(sessionId)?.writtenAtArchived ?? -1;
+    const writtenFloor = Math.max(state.writtenAtArchived, diskWritten);
+    if (!canOverwriteMinutes(writtenFloor, state.archivedTurns, TURN_LEDGER_MAX)) {
+      ctx.logger.info(
+        `[lrc] 会话纪要跳过写入：本稿归档到第 ${state.archivedTurns} 轮 < 已写 第 ${writtenFloor} 轮（保留库里的完整版）`
+      );
+      return "skipped";
+    }
+    const archivedAtWrite = Math.max(state.archivedTurns, 0);
+    try {
+      const client = await connection.get();
+      if (client === null) {
+        stashMinutes(state, `LRC 未就绪：${state.turns.length} 轮，待重连后补写`);
+        return "failed";
+      }
+      let effective = probedMinutes.get(sessionId);
+      if (effective === void 0 && (state.memoryId ?? "").length === 0) {
+        await probeExistingMinutes(client, sessionId);
+        effective = probedMinutes.get(sessionId);
+      }
+      const isCurrentSession = sessionId === minutesOwnerSessionId;
+      const result = await writeMinutes(client, sessionId, state.turns, {
+        project: config.project,
+        startedAt: state.startedAt,
+        ...effective === void 0 ? {} : { existingSegments: effective.segments }
+      });
+      if (result.unchanged === true) {
+        ctx.logger.info(
+          `[lrc] 会话纪要与库内那段完全一致（${result.turns} 轮），无需写入`
+        );
+        if (isCurrentSession) {
+          minutesWrittenTurns = Math.max(minutesWrittenTurns, state.turns.length);
+          minutesWrittenAtArchived = Math.max(minutesWrittenAtArchived, archivedAtWrite);
+          minutesMemoryId = state.memoryId || minutesMemoryId;
+          saveCurrentLedger();
+        }
+        if (stage === void 0) {
+          const pending = minutesBacklog.get(sessionId);
+          if (pending === void 0 || pending.archivedTurns <= archivedAtWrite) {
+            minutesBacklog.delete(sessionId);
+          }
+        }
+        return "skipped";
+      }
+      if (!result.written) {
+        return "skipped";
+      }
+      const isCurrent = sessionId === minutesOwnerSessionId;
+      const previousId = isCurrent ? minutesMemoryId : state.memoryId || "";
+      const newId = result.memoryId;
+      const previousSource = isCurrent ? minutesMemoryIdFromProbe : state.memoryIdFromProbe;
+      const previousFromProbe = previousId.length > 0 && previousId !== newId && previousSource !== false;
+      if (previousFromProbe) {
+        ctx.logger.info(
+          `[lrc] 会话纪要新增一段（${newId.slice(0, 8)}）：保留库里原有那段历史 ${previousId.slice(0, 8)}（不同时间窗不是重复）`
+        );
+      }
+      if (previousId.length > 0 && newId.length > 0 && newId !== previousId && !previousFromProbe) {
+        const pendingIds = /* @__PURE__ */ new Set([
+          ...minutesPendingForget.get(sessionId) ?? [],
+          ...minutesLedgerStore.load(sessionId)?.pendingForget ?? []
+        ]);
+        if (pendingIds.has(newId)) {
+          clearForget(sessionId, newId);
+          if (previousId !== newId) {
+            forgetWithRetry(client, sessionId, previousId);
+          }
+        } else {
+          forgetWithRetry(client, sessionId, previousId);
+        }
+      }
+      if (isCurrent) {
+        minutesWrittenTurns = Math.max(minutesWrittenTurns, state.turns.length);
+        minutesWrittenAtArchived = Math.max(minutesWrittenAtArchived, archivedAtWrite);
+        minutesStageWrittenTurnIdx = state.stageWrittenTurnIdx ?? 0;
+        {
+          const prevSegments = probedMinutes.get(sessionId)?.segments ?? [];
+          const others = prevSegments.filter((s) => s.id !== newId);
+          setProbedMinutes(sessionId, {
+            turns: result.turns,
+            content: result.content,
+            memoryId: newId,
+            segments: [...others, { turns: result.turns, content: result.content, id: newId }]
+          });
+        }
+        minutesMemoryIdFromProbe = false;
+        minutesMemoryId = newId;
+        saveCurrentLedger();
+      } else {
+        {
+          const prevSegments = probedMinutes.get(sessionId)?.segments ?? [];
+          const others = prevSegments.filter((s) => s.id !== newId);
+          setProbedMinutes(sessionId, {
+            turns: result.turns,
+            content: result.content,
+            memoryId: newId,
+            segments: [...others, { turns: result.turns, content: result.content, id: newId }]
+          });
+        }
+        const own = minutesLedgerStore.load(sessionId) ?? state;
+        const kept = mergeTurns([own.turns, state.turns]);
+        const keptTrimmed = kept.length > TURN_LEDGER_MAX ? kept.slice(-TURN_LEDGER_MAX) : kept;
+        minutesLedgerStore.save({
+          ...own,
+          // 轮次取并集：`own` 可能已被迟到的 `archiveTurn` 追加过，
+          // 而 `state` 可能带更新的一批 —— 直接取一方会丢另一方的轮次
+          turns: keptTrimmed,
+          writtenTurns: Math.max(own.writtenTurns, state.turns.length),
+          writtenAtArchived: Math.max(own.writtenAtArchived, archivedAtWrite),
+          startedAt: earliestPositive([own.startedAt, state.startedAt]),
+          memoryId: newId,
+          // ## 非当前会话同样要复位来源（critical 1）
+          //
+          // 它自己账本文件里的 `memoryIdFromProbe` 若是 true（曾从库里
+          // 捡来），而现在写入了自己的一条 ⇒ 来源变成「自己写的」。
+          // 漏写会让那份账本永久「永不 forget」⇒ 每次更新都留过时副本。
+          memoryIdFromProbe: false,
+          // 待删列表取并集（八轮审查 M-3）
+          pendingForget: [
+            .../* @__PURE__ */ new Set([...own.pendingForget ?? [], ...state.pendingForget ?? []])
+          ],
+          // 阶段标记与当前会话同口径（十一轮 C1/M-1）
+          //
+          // ⚠ 这里故意用 `keptTrimmed`（磁盘并集）而非 `state.turns`：
+          // 实际写进库的是 `state.turns`，但并集更大 ⇒ 标记偏保守
+          // （最多多放行一次无谓写入），不会让真正需要的收尾入口丢失。
+          // 十一轮 minor-3 指出过这个不一致 —— 保留并在此写明。
+          stageWrittenTurnIdx: nextStageMarker(
+            keptTrimmed,
+            stage,
+            Math.max(own.stageWrittenTurnIdx ?? 0, state.stageWrittenTurnIdx ?? 0)
+          )
+        });
+      }
+      if (stage === void 0) {
+        const pending = minutesBacklog.get(sessionId);
+        if (pending === void 0 || pending.archivedTurns <= archivedAtWrite) {
+          minutesBacklog.delete(sessionId);
+        }
+      }
+      ctx.logger.info(
+        `[lrc] 会话纪要已更新（触发：${reason}）：${result.turns} 轮 / ${result.conclusions} 条结论 / ${result.chars} 字符 / id=${result.memoryId.slice(0, 8)}`
+      );
+      return "written";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isConnectionError(error)) {
+        connection.invalidate(message);
+      }
+      stashMinutes(
+        state,
+        `写入失败，已暂存 ${state.turns.length} 轮待重试（不影响对话）：${message}`
+      );
+      return "failed";
+    }
+  }
+  function stashMinutes(state, message) {
+    const onDisk = minutesLedgerStore.load(state.sessionId);
+    let mergedState = state;
+    if (onDisk !== null) {
+      const kept = mergeTurns([onDisk.turns, state.turns]);
+      mergedState = {
+        ...onDisk,
+        turns: kept.length > TURN_LEDGER_MAX ? kept.slice(-TURN_LEDGER_MAX) : kept,
+        // 单调字段一律取大值
+        archivedTurns: Math.max(onDisk.archivedTurns, state.archivedTurns),
+        writtenAtArchived: Math.max(onDisk.writtenAtArchived, state.writtenAtArchived),
+        writtenTurns: Math.max(onDisk.writtenTurns, state.writtenTurns),
+        startedAt: earliestPositive([onDisk.startedAt, state.startedAt]),
+        // 记住已知的记忆 ID（哪一侧非空就用哪一侧）
+        memoryId: onDisk.memoryId || state.memoryId,
+        // ## 来源必须与 memoryId 同源（七轮审查 critical 1）
+        //
+        // `{...onDisk}` 会带上磁盘值，但 `state` 可能刚更新过（本次写入
+        // 成功时已复位为 false）。必须按「谁提供了 memoryId」来取，
+        // 否则会把刚复位的 false 覆盖回 true（或反之）。
+        memoryIdFromProbe: onDisk.memoryId.length > 0 ? onDisk.memoryIdFromProbe : state.memoryIdFromProbe,
+        // 待删列表取并集（八轮审查 M-3：全量覆盖会抹掉另一侧的待办）
+        pendingForget: [
+          .../* @__PURE__ */ new Set([...onDisk.pendingForget ?? [], ...state.pendingForget ?? []])
+        ],
+        // ## 阶段稿进度也取大值（十轮审查 C1）
+        //
+        // `{...onDisk}` 虽然能带上磁盘值，但 `state` 可能更新（同一次
+        // 写入里刚推进过）。两侧取 max 才不会回退。
+        stageWrittenTurnIdx: Math.max(
+          onDisk.stageWrittenTurnIdx ?? 0,
+          state.stageWrittenTurnIdx ?? 0
+        ),
+        updatedAt: Date.now()
+      };
+      minutesLedgerStore.save(mergedState);
+    } else {
+      minutesLedgerStore.save(state);
+    }
+    minutesBacklog.delete(mergedState.sessionId);
+    minutesBacklog.set(mergedState.sessionId, mergedState);
+    trimMinutesBacklog();
+    ctx.logger.info(`[lrc] 会话纪要暂存：${message}`);
+  }
+  function trimMinutesBacklog() {
+    while (minutesBacklog.size > MINUTES_BACKLOG_MAX) {
+      const first = minutesBacklog.keys().next();
+      if (first.done === true) return;
+      minutesBacklog.delete(first.value);
+    }
+  }
+  const MINUTES_RETRY_STEP_INTERVAL = 60;
+  function retryPendingMinutes() {
+    if (!minutesEnabled) return;
+    if (minutesBacklog.size === 0) {
+      void maybeWriteMinutes(minutesOwnerSessionId, "重连补写");
+      return;
+    }
+    for (const [sessionId, state] of [...minutesBacklog.entries()]) {
+      if (sessionId === minutesOwnerSessionId) continue;
+      void persistLedger(state, "重连补写");
+    }
+    void maybeWriteMinutes(minutesOwnerSessionId, "重连补写", true);
+  }
   function recordSessionFacts(facts) {
     for (const fact of facts) {
       const key = factKey(fact);
@@ -4442,8 +6313,8 @@ function apply(ctx, config) {
   function loadSnapshot() {
     const empty = { text: "", sessionId: "" };
     try {
-      if (!existsSync4(snapshotPath)) return empty;
-      const raw = JSON.parse(readFileSync4(snapshotPath, "utf8"));
+      if (!existsSync5(snapshotPath)) return empty;
+      const raw = JSON.parse(readFileSync5(snapshotPath, "utf8"));
       return {
         text: typeof raw.text === "string" ? raw.text : "",
         sessionId: typeof raw.sessionId === "string" ? raw.sessionId : ""
@@ -4470,8 +6341,8 @@ function apply(ctx, config) {
       latestSnapshot = text;
     }
     try {
-      mkdirSync4(cacheDir, { recursive: true });
-      writeFileSync4(
+      mkdirSync5(cacheDir, { recursive: true });
+      writeFileSync5(
         snapshotPath,
         JSON.stringify({ text, sessionId, updatedAt: Date.now() }),
         "utf8"
@@ -4512,6 +6383,7 @@ function apply(ctx, config) {
   let probed = false;
   let recallText = "";
   let recallFingerprint = "";
+  let lastHistoryQuery = "";
   let recallGeneration = 0;
   let recallRewrites = 0;
   const recallOptions = normalizeRecallOptions({
@@ -4519,7 +6391,9 @@ function apply(ctx, config) {
     maxCharsPerItem: config.recallInjectMaxCharsPerItem,
     maxTotalChars: 240,
     minScore: config.recallInjectMinScore,
-    minRawScore: config.recallInjectMinRawScore
+    minRawScore: config.recallInjectMinRawScore,
+    fragmentPrefixes: config.recallInjectFragmentPrefixes,
+    fragmentExemptImportance: config.recallInjectFragmentExemptImportance
   });
   let turnHits = 0;
   let turnMisses = 0;
@@ -4574,7 +6448,15 @@ function apply(ctx, config) {
   function bindSnapshotToSession(sessionId) {
     if (sessionId.length === 0) return;
     if (sessionId === currentSessionId) return;
+    const previousSession = currentSessionId;
     currentSessionId = sessionId;
+    if (previousSession.length > 0) {
+      const pending = offloader.turnPending(previousSession);
+      if (pending > 0) {
+        void offloader.flushTurn(previousSession, { intoPool: false }).catch(() => {
+        });
+      }
+    }
     if (recallText.length > 0 || recallFingerprint.length > 0) {
       recallText = "";
       recallFingerprint = "";
@@ -4582,6 +6464,27 @@ function apply(ctx, config) {
     }
     offloader.resetSnapshotPool();
     sessionFacts.length = 0;
+    if (liveTurn !== void 0 && liveTurn.sessionId === previousSession) {
+      archiveTurn(liveTurn, "switched");
+      liveTurn = void 0;
+    }
+    if (previousSession.length > 0 && turnLedger.length > 0) {
+      const stale = currentLedgerState();
+      if (stale.sessionId.length > 0 && stale.sessionId !== previousSession) {
+        ctx.logger.warn(
+          `[lrc] 纪要账本归属(${stale.sessionId}) 与上一会话(${previousSession}) 不一致，按账本归属落盘（避免交叉污染）`
+        );
+      }
+      saveCurrentLedger();
+      if (shouldRewriteMinutes(stale.archivedTurns, stale.writtenAtArchived)) {
+        void persistLedger(stale, "切换会话");
+      }
+    }
+    bindMinutesSession(sessionId);
+    liveTurn = void 0;
+    liveTurnSessionId = "";
+    finishingTurns.length = 0;
+    clearMinutesIdle();
     snapshotGeneration += 1;
     if (snapshotOwner !== sessionId) {
       if (storedSnapshot.text.length > 0) {
@@ -4632,25 +6535,72 @@ ${latestSnapshot}`;
     ctx.logger.warn("[lrc] systemPrompt 服务不可用，跳过 <lrc_memory> 提示注入（沉淀仍走硬规则）");
   }
   ctx.effect(() => () => runtime.stop(), "lrc.runtime.stop()");
+  ctx.effect(
+    () => () => {
+      clearMinutesIdle();
+      saveCurrentLedger();
+      void maybeWriteMinutes(minutesOwnerSessionId, "dispose", true);
+    },
+    "lrc.minutes.dispose()"
+  );
   const compaction = ctx.get("compaction");
   ctx.logger.info(
     `[lrc] compaction 服务：${compaction === void 0 ? "不可达（preset 隔离）" : typeof compaction.compactRegion === "function" ? "可用（支持 compactRegion）" : "存在但无 compactRegion"}`
   );
   offloader = new Offloader(
     null,
-    new CursorStore(join3(cacheDir, "cursor.json")),
+    new CursorStore(join4(cacheDir, "cursor.json")),
     {
       turnsThreshold: config.offloadTurns,
       charsThreshold: config.offloadChars,
       stepsThreshold: config.offloadSteps,
       project: config.project,
-      maxItems: config.maxItems
+      maxItems: config.maxItems,
+      foldEnabled: config.foldEnabled,
+      foldMinFacts: config.foldMinFacts,
+      foldMaxChars: config.foldMaxChars
     },
-    new RecentStore(join3(cacheDir, "recent.json"))
+    new RecentStore(join4(cacheDir, "recent.json"))
   );
+  minutesLedgerStore.prune(MINUTES_LEDGER_MAX_FILES);
   function attachOffloader(client) {
     offloader?.bind(client);
     drainProseBacklog();
+    retryPendingMinutes();
+    resetProbeAttempts();
+    if (minutesOwnerSessionId.length > 0) {
+      maybeProbeMinutesOnce(minutesOwnerSessionId);
+    }
+  }
+  const PROBE_MAX_ATTEMPTS = 3;
+  const probeAttempts = /* @__PURE__ */ new Map();
+  const probeInFlight = /* @__PURE__ */ new Set();
+  function maybeProbeMinutesOnce(sessionId) {
+    if (!minutesEnabled) return;
+    if (sessionId.length === 0) return;
+    if (probedMinutes.has(sessionId)) return;
+    if (probeInFlight.has(sessionId)) return;
+    const attempts = probeAttempts.get(sessionId) ?? 0;
+    if (attempts >= PROBE_MAX_ATTEMPTS) return;
+    probeAttempts.set(sessionId, attempts + 1);
+    probeInFlight.add(sessionId);
+    void connection.get().then(async (client) => {
+      if (client === null) {
+        probeAttempts.set(sessionId, attempts);
+        return;
+      }
+      const ok = await probeExistingMinutes(client, sessionId);
+      if (ok) probeAttempts.delete(sessionId);
+    }).catch((error) => {
+      ctx.logger.warn(
+        `[lrc] 会话纪要探查异常（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+      );
+    }).finally(() => {
+      probeInFlight.delete(sessionId);
+    });
+  }
+  function resetProbeAttempts() {
+    probeAttempts.clear();
   }
   function drainProseBacklog() {
     for (const [owner, list] of [...proseBacklog.entries()]) {
@@ -4681,12 +6631,63 @@ ${latestSnapshot}`;
       });
     }
   }
-  function offloadExtracted(facts, ownerSessionId, label) {
+  const TURN_FLUSH_MAX = 40;
+  function collectMinutesConclusions(facts, ownerSessionId, label, explicitSlot) {
+    if (facts.length === 0) return;
+    const slot = explicitSlot ?? (liveTurn !== void 0 && liveTurnSessionId === ownerSessionId ? liveTurn : [...finishingTurns].reverse().find((t) => t.sessionId === ownerSessionId));
+    if (slot === void 0) {
+      ctx.logger.info(
+        `[lrc] 纪要未收 ${facts.length} 条结论（${label}）：本轮槽位已归档或跨会话`
+      );
+      return;
+    }
+    for (const fact of facts) {
+      if (fact.kind !== "constraint" && fact.kind !== "decision" && fact.kind !== "conclusion" && fact.kind !== "statement") {
+        continue;
+      }
+      const text = fact.statement.trim();
+      if (text.length === 0) continue;
+      if (slot.conclusions.includes(text)) continue;
+      if (slot.conclusions.length >= 60) {
+        ctx.logger.info(`[lrc] 纪要单轮结论已达 60 条上限，本轮后续结论不再收（${label}）`);
+        break;
+      }
+      slot.conclusions.push(text);
+      slot.lastActivityAt = Date.now();
+    }
+  }
+  function offloadExtracted(facts, ownerSessionId, label, timing = "now", slot) {
     if (facts.length === 0) return;
     recordSessionFacts(facts);
+    collectMinutesConclusions(facts, ownerSessionId, label, slot);
     if (!offloader.connected) {
       pushProseBacklog(ownerSessionId, facts);
       void connection.get();
+      return;
+    }
+    if (timing === "turn") {
+      offloader.accumulate(facts);
+      const pendingForSession = offloader.turnPending(ownerSessionId);
+      if (pendingForSession >= TURN_FLUSH_MAX) {
+        void offloader.flushTurn(ownerSessionId).then((result) => {
+          if (result.distilled > 0) {
+            if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+              saveSnapshot(result.snapshot, ownerSessionId);
+            }
+            ctx.logger.info(
+              `[lrc] ${label} 暂存达上限，提前沉淀 ${result.distilled} 条（折叠 ${result.folded ?? 0} 条，写入 ${result.written}）`
+            );
+          }
+        }).catch((error) => {
+          ctx.logger.warn(
+            `[lrc] ${label} 提前沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      } else {
+        ctx.logger.info(
+          `[lrc] ${label} ${facts.length} 条暂存本轮（累计 ${pendingForSession} 条），轮末统一沉淀`
+        );
+      }
       return;
     }
     proseTurns += 1;
@@ -4775,7 +6776,7 @@ ${latestSnapshot}`;
       globalMaxCalls: config.llmExtractGlobalMaxCalls
     });
   }
-  async function runLlmFallback(text, session, ownerSessionId, alreadyExtracted = [], candidates = [], origin = "assistant") {
+  async function runLlmFallback(text, session, ownerSessionId, alreadyExtracted = [], candidates = [], origin = "assistant", ownerSlot) {
     const quota = quotaFor(ownerSessionId);
     quota.count += 1;
     quota.lastCallAt = Date.now();
@@ -4824,7 +6825,8 @@ ${latestSnapshot}`;
         return;
       }
       llmExtractHits += 1;
-      offloadExtracted(extracted.facts, ownerSessionId, "LLM 兜底");
+      if (origin === "assistant") attachTopic(extracted.facts, text);
+      offloadExtracted(extracted.facts, ownerSessionId, "LLM 兜底", "turn", ownerSlot);
     } catch (error) {
       llmExtractFailures += 1;
       ctx.logger.warn(
@@ -4880,7 +6882,13 @@ ${latestSnapshot}`;
     if (query.length === 0) return;
     const fingerprint = topicFingerprint(query, recallFingerprint);
     if (fingerprint.length === 0) return;
-    if (fingerprint === recallFingerprint) return;
+    const historyQuery = isHistoryQuery(query);
+    if (!historyQuery) {
+      lastHistoryQuery = "";
+      if (fingerprint === recallFingerprint) return;
+    } else if (query === lastHistoryQuery) {
+      return;
+    }
     const generation = recallGeneration + 1;
     recallGeneration = generation;
     const acquired = await acquireClient();
@@ -4892,9 +6900,12 @@ ${latestSnapshot}`;
         topK: Math.max(recallOptions.maxItems * 3, 3)
       });
       if (generation !== recallGeneration) return;
-      const next = formatRecallInjection(result.memories, recallOptions);
-      recallFingerprint = fingerprint;
-      const changed = next !== recallText;
+      if (historyQuery) lastHistoryQuery = query;
+      const opts = historyQuery ? { ...recallOptions, minRawScore: 0 } : recallOptions;
+      const next = formatRecallInjection(result.memories, opts);
+      if (!historyQuery) recallFingerprint = fingerprint;
+      const keepPrevious = historyQuery && next.length === 0 && recallText.length > 0;
+      const changed = !keepPrevious && next !== recallText;
       if (changed) {
         recallText = next;
         recallRewrites += 1;
@@ -4905,8 +6916,8 @@ ${latestSnapshot}`;
           const raw = typeof m.score === "number" && Number.isFinite(m.score) ? m.score : -1;
           return raw > max ? raw : max;
         }, -1);
-        const message = `[lrc] 本轮无记忆注入（候选 ${result.memories.length} 条，最高绝对分 ${top >= 0 ? top.toFixed(4) : "缺失"}，阈值 ${recallOptions.minRawScore}，指纹 ${fingerprint}）`;
-        if (result.memories.length > 0 && top >= 0 && top < recallOptions.minRawScore) {
+        const message = `[lrc] 本轮无记忆注入（候选 ${result.memories.length} 条，最高绝对分 ${top >= 0 ? top.toFixed(4) : "缺失"}，阈值 ${opts.minRawScore}，指纹 ${fingerprint}${historyQuery ? "，历史查询" : ""}${keepPrevious ? `，已保留原注入 ${recallText.length} 字符` : ""}）`;
+        if (result.memories.length > 0 && top >= 0 && top < opts.minRawScore) {
           ctx.logger.warn(
             `${message} —— 候选全部被绝对分闸门挡掉。若长期如此，检查 LRC 的通路权重（语义/深度路不可用时单路上限约 0.0164）或调低 recallInjectMinRawScore`
           );
@@ -4915,7 +6926,11 @@ ${latestSnapshot}`;
         }
       } else if (changed) {
         ctx.logger.info(
-          `[lrc] 注入 ${injected}/${result.memories.length} 条候选（${next.length} 字符，指纹 ${fingerprint}，累计改写 ${recallRewrites} 次）`
+          `[lrc] 注入 ${injected}/${result.memories.length} 条候选（${next.length} 字符，指纹 ${fingerprint}${historyQuery ? "，历史查询强制注入" : ""}，累计改写 ${recallRewrites} 次）`
+        );
+      } else if (historyQuery) {
+        ctx.logger.info(
+          `[lrc] 历史查询已检索（${result.memories.length} 条候选，注入文本未变，指纹 ${fingerprint}）`
         );
       }
     } catch (error) {
@@ -4955,16 +6970,17 @@ ${latestSnapshot}`;
           );
         }
         if (fromReasoning.facts.length > 0) {
+          collectMinutesConclusions(fromReasoning.facts, sessionId, `推理兜底(${reason})`);
           try {
-            const result2 = await offloader.offloadFacts(fromReasoning.facts);
-            if (result2.distilled > 0) {
-              if (result2.snapshot.length > 0 && snapshotChanged(latestSnapshot, result2.snapshot)) {
-                saveSnapshot(result2.snapshot, sessionId);
-              }
-              ctx.logger.info(
-                `[lrc] 推理兜底沉淀 ${result2.distilled} 条（写入 ${result2.written}，合并 ${result2.merged}${result2.deduped > 0 ? `；本地去重 ${result2.deduped}` : ""}，触发：${reason}）`
-              );
+            const result2 = await offloader.offloadFacts(fromReasoning.facts, {
+              deferToTurn: true
+            });
+            if (result2.snapshot.length > 0 && snapshotChanged(latestSnapshot, result2.snapshot)) {
+              saveSnapshot(result2.snapshot, sessionId);
             }
+            ctx.logger.info(
+              `[lrc] 推理兜底暂存 ${result2.distilled} 条（待轮末折叠，触发：${reason}）`
+            );
           } catch (error) {
             ctx.logger.warn(
               `[lrc] 推理兜底沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
@@ -5003,9 +7019,12 @@ ${latestSnapshot}`;
     turnTagSeen = false;
     turnReasoning = [];
     turnReasoningChars = 0;
+    lastMinutesStageAt = 0;
+    lastMinutesStageConclusionCount = 0;
+    lastMinutesStageUserChars = 0;
   }
   const REASONING_CAP = 2e4;
-  async function finishTurn(session) {
+  async function finishTurn(session, slot) {
     if (turnHadText) {
       if (turnTagSeen) turnHits += 1;
       else turnMisses += 1;
@@ -5022,28 +7041,55 @@ ${latestSnapshot}`;
     const reasoning = turnReasoning.join("\n");
     resetTurnState();
     const sessionId = session?.id ?? "";
-    await flush(session, "turn/end");
-    if (hadText || reasoning.length === 0) return;
-    const fromReasoning = extractFactsFromReasoning({
-      text: reasoning,
-      origin: "assistant",
-      sessionId
-    });
-    if (fromReasoning.facts.length === 0) return;
-    try {
-      const result = await offloader.offloadFacts(fromReasoning.facts);
-      if (result.distilled > 0) {
-        if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
-          saveSnapshot(result.snapshot, sessionId);
+    {
+      const turnResult = await offloader.flushTurn(sessionId);
+      if (turnResult.distilled > 0) {
+        if (turnResult.snapshot.length > 0 && snapshotChanged(latestSnapshot, turnResult.snapshot)) {
+          saveSnapshot(turnResult.snapshot, sessionId);
         }
+        const folded = turnResult.folded ?? 0;
         ctx.logger.info(
-          `[lrc] 推理兜底沉淀 ${result.distilled} 条（写入 ${result.written}，合并 ${result.merged}${result.deduped > 0 ? `；本地去重 ${result.deduped}` : ""}）`
+          `[lrc] 轮末沉淀 ${turnResult.distilled} 条` + (folded > 0 ? `（其中 ${folded} 条碎片折叠为 1 条摘要）` : "") + `，写入 ${turnResult.written}，合并 ${turnResult.merged}`
         );
       }
-    } catch (error) {
-      ctx.logger.warn(
-        `[lrc] 推理兜底沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
-      );
+    }
+    if (!hadText && reasoning.length > 0) {
+      const fromReasoning = extractFactsFromReasoning({
+        text: reasoning,
+        origin: "assistant",
+        sessionId
+      });
+      if (fromReasoning.facts.length > 0) {
+        collectMinutesConclusions(fromReasoning.facts, sessionId, "推理兜底(轮末)", slot);
+        try {
+          const result = await offloader.offloadFacts(fromReasoning.facts, {
+            deferToTurn: true
+          });
+          if (result.distilled > 0) {
+            if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+              saveSnapshot(result.snapshot, sessionId);
+            }
+            ctx.logger.info(`[lrc] 推理兜底暂存 ${result.distilled} 条（待轮末折叠）`);
+          }
+        } catch (error) {
+          ctx.logger.warn(
+            `[lrc] 推理兜底沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+    }
+    await flush(session, "turn/end");
+    {
+      const finalResult = await offloader.flushTurn(sessionId);
+      if (finalResult.distilled > 0) {
+        if (finalResult.snapshot.length > 0 && snapshotChanged(latestSnapshot, finalResult.snapshot)) {
+          saveSnapshot(finalResult.snapshot, sessionId);
+        }
+        const folded = finalResult.folded ?? 0;
+        ctx.logger.info(
+          `[lrc] 轮末收口 ${finalResult.distilled} 条` + (folded > 0 ? `（其中 ${folded} 条碎片折叠为 1 条摘要）` : "") + `，写入 ${finalResult.written}，合并 ${finalResult.merged}`
+        );
+      }
     }
   }
   ctx.on("session/event", (session, event) => {
@@ -5051,15 +7097,75 @@ ${latestSnapshot}`;
     const sessionId = session?.id ?? "";
     bindSnapshotToSession(sessionId);
     if (type === "turn/start") {
+      if (liveTurn !== void 0) {
+        archiveTurn(liveTurn, "no-end");
+        liveTurn = void 0;
+      }
+      const turnIdx = event?.data?.turn ?? archivedTurns + 1;
+      if (minutesOwnerSessionId !== sessionId) bindMinutesSession(sessionId);
+      maybeProbeMinutesOnce(sessionId);
+      const now = Date.now();
+      liveTurn = {
+        idx: turnIdx,
+        startedAt: now,
+        lastActivityAt: now,
+        sessionId,
+        userText: "",
+        conclusions: []
+      };
+      liveTurnSessionId = sessionId;
+      const pending = offloader.turnPending(sessionId);
+      if (pending > 0) {
+        void offloader.flushTurn(sessionId, { intoPool: false }).then((result) => {
+          if (result.distilled > 0) {
+            if (result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+              saveSnapshot(result.snapshot, sessionId);
+            }
+            ctx.logger.info(
+              `[lrc] 上一轮被中止，补写暂存的 ${result.distilled} 条（折叠 ${result.folded ?? 0} 条，写入 ${result.written}）`
+            );
+          }
+        }).catch((error) => {
+          ctx.logger.warn(
+            `[lrc] 补写上一轮暂存失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      }
       resetTurnState();
       return;
     }
     if (type === "turn/end") {
-      void finishTurn(session);
+      const finished = liveTurn;
+      if (finished !== void 0) {
+        liveTurn = void 0;
+        liveTurnSessionId = "";
+        finishingTurns.push(finished);
+      } else {
+        ctx.logger.info(
+          `[lrc] turn/end 但本轮无槽位（turn/start 可能丢失），该轮不进纪要（${sessionId}）`
+        );
+      }
+      const reason = event?.data?.reason?.kind ?? "unknown";
+      void finishTurn(session, finished).catch((error) => {
+        ctx.logger.warn(
+          `[lrc] turn/end 收尾异常（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+        );
+      }).finally(() => {
+        if (finished !== void 0) {
+          const at = finishingTurns.indexOf(finished);
+          if (at >= 0) finishingTurns.splice(at, 1);
+          archiveTurn(finished, reason);
+        }
+        void maybeWriteMinutes(sessionId, "turn/end");
+      });
       return;
     }
     if (type === "user/message" && isRealUserMessage(event)) {
       const userText = userMessageText(event);
+      if (liveTurn !== void 0 && userText.trim().length > 0) {
+        liveTurn.userText = liveTurn.userText.length === 0 ? userText.trim() : `${liveTurn.userText} ${userText.trim()}`;
+        liveTurn.lastActivityAt = Date.now();
+      }
       void refreshRecallInjection(userText);
       const result = extractFacts({
         text: userText,
@@ -5069,13 +7175,15 @@ ${latestSnapshot}`;
       offloadExtracted(result.facts, sessionId, "用户消息");
       const userExtractedKinds = result.facts.map((f) => f.kind);
       if (shouldFallback(userText, result.facts.map((f) => f.statement), sessionId, userExtractedKinds, result.pending)) {
+        const ownerSlot = liveTurn !== void 0 && liveTurnSessionId === sessionId ? liveTurn : void 0;
         void runLlmFallback(
           userText,
           session,
           sessionId,
           result.facts.map((f) => f.statement),
           result.pending,
-          "user"
+          "user",
+          ownerSlot
         );
       }
       if (artifactEnabled && isArtifactWorthy(userText, artifactMinChars)) {
@@ -5096,11 +7204,12 @@ ${latestSnapshot}`;
         origin: "assistant",
         sessionId
       });
-      offloadExtracted(extracted.facts, sessionId, "正文抽取");
+      offloadExtracted(extracted.facts, sessionId, "正文抽取", "turn");
       const alreadyExtracted = extracted.facts.map((f) => f.statement);
       const extractedKinds = extracted.facts.map((f) => f.kind);
       if (shouldFallback(text, alreadyExtracted, sessionId, extractedKinds, extracted.pending)) {
-        void runLlmFallback(text, session, sessionId, alreadyExtracted, extracted.pending);
+        const ownerSlot = liveTurn !== void 0 && liveTurnSessionId === sessionId ? liveTurn : void 0;
+        void runLlmFallback(text, session, sessionId, alreadyExtracted, extracted.pending, "assistant", ownerSlot);
       }
     } else if (!warnedShape && hasMalformedTextBlock(content)) {
       warnedShape = true;
@@ -5293,6 +7402,10 @@ ${latestSnapshot}`;
       const session = payload?.agent?.session;
       void flush(session, "threshold");
     }
+    if (minutesBacklog.size > 0 && governor.steps % MINUTES_RETRY_STEP_INTERVAL === 0) {
+      retryPendingMinutes();
+    }
+    maybeWriteStageMinutes();
     const decision = await next();
     if (decision !== null && typeof decision === "object") {
       const d = decision;
@@ -5431,29 +7544,74 @@ ${latestSnapshot}`;
         const { client } = acquired;
         try {
           const topK = Math.min(Math.max(args.top_k ?? 5, 1), 20);
-          const result = await client.recall(query, {
-            topK,
-            // 缺省不按项目过滤：插件沉淀写 config.project，手工 remember 可能写别的项目，
-            // 过滤会漏掉一半。需要收窄时由调用方显式传 project。
-            project: args.project
-          });
-          ctx.logger.info(
-            `[lrc][tool] lrc_recall "${query}" → ${describeRecall(result.memories.length, result.total)}`
+          const historyQuery = isHistoryQuery(query);
+          let minutes = [];
+          if (historyQuery) {
+            try {
+              const m = await client.recall(query, {
+                topK: 1,
+                // ## 纪要段必须收窄项目（独立审查 major 3）
+                //
+                // 明细段缺省不过滤是为了不漏手工 remember 的记忆；但纪要段是
+                // **硬取 top-1**，跨项目时会把别的项目 3K 字符的纪要塞进来。
+                // 纪要恒写入 `config.project`，用它兜底是安全的。
+                // ⚠ 用 `||` 而非 `??`：空串也要回退（复审 minor 3）
+                project: args.project || config.project || void 0,
+                tags: ["session-minutes"]
+              });
+              minutes = m.memories;
+            } catch (error) {
+              ctx.logger.warn(
+                `[lrc][tool] 纪要段检索失败，降级为仅明细：${noteToolFailure(error).slice(0, 120)}`
+              );
+            }
+          }
+          const detailK = Math.max(topK - minutes.length, 0);
+          let detailMemories = [];
+          let detailTotal = 0;
+          if (detailK > 0) {
+            try {
+              const r = await client.recall(query, {
+                topK: detailK,
+                // 缺省不按项目过滤：插件沉淀写 config.project，手工 remember 可能写别的项目，
+                // 过滤会漏掉一半。需要收窄时由调用方显式传 project。
+                project: args.project
+              });
+              detailMemories = r.memories;
+              detailTotal = r.total;
+            } catch (error) {
+              if (minutes.length === 0) throw error;
+              ctx.logger.warn(
+                `[lrc][tool] 明细段检索失败，仅返回纪要：${noteToolFailure(error).slice(0, 120)}`
+              );
+            }
+          }
+          const seen = new Set(minutes.map((m) => m.id));
+          const merged = [...minutes, ...detailMemories.filter((m) => !seen.has(m.id))].slice(
+            0,
+            topK
           );
-          if (result.memories.length === 0) {
+          const detailCount = Math.max(0, merged.length - minutes.length);
+          const summary = historyQuery ? `召回 ${merged.length} 条（纪要 ${minutes.length} 条 + 明细 ${detailCount} 条）` : describeRecall(merged.length, detailTotal);
+          ctx.logger.info(`[lrc][tool] lrc_recall "${query}" → ${summary}`);
+          if (merged.length === 0) {
             return { text: "LRC 未命中，可回退内置搜索。", count: 0 };
           }
-          const lines = result.memories.map((m, i) => {
-            const rel = Math.round((m.score_norm ?? 0) * 100);
+          const lines = merged.map((m, i) => {
             const kind = m.memory_type ?? "fact";
+            if (seen.has(m.id)) {
+              return `（记忆 #${i + 1} · 会话纪要 · 按标签取回，非语义匹配 · id=${m.id}）
+${m.content}`;
+            }
+            const rel = Math.round((m.score_norm ?? 0) * 100);
             return `（记忆 #${i + 1} · 相关度 ${rel}% · ${kind} · id=${m.id}）
 ${m.content}`;
           });
           return {
-            text: `LRC ${describeRecall(result.memories.length, result.total)}：
+            text: `LRC ${summary}：
 
 ` + lines.join("\n\n"),
-            count: result.memories.length
+            count: merged.length
           };
         } catch (error) {
           return { text: `LRC 召回失败：${noteToolFailure(error).slice(0, 200)}`, count: 0 };
@@ -5730,6 +7888,40 @@ ${chunk}${tail}`,
             stats.lastFlushAt === 0 ? "最近一次：尚未沉淀" : `最近一次：${new Date(stats.lastFlushAt).toISOString()}（写入 ${stats.lastFlushWritten} / 合并 ${stats.lastFlushMerged}）`
           );
           lines.push(`查重窗口：${stats.recentWindow} 块`);
+          const turnPending = offloader.turnPending();
+          if (turnPending > 0) {
+            lines.push(`本轮暂存：${turnPending} 条待轮末沉淀（turn/end 或下次 turn/start 时写入）`);
+          }
+          if (stats.foldBatches > 0) {
+            const ratio = (stats.totalFolded / stats.foldBatches).toFixed(1);
+            lines.push(
+              `同批折叠：${stats.foldBatches} 批 / 覆盖 ${stats.totalFolded} 条原始结论（平均每批 ${ratio} 条 → 1 条摘要）`
+            );
+          } else {
+            lines.push("同批折叠：尚未触发（一批不足 4 条时不折叠）");
+          }
+          if (minutesEnabled) {
+            if (turnLedger.length === 0) {
+              lines.push(
+                `会话纪要：本会话尚无轮次记录（首轮即写入，之后每 ${minutesEveryTurns} 轮更新${minutesIdleMs > 0 ? `，或空闲 ${Math.round(minutesIdleMs / 6e4)} 分钟后` : ""}）`
+              );
+            } else {
+              const draft = buildMinutes(
+                currentSessionId,
+                turnLedger,
+                void 0,
+                minutesStartedAt
+              );
+              const backlog = minutesBacklog.get(currentSessionId);
+              const shownWritten = Math.min(minutesWrittenTurns, archivedTurns);
+              const state = minutesWrittenAtArchived < 0 ? `尚未写入，首轮即写入，之后每 ${minutesEveryTurns} 轮更新` : `已写入 ${shownWritten} 轮，累计归档 ${archivedTurns} 轮`;
+              lines.push(
+                `会话纪要：已记 ${turnLedger.length} 轮 / ${draft === null ? 0 : draft.conclusions} 条结论 / ${draft === null ? 0 : draft.content.length} 字符（${state}）` + (backlog === void 0 ? "" : ` ⚠ 另有 ${backlog.turns.length} 轮待补写`)
+              );
+            }
+          } else {
+            lines.push("会话纪要：已关闭（minutesEnabled=false）");
+          }
         }
         lines.push("");
         lines.push("## 工件库");
@@ -5764,7 +7956,7 @@ ${chunk}${tail}`,
         );
         if (!recallInjectOn) {
           const dshHome = dirname3(dirname3(cacheDir));
-          const patchPath = join3(dshHome, "profiles", "desktop", "cordis.patch.yml");
+          const patchPath = join4(dshHome, "profiles", "desktop", "cordis.patch.yml");
           lines.push("");
           lines.push("### 主动召回注入未启用");
           lines.push(
@@ -5776,6 +7968,7 @@ ${chunk}${tail}`,
           lines.push("        recallInjectMinScore: 0.85");
           lines.push("        recallInjectMinRawScore: 0.025");
           lines.push("        recallInjectMaxCharsPerItem: 80");
+          lines.push("        recallInjectFragmentExemptImportance: 9");
           lines.push("```");
           lines.push("（上溯路径来自本插件实际使用的缓存目录；多 profile 时请确认当前 profile 名。）");
         }
@@ -5794,6 +7987,9 @@ ${chunk}${tail}`,
           );
           lines.push(
             `配置：最多 ${recallOptions.maxItems} 条｜相对分 ≥${recallOptions.minScore}｜绝对分 ≥${recallOptions.minRawScore}｜单条 ${recallOptions.maxCharsPerItem} 字符｜总长 ${recallOptions.maxTotalChars}`
+          );
+          lines.push(
+            recallOptions.fragmentPrefixes.length > 0 ? `碎片过滤：以悬空词开头的残句不注入（importance ≥${recallOptions.fragmentExemptImportance} 豁免）` : "碎片过滤：已关闭（fragmentPrefixes 为空）"
           );
           if (recallOptions.minRawScore > 0.0164) {
             lines.push(

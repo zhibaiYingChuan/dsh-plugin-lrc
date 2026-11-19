@@ -69,3 +69,26 @@
         llmExtractMinChars: 120
         # 单次发送的正文上限（超出取尾部）
         llmExtractMaxInputChars: 6000
+        # ── 同批折叠 ──
+        #
+        # 实测一个会话写入 1515 条、长度中位数仅 33 字，19.3% ≤ 20 字 ——
+        # 抽取器是句子级的，同一次推理被切成一串互不相关的碎片。
+        # 开启后同一批（一次 flush）的 N 条先压成 1 条摘要再入库。
+        foldEnabled: true
+        # 低于 4 条不折叠：2~3 条本就是一次完整表述，折叠反而损失精度
+        foldMinFacts: 4
+        # 摘要字符上限：正常批次约 500 字，远低于此值
+        foldMaxChars: 2000
+        # ── 会话纪要 ──
+        #
+        # 「一份对话一份纪要」：诉求演进 + 关键结论 + 真实时序，
+        # 走 /v1/memories/remember 带 source_timestamp_ms（实测偏差 0.0 秒）。
+        #
+        # ★必须显式写在 patch 里：插件按 `!== false` 判定，
+        # 但写出来能让配置可审阅、可关闭。
+        minutesEnabled: true
+        # 每满多少轮落一次。实测每会话轮数 p50 仅 2 轮，
+        # 5 轮 + 空闲触发可覆盖绝大多数会话。
+        minutesEveryTurns: 5
+        # 空闲多久强制落一次（毫秒，0 = 关闭）。兜住短会话。
+        minutesIdleMs: 600000

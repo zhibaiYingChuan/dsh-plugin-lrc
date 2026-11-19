@@ -9,6 +9,7 @@
  */
 import {
   formatRecallInjection,
+  isHistoryQuery,
   normalizeRecallOptions,
   topicFingerprint,
   DEFAULT_RECALL_INJECTION,
@@ -356,6 +357,378 @@ console.log('=== 8) 用户消息取文本 ===');
       data: { content: [{ type: 'reasoning', text: '内部' }] },
     }) === '',
   );
+}
+
+// ── 9) 历史查询的语言信号（2026-11-19 六钥匙裁决）──
+//
+// ## 为什么需要这一层
+//
+// 实测：`recallInjectMinRawScore = 0.025`，而 LRC 单路召回上限
+// `1/61 ≈ 0.0164` ⇒ 自动注入 **0 次**。调低阈值会让所有话题都注入
+// （全面注入回归）。所以改用**确定性的语言信号**触发。
+console.log('\n=== 9) 历史查询语言信号 ===');
+{
+  // 必须命中的真实说法
+  const positives = [
+    '上次那个方案是什么',
+    '之前我们怎么改的',
+    '以前是不是定过用 pnpm',
+    '当初为什么选 PostgreSQL',
+    '我们决定过用 RwLock 吧',
+    '不是定过要 8pt 栅格吗',
+    '还记得那个端口号吗',
+    '继续上次的重构',
+    '接着之前那个做',
+    '为什么这么设计',
+    '为什么用这个方案',
+    '那个方案后来怎么样了',
+    '我们之前改过什么',
+    '之前怎么配置的，照着来',
+    // 第五轮审查补的漏触发
+    '翻一下之前的记录',
+    '查一下历史记录',
+    '我们不是定了用 pnpm 吗',
+    '我们讨论过的那个方案',
+    '回忆一下当时的决定',
+    // 2026-11-19 实测漏判：真实提示词「回顾梳理我们前面所有的方案…」
+    '回顾梳理我们前面所有的方案和项目的状态，查看还有哪些需要补齐的地方。',
+    '回顾一下我们前面所有的方案',
+    '梳理一下我们前面所有的决定',
+    // 复审补的漏触发（由既有 `之前的(…)` 规则覆盖）
+    '复盘一下我们之前的方案',
+    '总结一下之前的工作',
+    // 第三轮复审补的漏触发
+    '梳理一下历史记录',
+    '翻翻以前的记录',
+    '看看之前的历史记录',
+    '我们之前是怎么约定的',
+    // 第四轮复审补的漏触发
+    '之前那个决定是怎么来的',
+    '我们之前定的接口规范在哪',
+  ];
+  for (const text of positives) {
+    check(`命中：${text}`, isHistoryQuery(text) === true, text);
+  }
+
+  // 不该命中的普通指令（误触发会白注入 2 条 + 打断前缀缓存）
+  //
+  // ## 必须包含「含信号词但语义不是问历史」的句子（独立审查 major 2）
+  //
+  // 只放「不含任何信号词」的句子等于没测：它们恒不命中。
+  // 下面这些是真实开发者会说的话，`之前`/`以前`/`原来` 在这里是**时间介词**。
+  const negatives = [
+    '把这个函数改成 async',
+    '跑一下测试',
+    '继续',
+    '然后呢',
+    '这个页面太宽了',
+    '帮我加个导出功能',
+    '端口 3099 被占用了',
+    // ── 时间介词误触发（critical 1 的守卫）──
+    '在提交之前先跑一遍测试',
+    '运行之前记得先 build',
+    '删除之前先备份数据库',
+    '恢复原来的配置',
+    '为什么改成 async 更好',
+    '清空 git 历史记录',
+    '按那个方案实现就行',
+    // ── 反向弱信号误触发（复审 critical 1）──
+    '确定之前先问一下',
+    '改之前先跑测试',
+    '调用之前先检查参数',
+    // ── 当前推理 / 故障排查（复审 major 2、3）──
+    '原来是这个原因',
+    '原来是缓存没清',
+    '为什么用不了这个 API',
+    '为什么用 fetch 会报错',
+    '为什么选不了',
+    // ── 第三轮独立审查实测的 11 条真实误触发（裸词版本 22 条命中 21 条）──
+    //
+    // 这些句子**都含信号词**，但语义是当前指令/排障，不是问历史。
+    // 只放「不含信号词」的句子等于没测 —— 它们恒不命中。
+    '记录当时的时间戳',
+    '你记得在 finally 里释放锁',
+    '我们决定用 pnpm 吧',
+    '为什么用这个 API 会 404',
+    '沿用原来的命名风格',
+    '刚才那个命令再执行一遍',
+    '查一下 git 历史上这个文件谁改的',
+    'git diff 看看改过什么',
+    '把先前版本的字段名迁移过来',
+    '在之前我写的函数里加日志',
+    // ── 第四轮独立审查实测的 10 条（「与动词共现」挡不住的形态）──
+    //
+    // 第三轮把弱信号写成 `之前 + (说|定|用|改|…)`，实测 20 条真实编码指令
+    // 仍命中 19 条 —— `用`/`改`/`说` 正是编码指令最高频的动词。
+    // 所以改成「弱信号 + 疑问标记」双闸门，下面这些必须全部不命中。
+    '之前用 axios 没问题，现在报错',
+    '之前改的那行代码有 bug',
+    '之前你写的函数加个日志',
+    '记录当时用的参数',
+    '当时是 3 秒超时，改成 5 秒',
+    '之前讨论的接口先别动',
+    '先前那个 bug 复现一下',
+    '为什么用这个锁会死锁',
+    '还记得要加 try-catch',
+    '照旧跑一遍测试',
+    // ── 第五轮独立审查实测（强信号口径不一致 / 疑问标记过松）──
+    '之前不是这样的',
+    '之前不是这个报错',
+    '我们约定一下接口格式',
+    '我们说好这个接口用 REST',
+    '看看我改了什么',
+    '之前怎么没报错',
+    '以前为什么没问题',
+    '记不记得要加 try-catch',
+    // ── 第六轮独立审查实测（是非问 / 当前动作 / 授权选型）──
+    '我提过 PR 了，你 review 一下',
+    '接着之前的代码往下写，别改结构',
+    '这个参数不是定了 5 秒吗',
+    '之前那个接口改好了吗',
+    '之前用什么库都行，你定',
+    // ── 2026-11-19 新增「回顾/梳理/前面」的误触发守卫 ──
+    //
+    // 这三个词本身是中性动词/方位词，必须带历史宾语才算问历史。
+    '回顾一下这段代码有没有问题',
+    '回顾一下这个报错',
+    '梳理一下当前需求',
+    '梳理一下这个模块的依赖',
+    '前面那个函数怎么改',
+    '前面这段逻辑有问题',
+    // ── 独立审查 M1：`我们/项目/方案/状态/整个` 不是历史专属宾语 ──
+    '回顾一下我们刚才改的代码',
+    '回顾一下我们现在的进度',
+    '回顾一下我们这次的改动',
+    '回顾一下项目结构',
+    '回顾一下整个流程',
+    '回顾一下方案A和方案B的差异',
+    // ── 独立审查 M2：`所有/整个` 不是历史专属宾语 ──
+    '梳理一下我们所有的接口',
+    '梳理一下所有依赖关系',
+    '梳理一下整个架构',
+    // ── 独立审查 M3：`前面 + 所有/那些/这些` 是当前代码定位 ──
+    '前面所有的函数都要加日志',
+    '前面那些函数都要改成 async',
+    '前面那些变量重命名一下',
+    '前面这些接口先别动',
+    // ── 第二轮复审 M-a：`回顾 + 之前/以前` 无法区分历史与当前 ──
+    '回顾一下之前改的那行代码',
+    '回顾一下之前的改动',
+    '回顾一下之前的代码风格',
+    '回顾一下以前的实现',
+    // ── 第二轮复审 M-b：`前面 + 的(工作/记录/讨论/方案)` 是当前代码名词 ──
+    '前面的工作目录改成绝对路径',
+    '前面的记录表加个索引',
+    '前面的讨论区样式调一下',
+    '前面的方案字段要加校验',
+    '前面提到的那个函数要加日志',
+    '前面聊到的那个 bug 复现一下',
+    '前面讨论的方案先别动',
+    // ── 第二轮复审 M-c：`历史` 作定语是当前任务 ──
+    '梳理一下历史数据迁移',
+    '梳理一下历史遗留的 TODO',
+    '回顾一下历史订单数据',
+    '回顾一下历史提交',
+    // ── 第三轮复审 major 1：`我们` 不构成消歧 ──
+    '回顾一下我们之前那个报错',
+    '回顾一下我们之前改的那行代码',
+    '回顾一下我们以前的实现',
+    '回顾一下我们整个流程',
+    '回顾一下我们所有接口',
+    // ── 第三轮复审 major 2：`前面` 单独出现是当前代码定位 ──
+    '梳理一下前面的逻辑',
+    '梳理一下前面那段代码',
+    '梳理一下我们前面写的接口',
+    '梳理一下我们前面提到的那个函数',
+    // ── 第四轮复审 major 1：`所有/整个` 也不消歧，必须带历史宾语 ──
+    '梳理一下我们前面所有的接口',
+    '回顾一下我们前面所有的改动',
+    '回顾一下我们前面整个流程',
+    // ── 第四轮复审 major 2：`历史记录表/字段/索引` 是数据库对象 ──
+    '查一下历史记录表有没有这个字段',
+    '回顾一下历史记录表的结构，加个索引',
+  ];
+  for (const text of negatives) {
+    check(`不命中：${text}`, isHistoryQuery(text) === false, text);
+  }
+
+  // 口语化说法必须命中（minor 7）
+  //
+  // ⚠ `按老规矩来` / `照旧处理` 已移出：它们是**续接指令**，不是问历史
+  // （第四轮审查 critical 1）。它们现在落在弱信号里，必须带疑问标记才命中。
+  const colloquial = [
+    '前面说过要 8pt',
+    // 复审 major 4 补的漏触发
+    '当时用的什么库',
+    '你记得我们用的什么吗',
+    '之前不是说过吗',
+    '之前提过这个方案',
+    '之前聊过这个',
+  ];
+  for (const text of colloquial) {
+    check(`命中（口语）：${text}`, isHistoryQuery(text) === true, text);
+  }
+
+  // 边界：空串 / 纯空白
+  check('空串不命中', isHistoryQuery('') === false);
+  check('纯空白不命中', isHistoryQuery('   ') === false);
+}
+
+// ── 10) 碎片过滤（2026-11-19 六钥匙裁决）──
+//
+// ## 为什么需要
+//
+// 实测 dsh 项目 2217 条记忆里 2037 条（92%）是未折叠碎片。它们不会
+// 「灌满」上下文（注入只取 2 条），但会**挤占 top2 槽位** ——
+// 一条 8 字的「改成实心的裂痕」排到第 1，就把真正有用的纪要挤掉了。
+//
+// ## 为什么判据是「悬空词开头」而不是长度
+//
+// 长度会误伤：`用户偏好纸质拼贴风格，不要渐变`（16 字）完整且高价值。
+// 区别在**有没有主语**，而「以改成/先/再/但开头」是主语缺失的可靠特征。
+console.log('\n=== 10) 碎片过滤 ===');
+{
+  const opts = normalizeRecallOptions({ maxItems: 2, minRawScore: 0, minScore: 0 });
+
+  // 悬空词开头 ⇒ 挡
+  const frag = formatRecallInjection([memRaw('a', '[决策] 改成实心的裂痕', 0.032)], opts);
+  check('「改成…」残句不注入', frag === '', frag);
+
+  // 完整短句 ⇒ 放行（长度不是判据）
+  const shortOk = formatRecallInjection(
+    [memRaw('b', '用户偏好纸质拼贴风格，不要渐变', 0.032)],
+    opts,
+  );
+  check('16 字完整短句放行', shortOk.includes('纸质拼贴'), shortOk);
+
+  // 长记忆 ⇒ 放行
+  const long = formatRecallInjection(
+    [
+      memRaw(
+        'c',
+        '[结论] 宿主已于 11:30:55 重启，这次重启发生在 dist 更新之后，因此修复已实际生效',
+        0.032,
+      ),
+    ],
+    opts,
+  );
+  check('长记忆正常注入', long.includes('宿主已于'), long);
+
+  // 同一个残句，只改 importance：9 放行 / 8 挡
+  //
+  // ⚠ 必须用**同一个**残句做对照（独立审查 major 1）：
+  // 之前用「以后所有图标…」测豁免，但它剥前缀后本就不匹配悬空词，
+  // 删掉豁免分支测试仍 PASS —— 那是恒真的假测试。
+  const fragText = '[决策] 改成实心的裂痕';
+  const exempt = formatRecallInjection(
+    [{ ...memRaw('d', fragText, 0.032), importance: 9 }],
+    opts,
+  );
+  check('同一残句 importance=9 放行', exempt.includes('实心的裂痕'), exempt);
+  const notExempt = formatRecallInjection(
+    [{ ...memRaw('e', fragText, 0.032), importance: 8 }],
+    opts,
+  );
+  check('同一残句 importance=8 挡', notExempt === '', notExempt);
+
+  // 宽口径会误伤的完整句 ⇒ 必须放行（窄口径的守卫）
+  const complete = formatRecallInjection(
+    [memRaw('e2', '[结论] 先确认宿主如何处理 assistant/message', 0.032)],
+    opts,
+  );
+  check('「先确认…」完整句放行', complete.includes('先确认'), complete);
+
+  // 只剩类型前缀、没有正文 ⇒ 挡（否则会注入一行 `- [决策]`）
+  check(
+    '只有类型前缀不注入',
+    formatRecallInjection([memRaw('e3', '[决策]', 0.032)], opts) === '',
+  );
+
+  // 关闭过滤 ⇒ 残句也放行（可回滚）
+  const off = normalizeRecallOptions({
+    maxItems: 2,
+    minRawScore: 0,
+    minScore: 0,
+    fragmentPrefixes: '',
+  });
+  check(
+    'fragmentPrefixes 为空时关闭过滤',
+    formatRecallInjection([memRaw('f', '[决策] 改成实心的裂痕', 0.032)], off) !== '',
+  );
+
+  // 混合批次：残句被剔除后，完整记忆仍能占满槽位
+  const mixed = formatRecallInjection(
+    [
+      memRaw('g', '[决策] 改成实心的裂痕', 0.032),
+      memRaw('h', '[决策] 只保留框架和两根贴边竖栏', 0.031),
+      memRaw('i', '[结论] 临时库隔离生效，58 项中 57 项通过，只剩「有围观话术」这一项失败', 0.030),
+    ],
+    opts,
+  );
+  check('混合批次只留完整记忆', mixed.includes('临时库隔离') && !mixed.includes('实心的裂痕'), mixed);
+
+  // 归一化
+  check(
+    'fragmentPrefixes 非字符串落默认',
+    normalizeRecallOptions({ fragmentPrefixes: 123 }).fragmentPrefixes ===
+      DEFAULT_RECALL_INJECTION.fragmentPrefixes,
+  );
+  // null 是「显式关闭」，不是「落默认」（独立审查 minor）
+  check('fragmentPrefixes=null 视为关闭', normalizeRecallOptions({ fragmentPrefixes: null }).fragmentPrefixes === '');
+  // 空白串 / 漏写 `^` 都必须落默认，否则会静默全挡（独立审查 major 2）
+  check(
+    'fragmentPrefixes 空白串落默认',
+    normalizeRecallOptions({ fragmentPrefixes: '   ' }).fragmentPrefixes ===
+      DEFAULT_RECALL_INJECTION.fragmentPrefixes,
+  );
+  check(
+    'fragmentPrefixes 漏写 ^ 落默认',
+    normalizeRecallOptions({ fragmentPrefixes: '改成' }).fragmentPrefixes ===
+      DEFAULT_RECALL_INJECTION.fragmentPrefixes,
+  );
+  check(
+    'fragmentExemptImportance 夹到 10',
+    normalizeRecallOptions({ fragmentExemptImportance: 99 }).fragmentExemptImportance === 10,
+  );
+  check(
+    'fragmentExemptImportance 负数归 0',
+    normalizeRecallOptions({ fragmentExemptImportance: -3 }).fragmentExemptImportance === 0,
+  );
+  // 写错正则时放行而不是全挡
+  check(
+    '非法正则不炸且放行',
+    formatRecallInjection(
+      [memRaw('j', '[决策] 改成实心的裂痕', 0.032)],
+      normalizeRecallOptions({ maxItems: 2, minRawScore: 0, minScore: 0, fragmentPrefixes: '^([' }),
+    ) !== '',
+  );
+
+  // ## 剔除碎片后重算相对分（独立审查 major 3）
+  //
+  // top1 是碎片（raw 0.032），top2 是完整记忆（raw 0.016，相对分 0.5）。
+  // 不重算 ⇒ top2 被 minScore 0.85 挡掉 ⇒ 槽位空着。
+  // 重算后 top2 成为存活项里的 top1（相对分 1.0）⇒ 正常注入。
+  const rescored = formatRecallInjection(
+    [
+      memRaw('k', '[决策] 改成实心的裂痕', 0.032, 1.0),
+      memRaw('l', '[结论] 临时库隔离生效，58 项中 57 项通过，只剩「有围观话术」这一项失败', 0.016, 0.5),
+    ],
+    normalizeRecallOptions({ maxItems: 2, minRawScore: 0, minScore: 0.85 }),
+  );
+  check('碎片被剔除后，次强记忆仍能注入', rescored.includes('临时库隔离'), rescored);
+
+  // ## 无过滤时**不得**重算（复审建议）
+  //
+  // LRC 有「近重复折叠」，可能把原 top1 折掉，此时返回首项 norm 本就 <1。
+  // 无条件重算会把它抬到 1.0，让原本 0.8 的次项越过 0.85 —— 与 minScore 语义相反。
+  const noFilter = formatRecallInjection(
+    [
+      memRaw('m', '[结论] 完整记忆 A，长度足够长可以独立理解，不会被碎片判据挡住', 0.032, 0.8),
+      memRaw('n', '[结论] 完整记忆 B，长度足够长可以独立理解，不会被碎片判据挡住', 0.016, 0.5),
+    ],
+    normalizeRecallOptions({ maxItems: 2, minRawScore: 0, minScore: 0.85 }),
+  );
+  check('无过滤时不重算相对分（0.8 仍被 0.85 挡）', noFilter === '', noFilter);
 }
 
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);

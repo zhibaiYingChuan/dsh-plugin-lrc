@@ -176,7 +176,18 @@ function check(name: string, condition: boolean, detail?: unknown): void {
 try {
   const client = new LrcClient({ baseUrl });
   const cursors = new CursorStore(cursorPath);
-  const offloader = new Offloader(client, cursors, { project: 'demo' });
+  // ## 这里**必须关闭折叠**（2026-11-17）
+  //
+  // 本文件的验收标准 2/3 测的是「LRC 侧语义合并」这条契约：
+  // 反复 migrate 同一批复述，库内总数不得增长。
+  //
+  // 折叠开启时 `offload()` 不再直接写库，而是把这批 Fact 转交轮末桶
+  // （见 offloader 里 `deferred` 的注释），于是 `merged` 恒为 0、`total` 不增长，
+  // 验收标准 2/3 会**测不到目标对象**（它们变成了在测「没写库」）。
+  //
+  // 关掉折叠后走的正是 `foldEnabled=false` 这条回滚路径 ——
+  // 也正是 fold.ts 承诺的「关闭后行为与引入折叠前逐字一致」。
+  const offloader = new Offloader(client, cursors, { project: 'demo', foldEnabled: false });
 
   // 第 1 轮：40 行，含 6 条结论
   const round1: string[] = [];

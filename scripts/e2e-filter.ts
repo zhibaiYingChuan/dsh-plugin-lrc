@@ -224,13 +224,26 @@ if (address === null || typeof address === 'string') throw new Error('无法获�
 const baseUrl = `http://127.0.0.1:${address.port}`;
 const workDir = mkdtempSync(join(tmpdir(), 'lrc-filter-'));
 
+/**
+ * 本文件的全部断言都在看 **migrate 实际收到了什么**
+ * （本地查重拦下 / migrate 抛错 / 围栏过滤 / 多消息标签提取）。
+ *
+ * ## 必须关闭折叠（2026-11-17）
+ *
+ * 折叠开启时 `offload()` 只把 Fact 转交轮末桶、不调 migrate，
+ * 上述断言全部失去观察对象（实测 10 项连锁失败）。
+ * 关闭折叠走的正是 `foldEnabled=false` 这条回滚路径，
+ * 也就是 fold.ts 承诺的「与引入折叠前逐字一致」的行为。
+ */
+const NO_FOLD = { project: 'demo', foldEnabled: false } as const;
+
 try {
   const client = new LrcClient({ baseUrl });
   const cursors = new CursorStore(join(workDir, 'cursor.json'));
 
   console.log('\n=== 4) 长任务：88 步只有 1 条正文 ===');
   {
-    const offloader = new Offloader(client, cursors, { project: 'demo', stepsThreshold: 20 });
+    const offloader = new Offloader(client, cursors, { ...NO_FOLD, stepsThreshold: 20 });
     for (let i = 0; i < 87; i += 1) offloader.observeStep();
     check('仅步数时 hasPending 为 true（步数兜底生效）', offloader.hasPending() === true);
     check('87 步已越过步数阈值', offloader.shouldOffload() === true);
@@ -252,7 +265,7 @@ try {
   }
 
   console.log('\n=== 5) turn/end 兜底：阈值未到但有待沉淀内容 ===');
-  const shared = new Offloader(client, cursors, { project: 'demo' });
+  const shared = new Offloader(client, cursors, NO_FOLD);
   {
     shared.observe('结论是：端口纪律 3099 正式、3111 测试。');
     check('单条正文未达阈值', shared.shouldOffload() === false);
@@ -271,7 +284,7 @@ try {
 
   console.log('\n=== 7) 失败不推进游标，下次可重试 ===');
   {
-    const offloader = new Offloader(client, cursors, { project: 'demo' });
+    const offloader = new Offloader(client, cursors, NO_FOLD);
     // 必须是**含谓词的完整陈述**：schema 之后「约束：…」这种人工前缀不再是
     // 语义载体，拆不出三元组就根本不会发 migrate，那这段测试也就测不到失败路径。
     const lines = ['端口纪律必须遵循 3099 正式、3111 测试的约定。'];
@@ -292,7 +305,7 @@ try {
 
   console.log('\n=== 8) 围栏代码在沉淀路径上被过滤 ===');
   {
-    const offloader = new Offloader(client, cursors, { project: 'demo' });
+    const offloader = new Offloader(client, cursors, NO_FOLD);
     const message = [
       '决定：围栏外的一句话，说明为什么这样做。',
       '```ts',
@@ -308,7 +321,7 @@ try {
 
   console.log('\n=== 9) 多消息各自带标签时都能提取 ===');
   {
-    const offloader = new Offloader(client, cursors, { project: 'demo' });
+    const offloader = new Offloader(client, cursors, NO_FOLD);
     const messages = [
       '第一轮回答\n<lrc_memory>决策：改用 pnpm 替代 npm</lrc_memory>',
       '第二轮回答\n<lrc_memory>约束：禁止连 3099 做测试</lrc_memory>',
@@ -322,7 +335,7 @@ try {
 
   console.log('\n=== 10) 标签路径与正文路径共用同一 schema ===');
   {
-    const offloader = new Offloader(client, cursors, { project: 'demo' });
+    const offloader = new Offloader(client, cursors, NO_FOLD);
     const message = [
       '本轮结论如下',
       '<lrc_memory>',
@@ -349,7 +362,7 @@ try {
 
   console.log('\n=== 11) 残句不得入库（schema 闸门） ===');
   {
-    const offloader = new Offloader(client, cursors, { project: 'demo' });
+    const offloader = new Offloader(client, cursors, NO_FOLD);
     const message = ['那我得确认两件事：git 的状态，以及 DSH 能不能起来。', '这必须用上。'].join('\n');
     lastMigrateItems = [];
     const result = await offloader.offload('session-residue', [message]);

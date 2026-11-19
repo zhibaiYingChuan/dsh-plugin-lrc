@@ -95,6 +95,29 @@ export interface MemoryFact {
    * 这类 Fact 仍可入库、可注入、可召回，只是不参与冲突判定。
    */
   enriched?: boolean;
+  /**
+   * 所在消息的主题（**上下文附加**，★2026-11-17）。
+   *
+   * ## 为什么需要它（真实数据决定）
+   *
+   * 实测 session-95eaf7e3（1578 条助手消息 / 266 条 Fact）：
+   * - **67.3% 的 Fact ≤ 20 字**，**69.5% 有上下文依赖特征**
+   * - 例：`[约束] 必须是 12 的倍数` —— 谁的 12 的倍数？脱离原文无从判断
+   *
+   * 同时实测否定了「按段落合并」这条路：含 ≥2 段落的消息仅 **5.6%**，
+   * markdown 标题仅 **0.7%** —— DSH 的正文几乎没有段落结构可依。
+   *
+   * 但 **99.2% 的消息有可用首句**。因此正确做法不是改切分单元，而是
+   * **给每条 Fact 附上它所在消息的主题**（业界称 contextual retrieval）。
+   *
+   * ## 为什么是可选字段
+   *
+   * 缺省时行为与引入本字段前**逐字一致**（statement / 去重 / 快照全不变）。
+   * `topic` 只用于：
+   * 1. 写入时落成 `topic:xxx` 标签（供按主题过滤）
+   * 2. 折叠摘要的标题（替代「本批 N 条：」）
+   */
+  topic?: string;
 }
 
 /** 类别 → 中文标签（写入 `[约束] …` 前缀）。 */
@@ -269,6 +292,13 @@ const PREDICATES: Record<Exclude<FactKind, 'location' | 'fact'>, readonly string
     '支持',
     '是',
   ],
+  /**
+   * 工件不走谓词表：它由 `makeArtifactFact` 直接从落盘元信息构造，
+   * 没有「从句子切前后两半」的过程。这里必须显式登记空表 ——
+   * `Record<Exclude<FactKind, 'location' | 'fact'>, …>` 要求每个键都在，
+   * 漏写会让 tsc 直接失败（这正是引入 tsc 想要的效果）。
+   */
+  artifact: [],
 };
 
 /**
@@ -524,8 +554,10 @@ function stripCommentMarker(text: string): string {
   return text.replace(COMMENT_MARKER, '');
 }
 
+type PredicateEntry = { kind: Exclude<FactKind, 'location' | 'fact'>; word: string };
+
 /** 所有谓词按长度降序（长词优先，避免 `不要` 抢走 `不要再使用`）。 */
-const ORDERED_PREDICATES: ReadonlyArray<{ kind: Exclude<FactKind, 'location' | 'fact'>; word: string }> = (
+const ORDERED_PREDICATES: ReadonlyArray<PredicateEntry> = (
   Object.entries(PREDICATES) as Array<[Exclude<FactKind, 'location' | 'fact'>, readonly string[]]>
 )
   .flatMap(([kind, words]) => words.map((word) => ({ kind, word })))
@@ -537,7 +569,7 @@ const ORDERED_PREDICATES: ReadonlyArray<{ kind: Exclude<FactKind, 'location' | '
  * 推理流经常是英文（工具密集型轮次尤其），只认中文谓词会把整轮内容漏掉。
  * 词表同样**有界**：只收能切出前后两半的连接型短语。
  */
-const ENGLISH_PREDICATES: ReadonlyArray<{ kind: Exclude<FactKind, 'location' | 'fact'>; word: string }> = [
+const ENGLISH_PREDICATES: ReadonlyArray<PredicateEntry> = ([
   { kind: 'constraint', word: 'must not' },
   { kind: 'constraint', word: 'should not' },
   { kind: 'constraint', word: 'do not' },
@@ -553,7 +585,7 @@ const ENGLISH_PREDICATES: ReadonlyArray<{ kind: Exclude<FactKind, 'location' | '
   { kind: 'conclusion', word: 'the conclusion is' },
   { kind: 'goal', word: 'at most' },
   { kind: 'goal', word: 'no more than' },
-].sort((a, b) => b.word.length - a.word.length);
+] satisfies PredicateEntry[]).sort((a, b) => b.word.length - a.word.length);
 
 /** 合并后的谓词表（中文优先：同长度时中文排在前面）。 */
 const ALL_PREDICATES = [...ORDERED_PREDICATES, ...ENGLISH_PREDICATES];
@@ -1670,6 +1702,69 @@ export function makeArtifactFact(input: {
 }
 
 /**
+ * 从一段消息正文里提取**主题**（供 Fact 的上下文附加用）。
+ *
+ * ## 为什么用「首句」而不是段落/标题（实测决定）
+ *
+ * 实测 session-95eaf7e3 的 1578 条助手正文：
+ * ```
+ * 含 ≥2 段落:   88 条（ 5.6%）   ← 段落几乎不存在
+ * 含 markdown 标题: 11 条（ 0.7%）   ← 标题几乎不存在
+ * 有可用首句:     1566 条（99.2%）   ← 首句几乎总在
+ * ```
+ * DSH 的助手正文是「长段落 + 列表」的形态，没有稳定的结构锚点。
+ * 首句是唯一覆盖率足够（99.2%）的锚点。
+ *
+ * ## 首句不是主题怎么办
+ *
+ * 实测首句质量尚可（`像素感这次是真的出来了`、`现状已经查清`、
+ * `剩下还有一件事需要你来决定`）。它们确实是**这一段在讲什么**。
+ * 少数以寒暄或标签开头的（`做完了`）会被裁短后仍可用 ——
+ * 它至少限定「这是关于『做完了』那一轮」。
+ *
+ * ## 边界
+ *
+ * - 剥离 markdown 标记（`#`、`>`、`-`、`*`、行内 code 反引号）
+ * - 去掉代码围栏块（``` 内的行不是主题）
+ * - 长度上限 [`TOPIC_MAX_CHARS`]，超出截断
+ * - 空/纯符号返回 `undefined`（调用方据此不附加 topic）
+ */
+export const TOPIC_MAX_CHARS = 40;
+
+export function extractTopic(text: string): string | undefined {
+  // 跳过代码围栏：围栏里的首行往往是 `const x = ...`，不是主题
+  const lines: string[] = [];
+  let inFence = false;
+  for (const raw of text.split('\n')) {
+    if (raw.trim().startsWith('```')) {
+      inFence = !inFence;
+      continue;
+    }
+    if (!inFence) lines.push(raw);
+  }
+  const body = lines.join('\n');
+
+  // 优先取 markdown 标题（罕见但质量最高）
+  const heading = /^#{1,6}\s+(.+)$/m.exec(body);
+  const candidate =
+    heading?.[1] ??
+    // 否则取第一句：截到第一个句末标点或换行
+    /^[^。！？\n]+/.exec(body.replace(/^[#>\-*+\s]+/gm, '').trim())?.[0];
+
+  if (candidate === undefined) return undefined;
+  const flat = candidate
+    .replace(/`([^`]*)`/g, '$1') // 行内 code 去反引号
+    .replace(/\*\*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (flat.length < 4) return undefined;
+  const chars = Array.from(flat);
+  return chars.length > TOPIC_MAX_CHARS
+    ? `${chars.slice(0, TOPIC_MAX_CHARS).join('')}…`
+    : flat;
+}
+
+/**
  * 由一句陈述构造 MemoryFact（**不做校验**，校验交给 `validateFact`）。
  *
  * 拆不出三元组时返回 `null` —— 调用方据此丢弃，不需要额外的长度门槛。
@@ -1864,19 +1959,79 @@ export interface MemoryItem {
  * `scope:session` 用于**审计与后续过滤**：临时参数（`这次不超过 5 秒`）
  * 不该被当作跨会话偏好反复召回。标签是当前唯一可承载它的通道。
  *
+ * ## 为什么 topic 也写进 tags（★2026-11-17）
+ *
+ * 实测 67.3% 的 Fact ≤ 20 字、69.5% 有上下文依赖特征 ——
+ * `[约束] 必须是 12 的倍数` 脱离原文无法理解。
+ * 把 topic 落成 `topic:xxx` 标签后：
+ * 1. 召回时能按主题过滤（`tags: ["topic:图标尺寸"]`）
+ * 2. 人看库时能看出这条属于哪件事
+ * 3. 不改 `content` ⇒ 去重 / 冲突判定 / 自足性校验全部不受影响
+ *
  * ## 为什么不再有「无前缀条目」
  *
  * 旧路径会把原文片段直接入库。现在每条都必须是三元组拆解成功的 Fact，
  * 因此 `content` 一定带类别前缀 —— 没有前缀就意味着有人绕过了 schema。
  */
 export function factsToItems(facts: readonly MemoryFact[]): MemoryItem[] {
-  return facts.map((fact) => ({
+  return facts.map((fact) =>
+    factToItem(
+      fact,
+      [fact.kind, 'distilled', 'lrc_schema', `scope:${fact.scope}`],
+      importanceOf(fact),
+    ),
+  );
+}
+
+/**
+ * topic → 标签数组（缺省返回空数组，调用方可直接展开）。
+ *
+ * 标签里不允许换行与过长内容：LRC 的 tags 会被前端渲染成 chip，
+ * 一个 40 字的 chip 会把界面撑坏。
+ *
+ * ## 与 `extractTopic` 的关系（消除两处截断分歧）
+ *
+ * `extractTopic` 已把 topic 限到 [`TOPIC_MAX_CHARS`]（超出时截断 + `…`）。
+ * 本函数**不再重新截断**，只做空白归一 —— 否则同一个 topic 在
+ * `fact.topic`（41 字带省略号）与标签（40 字无省略号）里长度不一致，
+ * 按标签反查会失败。这里只兜「调用方绕过 extractTopic 直接塞超长值」兜底。
+ */
+export function topicTags(topic: string | undefined): string[] {
+  if (topic === undefined) return [];
+  const flat = topic.replace(/\s+/g, ' ').trim();
+  if (flat.length === 0) return [];
+  // 兜底截断（正常路径不会触发：extractTopic 已截过）
+  const chars = Array.from(flat);
+  if (chars.length > TOPIC_MAX_CHARS + 1) {
+    return [`topic:${chars.slice(0, TOPIC_MAX_CHARS).join('')}`];
+  }
+  return [`topic:${flat}`];
+}
+
+/**
+ * Fact → LRC 条目的**唯一实现**（`factsToItems` 与折叠路径共用）。
+ *
+ * ## 为什么收成一个函数（2026-11-17 审查修出的 minor）
+ *
+ * 旧实现里 `factsToItems` 与 `factToItem` 各写一遍
+ * `content` / `memory_type` / `source_turns` / `origin`，只靠注释维持同步 ——
+ * 实测已经漂移：折叠条目缺 `scope:` 标签，于是「按 scope 过滤」对
+ * 折叠摘要整体失效。收成一个基座后，字段口径**结构上不可能不一致**。
+ *
+ * @param baseTags - 调用方给的标签（不含 `topic:`，本函数会自动补）
+ */
+export function factToItem(
+  fact: MemoryFact,
+  baseTags: readonly string[],
+  importance: number,
+): MemoryItem {
+  return {
     content: renderFact(fact),
     memory_type: MEMORY_TYPE[fact.kind],
-    tags: [fact.kind, 'distilled', 'lrc_schema', `scope:${fact.scope}`],
-    importance: importanceOf(fact),
+    tags: [...baseTags, ...topicTags(fact.topic)],
+    importance,
     source_turns: [fact.source.turn ?? 0, fact.source.turn ?? 0],
     origin: fact.origin,
-  }));
+  };
 }
 

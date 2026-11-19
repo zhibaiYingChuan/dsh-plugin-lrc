@@ -36,8 +36,15 @@ import {
 } from './memory-extract.ts';
 import {
   factsToItems,
+  factToItem,
   type MemoryFact,
 } from './memory-schema.ts';
+import {
+  foldFacts,
+  foldTags,
+  FOLD_MAX_CHARS,
+  FOLD_MIN_FACTS_DEFAULT,
+} from './fold.ts';
 
 export interface OffloadConfig {
   /** 累计多少轮触发一次卸载 */
@@ -56,6 +63,17 @@ export interface OffloadConfig {
   dedupThreshold: number;
   /** 查重时回看多少条已发送的块 */
   recentWindow: number;
+  /**
+   * 同批折叠开启（默认 true）。
+   *
+   * 关闭后行为与本模块引入折叠前**逐字一致**（每条 Fact 独立入库）——
+   * 用于对照实验与回滚。
+   */
+  foldEnabled: boolean;
+  /** 低于此条数不折叠（默认 [`FOLD_MIN_FACTS_DEFAULT`]） */
+  foldMinFacts: number;
+  /** 折叠摘要字符上限（默认 [`FOLD_MAX_CHARS`]） */
+  foldMaxChars: number;
 }
 
 export const DEFAULT_OFFLOAD_CONFIG: OffloadConfig = {
@@ -67,6 +85,9 @@ export const DEFAULT_OFFLOAD_CONFIG: OffloadConfig = {
   snapshotItems: 3,
   dedupThreshold: DEFAULT_DEDUP_THRESHOLD,
   recentWindow: 50,
+  foldEnabled: true,
+  foldMinFacts: FOLD_MIN_FACTS_DEFAULT,
+  foldMaxChars: FOLD_MAX_CHARS,
 };
 
 export interface OffloadResult {
@@ -80,6 +101,17 @@ export interface OffloadResult {
   merged: number;
   /** 被本地查重丢弃的条数 */
   deduped: number;
+  /** 折叠摘要覆盖的原始条数（0 = 本次未折叠） */
+  folded?: number;
+  /**
+   * 本次**转交轮末暂存**、尚未写库的条数（0/undefined = 未转交）。
+   *
+   * 折叠开启时 `offload()` 不再直接写库，而是把这批 Fact 交给
+   * [`Self::flushTurn`] 与同轮其它 Fact 一起折叠。此时 `written` 为 0，
+   * 但内容**没有丢** —— 只是延后到轮末。调用方据此区分
+   * 「真的没写」与「延后写」。
+   */
+  deferred?: number;
   /** 注入下一轮的状态快照（1~3 行） */
   snapshot: string;
   /** 游标是否因 transcript 重写而失效 */
@@ -96,6 +128,10 @@ export interface OffloadStats {
   lastFlushWritten: number;
   lastFlushMerged: number;
   recentWindow: number;
+  /** 累计被折叠覆盖的原始 Fact 条数 */
+  totalFolded: number;
+  /** 累计产出批次摘要条数（`totalFolded / totalFlushes` 即平均压缩比） */
+  foldBatches: number;
 }
 
 /** 快照优先级（0 最高）。 */
@@ -301,6 +337,8 @@ export class Offloader {
   private lastFlushAt = 0;
   private lastFlushWritten = 0;
   private lastFlushMerged = 0;
+  private totalFolded = 0;
+  private foldBatches = 0;
 
   constructor(
     client: LrcClient | null,
@@ -458,11 +496,17 @@ export class Offloader {
       lastFlushWritten: this.lastFlushWritten,
       lastFlushMerged: this.lastFlushMerged,
       recentWindow: this.recent.length,
+      totalFolded: this.totalFolded,
+      foldBatches: this.foldBatches,
     };
   }
 
   private record(result: OffloadResult): void {
     this.totalDeduped += result.deduped;
+    if (result.folded !== undefined && result.folded > 0) {
+      this.totalFolded += result.folded;
+      this.foldBatches += 1;
+    }
     if (result.written === 0 && result.merged === 0) return;
     this.flushCount += 1;
     this.totalWritten += result.written;
@@ -470,6 +514,37 @@ export class Offloader {
     this.lastFlushAt = Date.now();
     this.lastFlushWritten = result.written;
     this.lastFlushMerged = result.merged;
+  }
+
+  /**
+   * 把一批已查重的 Fact 转成待写入条目 —— **写入前先做同批折叠**。
+   *
+   * ## 为什么折叠只在写入侧
+   *
+   * 快照（注入下一轮的那 1~3 行）仍用**原始 Fact**：它服务的是
+   * 「本会话当前的约束/位置」，需要具体到「音频在 D:\Desktop」这种粒度；
+   * 批次摘要只适合存进 LRC 供日后 recall。两个消费者需求相反，
+   * 因此折叠只作用于 `migrate` 的入参，不改快照。
+   *
+   * ## 为什么条数不足时原样返回
+   *
+   * `foldFacts` 在条数 < `foldMinFacts` 时返回 `null`，这里退回逐条映射，
+   * 行为与本模块引入折叠前**逐字一致**。
+   *
+   * @returns `items` 待写入条目；`folded` 折叠覆盖的原始条数（0 = 未折叠）
+   */
+  private toItems(facts: readonly MemoryFact[]): { items: DistilledItem[]; folded: number } {
+    if (this.config.foldEnabled) {
+      const batch = foldFacts(facts, {
+        minFacts: this.config.foldMinFacts,
+        maxChars: this.config.foldMaxChars,
+      });
+      if (batch !== null) {
+        const item = factToItem(batch.fact, foldTags(batch), batch.importance);
+        return { items: [item as DistilledItem], folded: batch.covered };
+      }
+    }
+    return { items: factsToItems(facts) as DistilledItem[], folded: 0 };
   }
 
   /**
@@ -543,7 +618,44 @@ export class Offloader {
       return empty;
     }
 
-    const migrated = await this.requireClient().migrate(factsToItems(kept) as DistilledItem[], this.config.project);
+    // ## 折叠开启时，**不得在这里直接写库**（2026-11-17 实测新会话发现）
+    //
+    // `flush()` 在 turn/end 会调到这里，而它每次只处理**游标之后的新增片段** ——
+    // 一个 step 往往只有 1~2 条 Fact，凑不满 `foldMinFacts`（4 条），
+    // 于是 `toItems` 退化为逐条写入。实测新会话 20:37~20:40：
+    // ```
+    // 9 条互不相关的短句直接入库（`像素画的动感只能靠逐帧切换` 18 字）
+    // 而此前 flushTurn 的折叠摘要已经写过 ⇒ 折叠路径是通的，是这条绕过了它
+    // ```
+    // 修法：折叠开启时把结果交给**轮末桶**，与正文抽取的 Fact 汇成一批。
+    // 游标照常推进 —— 这些 Fact 已被 `turnFacts` 接住，不会丢。
+    if (this.config.foldEnabled && kept.length > 0) {
+      this.accumulate(kept);
+      this.commitCursor(sessionId, plain, slice.fromLine);
+      // ## 不 push `recent`（2026-11-17 实测发现）
+      //
+      // `recent` 的用途是「防止**已写库**内容被换措辞重复写入」。
+      // 这批还只在内存桶里、尚未写库，若推进 `recent`，轮末 `flushTurn`
+      // → `offloadFacts` 会用它去重 ⇒ **转交的这批判为重复、凭空少掉**
+      // （实测：4 条桶收口后只剩 3 条，foldMinFacts 不够 ⇒ 退化为逐条）。
+      // 重复抽取由**游标已推进**挡住，不需要 recent 兜底。
+      const deferred: OffloadResult = {
+        charsSent,
+        distilled: kept.length,
+        written: 0,
+        merged: 0,
+        deduped,
+        folded: 0,
+        deferred: kept.length,
+        snapshot: this.buildPooledSnapshot(kept, epoch),
+        reset: slice.reset,
+      };
+      this.record(deferred);
+      return deferred;
+    }
+
+    const { items, folded } = this.toItems(kept);
+    const migrated = await this.requireClient().migrate(items, this.config.project);
     // **只有 migrate 成功才推进游标**（见方法尾部注释）
     this.commitCursor(sessionId, plain, slice.fromLine);
     this.recent.push(...kept.map((f) => f.statement));
@@ -558,6 +670,7 @@ export class Offloader {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
+      folded,
       snapshot: this.buildPooledSnapshot(kept, epoch),
       reset: slice.reset,
     };
@@ -566,7 +679,138 @@ export class Offloader {
   }
 
   /**
-   * 直接沉淀一批已提取的记忆（**不走行游标**）。
+   * 本轮累积器（按**轮次**为边界，不是按条数）。
+   *
+   * ## 为什么边界是「轮」而不是「N 条」
+   *
+   * 折叠的主旨是让「一批」成为**语义批次**。`assistant/message` 是逐条触发的，
+   * 若每条都立即写库，实测按分钟切分时 **845/993 批不足 4 条**
+   * （其中 448 批只有 1 条）—— 折叠只在约 36% 的事实上生效。
+   *
+   * 而一轮对话（5~15 分钟）天然把「同一次排查/同一件事」圈在一起：
+   * 实测按 5/10/60 分钟窗，折叠覆盖的事实占比分别为
+   * **71.8% / 87.4% / 99.0%**。
+   *
+   * ## 为什么**不**按 topic 再分桶（实测否决）
+   *
+   * 曾按 `轮 × topic` 分桶，想避免「整轮摘要被标成第一条消息的主题」。
+   * 实测该 session（42 轮 / 238 条有产出的消息 / 266 条 Fact）：
+   * ```
+   * 分桶数 238，其中能折叠（≥4 条）的只有 2 个
+   * ⇒ 条数 266 → 260（97.7%），折叠等于没做
+   * ```
+   * 根因：平均每条消息只产 1.1 条 Fact，topic 几乎等于消息唯一标识，
+   * 按 topic 分桶**退化为按消息分桶**，折叠永远凑不满。
+   *
+   * 正确做法是：仍按轮分桶，但在**摘要正文里逐条保留各自的主题**
+   * （见 `foldFacts` 的 topic 处理），让主题信息不丢，同时保住折叠率。
+   *
+   * ## 与「攒 8 条」的区别
+   *
+   * 8 是魔法数字 —— 它既不对应任何语义边界，又会让某些轮次不触发、
+   * 某些轮次提前触发。轮次是宿主已有的真实边界。
+   */
+  private turnFacts = new Map<string, MemoryFact[]>();
+
+  /**
+   * 把 Fact **暂存到本轮**（不落库），等 [`Self::flushTurn`] 统一折叠写入。
+   *
+   * ## 调用方必须保证「轮末一定冲刷」
+   *
+   * 暂存意味着数据只在内存里。调用方要在这三个时机冲刷：
+   * 1. `turn/end`
+   * 2. **下一次 `turn/start`**（用户中止上一轮时走不到 turn/end ——
+   *    实测 turn 2/3 都是 aborted by user）
+   * 3. 切换会话（旧会话不会再收到 turn/end）
+   *
+   * @returns 当前暂存总条数（便于调用方判断是否触达上限）
+   */
+  accumulate(facts: readonly MemoryFact[]): number {
+    if (facts.length === 0) return 0;
+    for (const fact of facts) {
+      const owner = fact.source.sessionId ?? '';
+      const list = this.turnFacts.get(owner) ?? [];
+      list.push(fact);
+      this.turnFacts.set(owner, list);
+    }
+    return this.turnPending();
+  }
+
+  /** 本轮已暂存但未写库的条数（`lrc_status` 用）。 */
+  turnPending(owner?: string): number {
+    if (owner !== undefined) return this.turnFacts.get(owner)?.length ?? 0;
+    let total = 0;
+    for (const list of this.turnFacts.values()) total += list.length;
+    return total;
+  }
+
+  /**
+   * 冲刷本轮暂存的 Fact（**折叠后一次写库**）。
+   *
+   * @param owner - 只冲刷该会话的桶；缺省冲刷全部
+   * @param options.intoPool - 是否并入快照池。**切会话后补写旧会话时必须传
+   *   `false`** —— 与 `offloadFacts` 同口径：那时池子已属于新会话，
+   *   把旧会话的约束推进去会让新会话下一次注入出现「B 的约束；A 私有：…」。
+   * @returns 合并后的写入结果；无暂存时返回零值结果
+   */
+  async flushTurn(
+    owner?: string,
+    options: { intoPool?: boolean } = {},
+  ): Promise<OffloadResult> {
+    const empty: OffloadResult = {
+      charsSent: 0,
+      distilled: 0,
+      written: 0,
+      merged: 0,
+      deduped: 0,
+      folded: 0,
+      snapshot: '',
+      reset: false,
+    };
+    // ## 桶键就是会话 ID（按轮累积，不按 topic 再分）
+    const keys = owner === undefined ? [...this.turnFacts.keys()] : [owner];
+    // ## 先取走再写，但**写失败必须回桶**（2026-11-17 独立审查修出的 critical）
+    //
+    // 旧实现删桶后 `await offloadFacts(batch)` 一旦抛错（migrate 超时/503/
+    // LRC 重启），这批 Fact 已从 Map 移除，调用方只 `logger.warn` ⇒
+    // **数据永久丢失**。这与项目红线「宁重不漏」直接冲突
+    // （历史事故：LRC 桌面端晚起 20 分钟导致约束永久丢失）。
+    //
+    // 修法：每个桶独立 try/catch，失败时把 batch **放回桶头**并继续下一个桶。
+    // 重复写入的代价可接受 —— LRC 的 migrate 是幂等的（相似度命中即合并），
+    // 且 `recent` 窗口会挡掉同一批的重复。
+    const results: OffloadResult[] = [];
+    for (const key of keys) {
+      const list = this.turnFacts.get(key);
+      if (list === undefined || list.length === 0) continue;
+      this.turnFacts.delete(key);
+      try {
+        results.push(await this.offloadFacts(list, options));
+      } catch (error) {
+        // 放回桶头（保持原有先后顺序：这批比后来的更新，但也比未来的旧）
+        const current = this.turnFacts.get(key) ?? [];
+        this.turnFacts.set(key, [...list, ...current]);
+        // 继续处理其它桶：一个会话失败不该阻塞别的会话
+        continue;
+      }
+    }
+    if (results.length === 0) return empty;
+
+    return {
+      charsSent: results.reduce((s, r) => s + r.charsSent, 0),
+      distilled: results.reduce((s, r) => s + r.distilled, 0),
+      written: results.reduce((s, r) => s + r.written, 0),
+      merged: results.reduce((s, r) => s + r.merged, 0),
+      deduped: results.reduce((s, r) => s + r.deduped, 0),
+      folded: results.reduce((s, r) => s + (r.folded ?? 0), 0),
+      // 多桶时取最后一个非空快照（最新状态）
+      snapshot: [...results].reverse().find((r) => r.snapshot.length > 0)?.snapshot ?? '',
+      reset: false,
+    };
+  }
+
+  /**
+   * 直接沉淀一批已提取的记忆（**立即写库，不走轮内累积**）。
    *
    * 用于推理兜底与 LLM 补全：这些内容不在 transcript 行流里，
    * 无法用行号游标追踪，只能按内容查重。
@@ -577,7 +821,7 @@ export class Offloader {
    */
   async offloadFacts(
     facts: readonly MemoryFact[],
-    options: { intoPool?: boolean } = {},
+    options: { intoPool?: boolean; deferToTurn?: boolean } = {},
   ): Promise<OffloadResult> {
     const epoch = this.poolEpoch;
     const { fresh, dropped } = dedupeFacts(facts, [], (a, b) =>
@@ -600,6 +844,7 @@ export class Offloader {
         written: 0,
         merged: 0,
         deduped,
+        folded: 0,
         snapshot: '',
         reset: false,
       };
@@ -607,7 +852,33 @@ export class Offloader {
       return empty;
     }
 
-    const migrated = await this.requireClient().migrate(factsToItems(kept) as DistilledItem[], this.config.project);
+    // ## 延后到轮末（2026-11-17 实测新会话发现）
+    //
+    // 推理兜底 / LLM 兜底 / 切会话补写这几条路径的产物**不在 transcript 行流里**，
+    // 各自只有 1~3 条，单独走折叠永远凑不满 `foldMinFacts` ⇒ 逐条碎片入库。
+    // 实测新会话 20:37~20:40 写入的 9 条全是这种形态。
+    // 调用方传 `deferToTurn: true` 时先入桶，等 `flushTurn` 与本轮其它 Fact 一起折叠。
+    if (options.deferToTurn === true && this.config.foldEnabled) {
+      this.accumulate(kept);
+      // 同样**不 push recent**：这批尚未写库，推进 recent 会让轮末收口
+      // 把自己判成重复（见 `offload()` 同名分支的注释）。
+      const deferred: OffloadResult = {
+        charsSent: kept.reduce((sum, f) => sum + f.statement.length, 0),
+        distilled: kept.length,
+        written: 0,
+        merged: 0,
+        deduped,
+        folded: 0,
+        deferred: kept.length,
+        snapshot: options.intoPool === false ? '' : this.buildPooledSnapshot(kept, epoch),
+        reset: false,
+      };
+      this.record(deferred);
+      return deferred;
+    }
+
+    const { items, folded } = this.toItems(kept);
+    const migrated = await this.requireClient().migrate(items, this.config.project);
     this.recent.push(...kept.map((f) => f.statement));
     if (this.recent.length > this.config.recentWindow) {
       this.recent = this.recent.slice(-this.config.recentWindow);
@@ -620,6 +891,7 @@ export class Offloader {
       written: migrated.written,
       merged: migrated.merged,
       deduped,
+      folded,
       snapshot: options.intoPool === false ? '' : this.buildPooledSnapshot(kept, epoch),
       reset: false,
     };

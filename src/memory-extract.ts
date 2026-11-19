@@ -35,9 +35,9 @@
  * 拆不出来就不是记忆 —— 不需要长度门槛，也不需要黑名单。
  */
 import {
-  deriveClaim,
   deriveLocation,
   deriveRebuttal,
+  extractTopic,
   isProcessNarration,
   isSelfContained,
   makeFact,
@@ -354,6 +354,37 @@ export function extractFacts(input: ExtractInput): ExtractResult {
     facts.push(fact);
   }
 
+  // ── 统一附加消息主题（★2026-11-17，contextual enrichment）──
+  //
+  // ## 为什么放在**出口**而不是每条 makeFact 调用处
+  //
+  // 本函数有四条抽取分支（标签 / 资源位置 / 正文逐句 / 用户纠正），
+  // 逐处传参必然漏 —— 而漏掉的那一支产出的 Fact 就会缺 topic，
+  // 表现为「同一个函数产出的记忆质量不一致」，极难排查。
+  //
+  // ## 为什么不改 statement
+  //
+  // statement 参与去重（`areNearDuplicate`）、冲突判定（`factKey`）、
+  // 自足性校验与快照渲染。往里塞 topic 会让这四条全部失真：
+  // 两条不同主题的同义 Fact 会被判成重复。topic 必须是**旁路字段**。
+  //
+  // ## topic 只对**多句正文**有意义
+  //
+  // 用户消息通常一两句话，topic 就等于全文，附加无意义；标签支路
+  // 本身就是模型显式给的结论，也不缺上下文。因此只给 assistant 正文附加。
+  //
+  // ## 必须用**已清洗**的 `body`，不能用 `body0`（2026-11-17 审查修出的 major）
+  //
+  // `body0` 含 `<lrc_memory>…</lrc_memory>` 标签与代码围栏。实测：
+  // ```
+  // extractTopic('<lrc_memory>\n[约束] 必须是 12 的倍数') → '<lrc_memory>'
+  // ```
+  // 于是标签支路产出的 Fact 会被标成 `topic:<lrc_memory>`，折叠头也变成
+  // `【<lrc_memory>】` —— 一条纯噪声进库。`body` 已剥掉标签与围栏。
+  // 统一走 `attachTopic`：让「附加 topic」只有一处实现，
+  // 其它产生 Fact 的路径（LLM 兜底）也能复用同一判据。
+  if (input.origin === 'assistant') attachTopic(facts, body);
+
   return { facts, rejected, pending };
 }
 
@@ -409,6 +440,33 @@ export function factsFromLlmLines(
     facts.push(fact);
   }
   return { facts, rejected, pending: [] };
+}
+
+/**
+ * 给一批 Fact 补上**所在消息的主题**（上下文附加）。
+ *
+ * ## 为什么单独抽成函数（2026-11-17 实测发现）
+ *
+ * 改造时只在 `extractFacts` 的出口附加了 topic，于是**所有绕过它的路径**
+ * 都没有 topic —— 实测新会话里 LLM 兜底写出的 5 条：
+ * ```
+ * [事实] 现在的兽只有一个静止的点阵，外加一层 CSS 缩放淡入   ← 无 topic
+ * [结论] 像素画的动感只能靠逐帧切换                          ← 无 topic
+ * ```
+ * 这些正是「脱离原文就不知在说谁」的碎片。topic 缺失即上下文锚点缺失。
+ *
+ * 收成一个入口，让每条产生 Fact 的路径都调用它，不存在「补丁落在路径之外」。
+ *
+ * @param facts  - 待补 topic 的 Fact（原地修改）
+ * @param source - 这批 Fact 的来源正文（用**已清洗**的正文，不要传原始消息）
+ */
+export function attachTopic(facts: MemoryFact[], source: string | undefined): void {
+  if (source === undefined || source.length === 0) return;
+  const topic = extractTopic(source);
+  if (topic === undefined) return;
+  for (const fact of facts) {
+    if (fact.topic === undefined) fact.topic = topic;
+  }
 }
 
 /** 完整同句片段（含路径）用于查重键：避免路径被 mask 掉后相似度虚高。 */

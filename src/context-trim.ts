@@ -1513,11 +1513,7 @@ export function pruneToolCallArguments(deps: {
   log: (message: string) => void;
   options?: Partial<PruneArgsOptions>;
 }): PruneOutcome {
-  const { agent, log } = deps;
-  const thresholdChars = deps.options?.thresholdChars ?? 4000;
-  const headChars = deps.options?.headChars ?? 2000;
-  const keepRecentNodes = normalizeCount(deps.options?.keepRecentNodes, DEFAULT_KEEP_RECENT, 0);
-
+  const { agent } = deps;
   const session = (agent as { session?: unknown })?.session;
   if (session === undefined) return { ok: false, reason: 'no-session' };
 

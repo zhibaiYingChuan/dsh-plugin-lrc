@@ -36,7 +36,7 @@ function check(name: string, condition: boolean, detail?: unknown): void {
 // ────────────────────────────────────────────────────────────
 // mock LRC：按 query 关键词返回不同记忆，可注入延迟（测并发）
 // ────────────────────────────────────────────────────────────
-const enrichCalls: Array<{ query: string; top_k: number }> = [];
+const enrichCalls: Array<{ query: string; top_k: number; tags?: string[]; project?: string }> = [];
 /** 每次 enrich 的人工延迟（毫秒），用于构造"慢查询后回来"的竞态 */
 let enrichDelayMs = 0;
 
@@ -57,9 +57,60 @@ const server = createServer(async (req, res) => {
   const raw = await readBody(req);
   if (url.pathname === '/health') return send(res, 200, { status: 'running' });
   if (url.pathname === '/v1/memories/enrich') {
-    const body = JSON.parse(raw) as { query: string; top_k: number };
+    const body = JSON.parse(raw) as { query: string; top_k: number; tags?: string[] };
     enrichCalls.push(body);
     if (enrichDelayMs > 0) await new Promise((r) => setTimeout(r, enrichDelayMs));
+    // ## 纪要层：带 `session-minutes` 标签的查询只返回纪要
+    //
+    // 对应 `lrc_recall` 的两段式第一段。真实 LRC 的 tags 过滤是「任一匹配」，
+    // 这里如实模拟：只要请求带该标签，就只回纪要，不回碎片。
+    if (body.tags?.includes('session-minutes')) {
+      // 纪要段失败降级：模拟 LRC 5xx，验证明细仍能返回
+      if (body.query.includes('纪要失败')) return send(res, 500, { error: 'boom' });
+      return send(res, 200, {
+        total: 1,
+        memories: [
+          {
+            id: 'min1',
+            content: '【会话纪要】session-x 时间：2026-11-14 11:28 → 2026-11-17 05:10\n## 诉求演进\n- 做像素风图标',
+            memory_type: 'conversation',
+            score: 0.0330,
+            score_norm: 1.0,
+            importance: 9,
+          },
+        ],
+      });
+    }
+    // 纪要段失败后的明细兜底
+    if (body.query.includes('纪要失败')) {
+      return send(res, 200, {
+        total: 1,
+        memories: [
+          { id: 'f1', content: '纪要失败时的明细兜底', memory_type: 'fact', score: 0.0300, score_norm: 1.0, importance: 5 },
+        ],
+      });
+    }
+    // 明细段失败：纪要已取到，验证降级返回纪要
+    if (body.query.includes('明细失败')) {
+      return send(res, 500, { error: 'boom' });
+    }
+    // 去重：明细段也返回 min1，验证按 id 去重
+    if (body.query.includes('去重测试')) {
+      return send(res, 200, {
+        total: 2,
+        memories: [
+          {
+            id: 'min1',
+            content: '【会话纪要】session-x 时间：2026-11-14 11:28 → 2026-11-17 05:10\n## 诉求演进\n- 做像素风图标',
+            memory_type: 'conversation',
+            score: 0.0330,
+            score_norm: 1.0,
+            importance: 9,
+          },
+          { id: 'd2', content: '去重测试明细', memory_type: 'fact', score: 0.0300, score_norm: 0.9, importance: 5 },
+        ],
+      });
+    }
     // 按关键词给出可区分的记忆，让"注入了哪个话题"可断言。
     //
     // ★ 必须同时给 `score`（绝对分）与 `score_norm`（相对分）：
@@ -130,6 +181,8 @@ process.env.DSH_HOME = workDir;
 // ────────────────────────────────────────────────────────────
 const logs: string[] = [];
 const handlers = new Map<string, Array<(a: unknown, b?: unknown) => unknown>>();
+/** 捕获注册的工具，用于直接调用 `lrc_recall` 验证两段式检索 */
+const tools = new Map<string, { execute: (args: unknown) => Promise<{ text: string; count: number }> }>();
 let contextText: (() => string) | null = null;
 let sectionText = '';
 
@@ -157,7 +210,11 @@ const ctx = {
     list.push(handler);
     handlers.set(event, list);
   },
-  tools: { register: () => {} },
+  tools: {
+    register: (t: { name: string; execute: (args: unknown) => Promise<{ text: string; count: number }> }) => {
+      tools.set(t.name, t);
+    },
+  },
 };
 
 /**
@@ -370,6 +427,85 @@ try {
   // 视频一次 + 数据库一次 + 竞态后的数据库内容（与上次可能不同）
   const rewriteLogs = logs.filter((l) => l.includes('累计改写'));
   check('改写次数可枚举且不为 0', rewriteLogs.length > 0, rewriteLogs.length);
+  // ── 10) lrc_recall 两段式：历史查询纪要优先 ──
+  //
+  // 库里 dsh 项目 2039 条碎片 vs 3 条纪要。单次语义检索时碎片数量占绝对
+  // 优势，会把纪要挤出 top_k。两段式先按 `session-minutes` 标签精确取纪要，
+  // 再取明细 —— 只在历史查询时启用，明细类问题不浪费纪要的 3K 字符。
+  console.log('=== 10) lrc_recall 两段式检索 ===');
+  {
+    const recall = tools.get('lrc_recall');
+    check('lrc_recall 已注册', recall !== undefined);
+
+    // 10a) 历史查询：先取纪要，再取明细，纪要排在最前
+    const before = enrichCalls.length;
+    const hist = await recall!.execute({ query: '上次数据库为什么选 PostgreSQL', top_k: 5 });
+    const histCalls = enrichCalls.slice(before);
+    check('历史查询发起两次 enrich', histCalls.length === 2, histCalls);
+    check('第一段带 session-minutes 标签', histCalls[0]?.tags?.includes('session-minutes') === true, histCalls[0]);
+    check('第一段只取 1 条纪要', histCalls[0]?.top_k === 1, histCalls[0]);
+    check('第二段不带标签（明细）', histCalls[1]?.tags === undefined, histCalls[1]);
+    check('第二段 top_k 扣掉纪要名额', histCalls[1]?.top_k === 4, histCalls[1]);
+    check('返回内容同时含纪要与明细', hist.text.includes('【会话纪要】') && hist.text.includes('PostgreSQL'), hist.text.slice(0, 200));
+    check(
+      '纪要排在明细之前',
+      hist.text.indexOf('【会话纪要】') < hist.text.indexOf('PostgreSQL'),
+      hist.text.slice(0, 200),
+    );
+    check('返回条数 = 纪要 + 明细', hist.count === 2, hist.count);
+    check('纪要标注「按标签取回，非语义匹配」', hist.text.includes('按标签取回，非语义匹配'), hist.text.slice(0, 200));
+    check('纪要段按 config.project 收窄', histCalls[0]?.project === 'test', histCalls[0]);
+
+    // 10b) 明细查询：只发一次 enrich，不带标签
+    const before2 = enrichCalls.length;
+    const detail = await recall!.execute({ query: '数据库索引怎么建', top_k: 5 });
+    const detailCalls = enrichCalls.slice(before2);
+    check('明细查询只发一次 enrich', detailCalls.length === 1, detailCalls);
+    check('明细查询不带标签', detailCalls[0]?.tags === undefined, detailCalls[0]);
+    check('明细查询返回数据库记忆', detail.text.includes('PostgreSQL'), detail.text.slice(0, 120));
+
+    // 10c) 去重：明细段也返回同 id 纪要时不得重复
+    const dedupe = await recall!.execute({ query: '上次去重测试', top_k: 5 });
+    check('同 id 纪要只出现一次', dedupe.text.split('【会话纪要】').length - 1 === 1, dedupe.text.slice(0, 200));
+    check('去重后仍保留明细', dedupe.text.includes('去重测试明细'), dedupe.text.slice(0, 200));
+    check('去重后条数 = 纪要 1 + 明细 1', dedupe.count === 2, dedupe.count);
+
+    // 10d) top_k=1：纪要占满名额，跳过明细调用
+    const before3 = enrichCalls.length;
+    const onlyMin = await recall!.execute({ query: '上次数据库为什么选 PostgreSQL', top_k: 1 });
+    const onlyMinCalls = enrichCalls.slice(before3);
+    check('top_k=1 时只发纪要段一次', onlyMinCalls.length === 1, onlyMinCalls);
+    check('top_k=1 时只返回纪要', onlyMin.count === 1 && onlyMin.text.includes('【会话纪要】'), onlyMin.text.slice(0, 120));
+
+    // 10e) 纪要段失败：降级为仅明细，不得整次失败
+    const before4 = enrichCalls.length;
+    const degraded = await recall!.execute({ query: '上次纪要失败测试', top_k: 5 });
+    const degradedCalls = enrichCalls.slice(before4);
+    check('纪要段失败后仍发起明细调用', degradedCalls.length === 2, degradedCalls);
+    check('纪要段失败不返回整体失败', !degraded.text.includes('LRC 召回失败'), degraded.text.slice(0, 120));
+    check('纪要段失败后返回明细兜底', degraded.text.includes('纪要失败时的明细兜底'), degraded.text.slice(0, 160));
+    check(
+      '纪要段失败有降级日志',
+      logs.some((l) => l.startsWith('warn:') && l.includes('纪要段检索失败')),
+      logs.filter((l) => l.includes('纪要段')),
+    );
+
+    // 10f) 明细段失败但有纪要：降级返回纪要，不得整体失败
+    const detailFail = await recall!.execute({ query: '上次明细失败测试', top_k: 5 });
+    check('明细段失败时仍返回纪要', detailFail.text.includes('【会话纪要】'), detailFail.text.slice(0, 120));
+    check('明细段失败不返回整体失败', !detailFail.text.includes('LRC 召回失败'), detailFail.text.slice(0, 120));
+    check(
+      '明细段失败有降级日志',
+      logs.some((l) => l.startsWith('warn:') && l.includes('明细段检索失败')),
+      logs.filter((l) => l.includes('明细段')),
+    );
+
+    // 10g) 空串 project 回退到 config.project
+    const before5 = enrichCalls.length;
+    await recall!.execute({ query: '上次数据库为什么选 PostgreSQL', top_k: 5, project: '' });
+    const emptyProjCalls = enrichCalls.slice(before5);
+    check('空串 project 回退到 config.project', emptyProjCalls[0]?.project === 'test', emptyProjCalls[0]);
+  }
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   rmSync(workDir, { recursive: true, force: true });

@@ -71,6 +71,36 @@ export interface RecallItem {
   /** 展示用相关度（0–1，相对 top1 归一化） */
   score_norm: number;
   importance: number;
+  /**
+   * 纪要覆盖的**时间段起点**（ISO 8601，来自写入时的 `source_timestamp_ms`）。
+   *
+   * ## 为什么用它而不是「写入时刻」
+   *
+   * 会话纪要写入时会把 `source_timestamp_ms` 设成「本段对话的开始时间」，
+   * 所以 `created_at` 的大小顺序 = 各段的**时间窗先后**。
+   *
+   * 冷启动探查必须据此选「最新的一段」而不是「最长的一段」：
+   * ```
+   * 87f7d090  11-14 11:28 → 11-17 05:10  22 轮 / 2776 字（旧段的完整记录）
+   * a9584d98  11-17 23:03 → 11-18 04:10   2 轮 / 1104 字（新段，且推翻了旧段结论）
+   * ```
+   * 「最长」会选中旧段，把正在生长的会话锁死在历史版本上（六钥匙裁决）。
+   */
+  created_at?: string | null;
+  /**
+   * 记忆的业务键（会话纪要恒为 `session-minutes:<sessionId>`）。
+   *
+   * 用于「冷启动探查」：插件本地账本丢失（旧版本升级 / 账本被 prune）
+   * 时，靠它从库里找回既有纪要的 `id`，避免下次写入因
+   * `memoryId` 为空而**新建第二条**同 `event_id` 的纪要。
+   * 非纪要记忆通常没有这个字段。
+   *
+   * 可为 `null`：LRC 的 `EnrichedMemory.event_id` 是 `Option<String>`
+   * 且**没有** `skip_serializing_if`，JSON 里会输出 `"event_id": null`
+   * （十二轮审查 m3）。用 `=== expected` 比较时 null 自然不匹配，
+   * 行为正确 —— 但类型必须如实声明，否则下游写 `?? ''` 会掩盖问题。
+   */
+  event_id?: string | null;
 }
 
 export interface RecallResult {
@@ -176,7 +206,7 @@ export class LrcClient {
    */
   async recall(
     query: string,
-    options: { topK?: number; project?: string } = {},
+    options: { topK?: number; project?: string; tags?: string[] } = {},
   ): Promise<RecallResult> {
     const body: Record<string, unknown> = {
       query,
@@ -184,6 +214,14 @@ export class LrcClient {
     };
     if (options.project !== undefined && options.project.length > 0) {
       body.project = options.project;
+    }
+    // ## tags 过滤是「冷启动探查」的唯一可靠手段（实测）
+    //
+    // 纯语义 query 无法稳定把同 `event_id` 的纪要召回（它们的正文
+    // 与 query 的相似度不可控）。而 `session:<sessionId>` 这个标签
+    // 是每条纪要必带的，实测连续 3 次都能稳定命中同一批。
+    if (options.tags !== undefined && options.tags.length > 0) {
+      body.tags = options.tags;
     }
     const data = await this.request<{ memories?: RecallItem[]; total?: number }>(
       '/v1/memories/enrich',
@@ -230,5 +268,66 @@ export class LrcClient {
       merged: migrated.merged,
       indexLine: distilled.index_line,
     };
+  }
+
+  /**
+   * 写入**单条**记忆，可携带真实发生时间（`source_timestamp_ms`）。
+   *
+   * ## 为什么不能用 `migrate` 代替（2026-11-17 实测）
+   *
+   * `migrate` 的请求体没有时间字段，LRC 侧在 `v1_api.rs` 里把
+   * `source_timestamp` 硬编码为 `None` ⇒ 落库时间恒为**摄入时刻**。
+   * 实测对照（写入一条「声称发生在 2026-01-01」的记忆）：
+   * ```
+   * /v1/memories/remember  → created_at = 2026-01-01  ✅ 偏差 0.0 秒
+   * /v1/context/migrate    → created_at = 写入当天    ❌ 偏差 319.9 天
+   * ```
+   * 会话纪要的价值完全依赖真实时间（「什么时候定的这个方案」），
+   * 用摄入时刻等于把 65.8 小时的会话压成一个瞬间 —— 时序信息永久丢失。
+   *
+   * ## `event_id` **不是**覆盖语义（十二轮审查 M4，已核对 LRC 源码）
+   *
+   * LRC 的去重完全基于**内容相似度**，与 `event_id` 无关：
+   * - `memory_store.rs` 的 `build_candidates` / `find_similar_in_snapshot`
+   *   都**不读** `event_id`
+   * - `memory_write.rs` 的 `apply_merge` 只在合并后把 `event_id` 更新成新值
+   *
+   * 实测矩阵（同一 `event_id` 连续写两次）：
+   * ```
+   * 内容 Jaccard ≥ 0.5 ⇒ 合并 ⇒ 返回同一个 memory_id，库内 1 条
+   * 内容 Jaccard < 0.5 ⇒ 新建 ⇒ 返回新的 memory_id，库内 **2 条**
+   * ```
+   *
+   * 所以「一份对话一份纪要」不能靠 `event_id` 保证，必须由调用方
+   * 记住上次返回的 `memory_id`，在 id 变化时主动 `forget(旧 id)`。
+   * 参会见 `session-minutes.ts` 的 `MinutesLedgerState.memoryId`。
+   */
+  async remember(input: {
+    content: string;
+    memoryType: string;
+    project?: string;
+    tags?: string[];
+    importance?: number;
+    eventId?: string;
+    /** 真实发生时间（Unix 毫秒）。缺省 = 摄入时刻。 */
+    sourceTimestampMs?: number;
+    entities?: Array<{ name: string; kind?: string }>;
+  }): Promise<{ memoryId: string }> {
+    const body: Record<string, unknown> = {
+      content: input.content,
+      memory_type: input.memoryType,
+    };
+    if (input.project !== undefined) body.project = input.project;
+    if (input.tags !== undefined) body.tags = input.tags;
+    if (input.importance !== undefined) body.importance = input.importance;
+    if (input.eventId !== undefined) body.event_id = input.eventId;
+    if (input.sourceTimestampMs !== undefined) body.source_timestamp_ms = input.sourceTimestampMs;
+    if (input.entities !== undefined) body.entities = input.entities;
+
+    const data = await this.request<{ memory_id?: string; success?: boolean }>(
+      '/v1/memories/remember',
+      { method: 'POST', body: JSON.stringify(body) },
+    );
+    return { memoryId: data.memory_id ?? '' };
   }
 }

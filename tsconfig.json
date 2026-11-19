@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "forceConsistentCasingInFileNames": true,
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false
+  },
+  // ## 为什么 scripts 只纳入 e2e-minutes.ts（2026-11-17 二轮审查 m1）
+  //
+  // 全量纳入 `scripts/**` 会一次冒出 20+ 个**改动前就存在**的类型错误
+  // （`probe-bracket-cut.ts` 引用早已删除的导出、`e2e-trim.ts` 调用签名
+  // 漂移、`tmp-host` 无声明文件…）。那不是本次变更引入的，混在一起修
+  // 会掩盖真正的回归。
+  //
+  // 折中是：把「本次新增且承载回归断言」的 e2e 纳入类型检查，
+  // 其余 scripts 后续单独清理（它们不在 `npm test` 的关键路径上时优先）。
+  "include": [
+    "src/**/*.ts",
+    "scripts/e2e-minutes.ts",
+    "scripts/e2e-minutes-integration.ts"
+  ]
+}

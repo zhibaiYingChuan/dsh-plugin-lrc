@@ -27,3 +27,18 @@ tmp-host/
 # 本地排查脚本（依赖 session-file.ts，后者属于本地勘查工具，不提交）
 scripts/audit-live.ts
 scripts/replay-session.ts
+
+# 本地开发 / 测试文档（不推送，README 是唯一对外文档）
+docs/
+
+# 本地临时探针（一次性排查用，不提交）
+scripts/_tmp_probe*.mjs
+
+# 本地基准 / 诊断脚本（不属于插件本体，不参与 npm test）
+scripts/fold-bench.ts
+scripts/fold-diag.ts
+scripts/fold-window-bench.ts
+scripts/simulate-refold.ts
+scripts/topic-bench.ts
+scripts/turn-merge-bench.ts
+
