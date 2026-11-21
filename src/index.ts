@@ -3537,6 +3537,85 @@ export function apply(ctx: Context, config: Config): void {
   const TURN_FLUSH_MAX = 40;
 
   /**
+   * 暂存桶的**时间上限**：滞留超过这么久就提前沉淀（毫秒）。
+   *
+   * ## 为什么补这一条（2026-11-21 长期 goal 任务实测）
+   *
+   * `TURN_FLUSH_MAX` 只兜住「内容多」的情况。goal 任务里抽取是稀疏的 ——
+   * 实测 2 小时只抽出 4 条，永远到不了 40 条，于是这 4 条一直等
+   * `turn/end`，而 goal 任务可能跑几小时都不结束轮次。进程一崩就全丢。
+   *
+   * 30 分钟是「崩溃最多丢半小时」与「折叠批次不被切得太碎」的折中：
+   * `foldMinFacts = 4`，半小时通常够攒一批；真不够时也只是多写一条。
+   *
+   * 与 `TURN_FLUSH_MAX` 同理**不作为配置项**：调大只增加丢失窗口，
+   * 调小只是多切几批，用户没有调它的合理动机。
+   */
+  const TURN_FLUSH_MAX_MS = 30 * 60 * 1000;
+
+  /**
+   * 上一次「超时提前沉淀」的尝试时刻（0 = 从未尝试）。
+   *
+   * 失败时桶会被放回且时间戳保留 ⇒ 若不节流，LRC 挂掉期间会**每步**发起
+   * 一次必然失败的 HTTP。60 秒足以避免刷屏，又不会让补写明显滞后。
+   */
+  let lastTurnFlushAttemptAt = 0;
+
+  /**
+   * 暂存桶滞留超时 ⇒ 提前沉淀（数量上限 `TURN_FLUSH_MAX` 的时间版）。
+   *
+   * 每步 O(1)：未超时不做任何 I/O。
+   *
+   * ## 为什么扫「所有桶」而不是只看当前会话（独立审查 major 1）
+   *
+   * 切会话时对旧桶的冲刷是尽力而为的。失败后桶和时间戳都还在，但
+   * `pendingAgeMs(currentSessionId)` 再也看不到它 —— 那批数据只能等进程退出时丢。
+   * 这里用 `staleOwners()` 把孤儿桶也扫出来，逐桶补写。
+   *
+   * ⚠ 孤儿桶必须传 `intoPool: false`：快照池此时已属于新会话，
+   * 把旧会话的约束推进去会让下一次注入出现「B 的约束；A 会话私有：…」。
+   *
+   * @param stepSessionId - 本次 pre-step 所属会话（取 payload，避免与全局
+   *   `currentSessionId` 在子代理/多会话交错时短暂不一致）
+   */
+  function maybeFlushTurnFacts(stepSessionId?: string): void {
+    // 未连接时冲刷必然失败并把数据放回桶里，白跑一次 HTTP 超时
+    if (!offloader.connected) return;
+    const stale = offloader.staleOwners(TURN_FLUSH_MAX_MS);
+    if (stale.length === 0) return;
+    const now = Date.now();
+    if (now - lastTurnFlushAttemptAt < 60_000) return;
+    lastTurnFlushAttemptAt = now;
+    // 先固化会话：`.then` 执行时 `currentSessionId` 可能已经变了。
+    // 用 `||` 而非 `??`：`session.id` 可能是空串，空串必须回退到全局值，
+    // 否则当前会话的桶会被当成孤儿（数据能写，但快照池不更新）。
+    const owner = stepSessionId !== undefined && stepSessionId.length > 0 ? stepSessionId : currentSessionId;
+    for (const sessionId of stale) {
+      const age = offloader.pendingAgeMs(sessionId);
+      const intoPool = sessionId === owner;
+      void offloader
+        .flushTurn(sessionId, { intoPool })
+        .then((result) => {
+          if (result.distilled === 0) return;
+          if (intoPool && result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+            saveSnapshot(result.snapshot, owner);
+          }
+          ctx.logger.info(
+            `[lrc] 暂存桶已滞留 ${Math.round(age / 60000)} 分钟${intoPool ? '' : '（旧会话）'}，` +
+              `提前沉淀 ${result.distilled} 条（折叠 ${result.folded ?? 0} 条，写入 ${result.written}）`,
+          );
+        })
+        .catch((error: unknown) => {
+          ctx.logger.warn(
+            `[lrc] 超时提前沉淀失败（不影响对话）：${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+    }
+  }
+
+  /**
    * 把一批 Fact 里的**结论类**汇入本轮纪要槽位。
    *
    * 只收「能回答为什么」的四类：约束/决策/结论/事实。
@@ -4039,7 +4118,11 @@ export function apply(ctx: Context, config: Config): void {
       );
       return;
     }
-    ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
+    const lrcVersion = runtime.status().version;
+    ctx.logger.info(
+      `[lrc] 记忆沉淀已就绪：${client.baseUrl}` +
+        (lrcVersion === undefined ? '' : `（LRC v${lrcVersion}）`),
+    );
     // 快照与写入解耦：上次进程没来得及沉淀时，从 LRC 索引重建
     void bootstrapSnapshot();
     drainProseBacklog();
@@ -5174,6 +5257,11 @@ export function apply(ctx: Context, config: Config): void {
     // 轮内阶段纪要：长任务一轮可能跑几十分钟都不 turn/end，
     // 这里每步做一次 O(1) 判定（时间与结论数比较），到点才真正写。
     maybeWriteStageMinutes();
+    // 轮内暂存的时间上限：内容稀疏但轮次很长的 goal 任务里，
+    // 桶永远到不了 40 条，靠这里把崩溃丢失窗口压到 30 分钟。
+    // 宿主 payload 走的是 cast，用 typeof 守卫兜住 null（不能只看空串）。
+    const stepSessionId = (payload as { agent?: { session?: { id?: unknown } } })?.agent?.session?.id;
+    maybeFlushTurnFacts(typeof stepSessionId === 'string' ? stepSessionId : undefined);
     const decision = await next();
     // ★2026-11-07（缓存命中率）：把 runtime-context 快照移到当前用户消息**之前**。
     //
@@ -5762,7 +5850,9 @@ export function apply(ctx: Context, config: Config): void {
             `- 累计：成功 ${conn.successes} 次 / 失败 ${conn.failures} 次（连续 ${conn.consecutiveFailures}）`,
           );
           lines.push(
-            `- 运行时：${rt.mode}｜连续降级 ${rt.degradeCount} 次｜下次重探 ${Math.ceil(rt.retryInMs / 1000)}s`,
+            // 版本只在探测瞬间取一次，服务端热升级后这里不会自动变，故标注「探测时」
+            `- 运行时：${rt.mode}${rt.version === undefined ? '' : `（探测时 LRC v${rt.version}）`}` +
+              `｜连续降级 ${rt.degradeCount} 次｜下次重探 ${Math.ceil(rt.retryInMs / 1000)}s`,
           );
           if (conn.lastError !== undefined && conn.state !== 'ready') {
             lines.push(`- 最近错误：${conn.lastError}`);
@@ -5800,7 +5890,7 @@ export function apply(ctx: Context, config: Config): void {
           // 轮内暂存：正文抽取改为轮末统一切，这里要能看到「还没写的有多少」
           const turnPending = offloader.turnPending();
           if (turnPending > 0) {
-            lines.push(`本轮暂存：${turnPending} 条待轮末沉淀（turn/end 或下次 turn/start 时写入）`);
+            lines.push(`暂存（含旧会话）：${turnPending} 条待轮末沉淀（turn/end 或下次 turn/start 时写入）`);
           }
           // 折叠统计：回答「1515 条碎片现在压成多少条」。
           // 没有这一行时，用户只能看到「新写入 N 条」，无法判断碎片化是否改善。

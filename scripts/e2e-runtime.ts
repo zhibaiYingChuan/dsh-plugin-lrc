@@ -36,7 +36,8 @@ function send(res: ServerResponse, status: number, payload: unknown): void {
 // ── 1) external：已有实例 ──────────────────────────────
 console.log('=== 1) external 模式 ===');
 const healthServer = createServer((req, res) => {
-  if (req.url === '/health') return send(res, 200, { status: 'running' });
+  // 真实 LRC 的 /health 带 version；插件据此在启动日志与 lrc_status 里显示
+  if (req.url === '/health') return send(res, 200, { status: 'running', version: '0.11.1' });
   send(res, 404, {});
 });
 await new Promise<void>((resolve) => healthServer.listen(0, '127.0.0.1', resolve));
@@ -50,6 +51,8 @@ const externalRuntime = new LrcRuntime({ cacheDir: join(workDir, 'a') });
 const external = await externalRuntime.ensure();
 check('识别为 external', external.mode === 'external', external);
 check('复用给定地址', external.baseUrl === externalUrl, external);
+check('从 /health 取回 LRC 版本', external.version === '0.11.1', external.version);
+check('status() 透出版本', externalRuntime.status().version === '0.11.1', externalRuntime.status());
 check('没有下载二进制', !existsSync(join(workDir, 'a', 'bin')), 'bin 目录不应存在');
 delete process.env.LRC_BASE;
 await new Promise<void>((resolve) => healthServer.close(() => resolve()));

@@ -38,6 +38,13 @@ export interface RuntimeResult {
   baseUrl: string;
   /** degraded 时给出可读原因 */
   reason?: string;
+  /**
+   * LRC 服务端版本（来自 `/health` 的 `version` 字段，缺失时为 undefined）。
+   *
+   * 为什么需要：插件与 LRC 是独立升级的。没有这个字段时，用户升级 LRC 后
+   * 无法确认插件连的到底是哪一版，排查「新能力为什么没生效」时只能去翻进程。
+   */
+  version?: string;
 }
 
 /**
@@ -192,15 +199,57 @@ function findFreePort(): Promise<number> {
   });
 }
 
-async function isHealthy(baseUrl: string, timeoutMs = 3000): Promise<boolean> {
+/**
+ * 探测一个 LRC 实例是否可用，并尽量取回它的版本号。
+ *
+ * ## 为什么用 `/health` 而不是 `/v1/health/system`
+ *
+ * 实测（2026-11-21，LRC v0.11.1）：
+ * - `GET /health` → 约 350 字节，已含 `{"status":"running","version":"0.11.1",...}`
+ * - `GET /v1/health/system` → **52,978 字节**（含合成日志的 191 个 source_ids）
+ *
+ * 这里只需要「活着 + 版本」，用重端点纯属浪费；而且 `/health` 本来就在
+ * 启动路径上被调用，解析 body 等于**零额外请求**。
+ */
+async function probeHealth(
+  baseUrl: string,
+  timeoutMs = 3000,
+): Promise<{ ok: boolean; version?: string }> {
   try {
     const response = await fetch(`${baseUrl}/health`, {
       signal: AbortSignal.timeout(timeoutMs),
     });
-    return response.ok;
+    if (!response.ok) return { ok: false };
+    try {
+      const body = (await response.json()) as {
+        status?: unknown;
+        service?: unknown;
+        version?: unknown;
+      };
+      // ## 必须确认「这真的是 LRC」（一轮 minor 4 / 二轮 major）
+      //
+      // 只判 `response.ok` 会把同端口上任何 HTTP 服务当成 LRC 复用；
+      // 若 body 解析失败还放行，等于「任何返回 200 的服务」都能通过。
+      // 身份判据只认 LRC `/health` 的两个特征字段：`version` 只用于取值，
+      // 不参与身份识别（带版本号的健康检查太常见）。
+      const looksLikeLrc = body.status === 'running' || body.service === 'loong-recall';
+      if (!looksLikeLrc) return { ok: false };
+      return {
+        ok: true,
+        version: typeof body.version === 'string' && body.version.length > 0 ? body.version : undefined,
+      };
+    } catch {
+      // 非 JSON（HTML / 空 body / 读 body 时超时）⇒ 不是 LRC
+      return { ok: false };
+    }
   } catch {
-    return false;
+    return { ok: false };
   }
+}
+
+/** 版本号拼进日志/状态行的统一格式（未知时返回空串）。 */
+function formatVersion(version: string | undefined): string {
+  return version === undefined ? '' : `（LRC v${version}）`;
 }
 
 export class LrcRuntime {
@@ -296,9 +345,14 @@ export class LrcRuntime {
     // ① 已有实例（配置 baseUrl > LRC_BASE 环境变量）
     const explicit = this.explicitBase;
     if (explicit) {
-      if (await isHealthy(explicit)) {
-        this.result = { mode: 'external', baseUrl: explicit.replace(/\/+$/, '') };
-        this.log(`[lrc] 复用已有实例：${this.result.baseUrl}`);
+      const probe = await probeHealth(explicit);
+      if (probe.ok) {
+        this.result = {
+          mode: 'external',
+          baseUrl: explicit.replace(/\/+$/, ''),
+          version: probe.version,
+        };
+        this.log(`[lrc] 复用已有实例：${this.result.baseUrl}${formatVersion(probe.version)}`);
         return this.succeed();
       }
       // 显式指定了却连不上：**直接降级，不回落 3099**。
@@ -306,10 +360,13 @@ export class LrcRuntime {
       return this.degrade(explicit, `配置的实例不可用：${explicit}`);
     }
     const local = 'http://127.0.0.1:3099';
-    if (this.probeLocal && (await isHealthy(local))) {
-      this.result = { mode: 'external', baseUrl: local };
-      this.log(`[lrc] 复用本地实例：${local}`);
-      return this.succeed();
+    if (this.probeLocal) {
+      const probe = await probeHealth(local);
+      if (probe.ok) {
+        this.result = { mode: 'external', baseUrl: local, version: probe.version };
+        this.log(`[lrc] 复用本地实例：${local}${formatVersion(probe.version)}`);
+        return this.succeed();
+      }
     }
 
     // ② 准备二进制
@@ -337,9 +394,12 @@ export class LrcRuntime {
       const baseUrl = `http://127.0.0.1:${port}`;
       const deadline = Date.now() + this.healthTimeoutMs;
       while (Date.now() < deadline) {
-        if (await isHealthy(baseUrl, 1000)) {
-          this.result = { mode: 'managed', baseUrl };
-          this.log(`[lrc] 已启动隔离实例：${baseUrl}（数据目录 ${dataDir}）`);
+        const probe = await probeHealth(baseUrl, 1000);
+        if (probe.ok) {
+          this.result = { mode: 'managed', baseUrl, version: probe.version };
+          this.log(
+            `[lrc] 已启动隔离实例：${baseUrl}（数据目录 ${dataDir}）${formatVersion(probe.version)}`,
+          );
           return this.succeed();
         }
         await new Promise((resolve) => setTimeout(resolve, 300));
@@ -404,11 +464,18 @@ export class LrcRuntime {
   }
 
   /** 当前状态（诊断用）。 */
-  status(): { mode: RuntimeMode | 'idle'; retryInMs: number; degradeCount: number } {
+  status(): {
+    mode: RuntimeMode | 'idle';
+    retryInMs: number;
+    degradeCount: number;
+    /** LRC 服务端版本（`/health` 返回；旧版服务或未探测时为 undefined） */
+    version?: string;
+  } {
     return {
       mode: this.result?.mode ?? 'idle',
       retryInMs: Math.max(0, this.nextRetryAt - Date.now()),
       degradeCount: this.degradeCount,
+      version: this.result?.version,
     };
   }
 

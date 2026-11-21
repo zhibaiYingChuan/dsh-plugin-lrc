@@ -31,6 +31,8 @@ interface StoredMemory {
 
 const memories: StoredMemory[] = [];
 const calls: Array<{ path: string; chars: number }> = [];
+/** 置 true 时下一次 migrate 返回 500，用于验证「失败回桶 + 时间戳还原」。 */
+let migrateFailOnce = false;
 
 /** 模拟 LRC 的提炼规则：只留含决策/约束/结论词的行。 */
 const MARKERS = ['决定', '禁止', '不要', '结论', '改用', '统一用'];
@@ -100,7 +102,8 @@ const server = createServer(async (req, res) => {
   const raw = await readBody(req);
 
   if (url.pathname === '/health') {
-    send(res, 200, { status: 'running' });
+    // 真实 LRC 的 /health 带 version（插件据此在启动日志里显示版本）
+    send(res, 200, { status: 'running', service: 'loong-recall', version: '0.11.1' });
     return;
   }
   if (url.pathname === '/v1/context/distill') {
@@ -110,6 +113,11 @@ const server = createServer(async (req, res) => {
     return;
   }
   if (url.pathname === '/v1/context/migrate') {
+    if (migrateFailOnce) {
+      migrateFailOnce = false;
+      send(res, 500, { error: 'boom' });
+      return;
+    }
     const body = JSON.parse(raw) as { items: StoredMemory[] };
     calls.push({ path: 'migrate', chars: body.items.length });
     send(res, 200, migrate(body.items));
@@ -368,6 +376,112 @@ try {
     snapshotChanged('[LRC 状态] A；B。', '[LRC 状态] A；C。') === true,
   );
   check('空 → 非空触发更新', snapshotChanged('', '[LRC 状态] A。') === true);
+
+  // ── 暂存桶时间上限（2026-11-21 长期 goal 任务）──
+  //
+  // 背景：`TURN_FLUSH_MAX = 40` 只兜住「内容多」。goal 任务里抽取稀疏，
+  // 实测 2 小时只抽出 4 条，永远到不了 40，于是这批数据一直等 turn/end，
+  // 进程一崩就全丢。这里验证时间戳的四个语义：
+  // ① 空桶 age=0；② 入桶后 age 增长；③ 追加**不刷新**入桶时间；
+  // ④ 冲刷成功清零、失败回桶并**还原**时间戳。
+  console.log('\n=== 附加：暂存桶时间上限 ===');
+  {
+    const ageSession = 'session-age';
+    // 每条语句都带唯一后缀：与前面轮次的语句重复会被 `recent` 判重，
+    // `offloadFacts` 提前返回、根本不发 migrate，成功路径就测不到了。
+    const tag = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const mkFact = (text: string, session = ageSession) => ({
+      kind: 'conclusion' as const,
+      subject: '结论',
+      predicate: '结论是',
+      value: `${text}（${tag}）`,
+      statement: `${text}（${tag}）`,
+      scope: 'project' as const,
+      origin: 'assistant' as const,
+      confidence: 0.9,
+      source: { sessionId: session },
+      status: 'active' as const,
+    });
+    // 用一个**未来 31 分钟**的时刻判定，避免真的等半小时
+    const future = Date.now() + 31 * 60 * 1000;
+    const threshold = 30 * 60 * 1000;
+
+    check('无暂存时 age = 0', offloader.pendingAgeMs(ageSession) === 0, offloader.pendingAgeMs(ageSession));
+
+    offloader.accumulate([mkFact('决定用 pnpm 替代 npm，因为依赖解析更快。')]);
+    check(
+      '入桶后 age 达到 31 分钟',
+      offloader.pendingAgeMs(ageSession, future) >= threshold,
+      offloader.pendingAgeMs(ageSession, future),
+    );
+
+    // 相对比较：若追加会刷新时间戳，age 必须变小（这里刻意隔 5ms，
+    // 避免同一毫秒内刷新导致两者相等而误判通过）。
+    const ageBeforeAppend = offloader.pendingAgeMs(ageSession, future);
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    offloader.accumulate([mkFact('禁止连 3099 做测试，测试一律用 3111。')]);
+    const ageAfterAppend = offloader.pendingAgeMs(ageSession, future);
+    check(
+      '追加不刷新入桶时间（否则时间上限永远不触发）',
+      ageAfterAppend === ageBeforeAppend,
+      { ageBeforeAppend, ageAfterAppend },
+    );
+
+    await offloader.flushTurn(ageSession);
+    check('冲刷成功后 age 归零', offloader.pendingAgeMs(ageSession, future) === 0, offloader.pendingAgeMs(ageSession, future));
+    check('冲刷成功后桶为空', offloader.turnPending(ageSession) === 0, offloader.turnPending(ageSession));
+
+    // 失败路径：migrate 返回 500 ⇒ 数据回桶，且时间戳必须还原。
+    const unique = `结论是：失败路径验证 ${Date.now()}-${Math.random().toString(36).slice(2)}。`;
+    offloader.accumulate([mkFact(unique)]);
+    // 相对比较：失败回桶后时间戳必须**原样还原**（而不是被删成 0 或刷新成现在）
+    const ageBeforeFail = offloader.pendingAgeMs(ageSession, future);
+    migrateFailOnce = true;
+    await offloader.flushTurn(ageSession);
+    migrateFailOnce = false; // 兜底：若上一步没消费到，别影响后续用例
+    check('冲刷失败后数据回桶', offloader.turnPending(ageSession) === 1, offloader.turnPending(ageSession));
+    const ageAfterFail = offloader.pendingAgeMs(ageSession, future);
+    check(
+      '冲刷失败后时间戳被还原',
+      ageAfterFail === ageBeforeFail && ageAfterFail > 0,
+      { ageBeforeFail, ageAfterFail },
+    );
+    // 收尾：把回桶的那条写掉，避免影响后续断言
+    await offloader.flushTurn(ageSession);
+
+    // staleOwners：阈值判定 + 最老优先（独立审查 minor）。
+    // 两个桶刻意隔 20ms 创建，再注入 now 让「老桶更老」可判定。
+    offloader.accumulate([mkFact('决定旧会话的语句先写。', 'session-old')]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    offloader.accumulate([mkFact('决定新会话的语句后写。', 'session-new')]);
+    const nowNear = Date.now() + 10;
+    const stale = offloader.staleOwners(10, nowNear);
+    check(
+      'staleOwners 包含两个超时桶',
+      stale.includes('session-old') && stale.includes('session-new'),
+      stale,
+    );
+    check(
+      'staleOwners 最老优先',
+      stale.indexOf('session-old') < stale.indexOf('session-new'),
+      stale,
+    );
+    check(
+      'staleOwners 未达阈值返回空',
+      offloader.staleOwners(60 * 60 * 1000, nowNear).length === 0,
+      offloader.staleOwners(60 * 60 * 1000, nowNear),
+    );
+    const ageOld = offloader.pendingAgeMs('session-old', nowNear);
+    check(
+      'staleOwners 与 pendingAgeMs 阈值口径一致',
+      offloader.staleOwners(ageOld, nowNear).includes('session-old') &&
+        !offloader.staleOwners(ageOld + 1, nowNear).includes('session-old'),
+      { ageOld },
+    );
+    // 收尾：孤儿桶必须传 intoPool:false（旧会话不得污染当前快照池）
+    await offloader.flushTurn('session-old', { intoPool: false });
+    await offloader.flushTurn('session-new', { intoPool: false });
+  }
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   rmSync(workDir, { recursive: true, force: true });

@@ -713,6 +713,21 @@ export class Offloader {
   private turnFacts = new Map<string, MemoryFact[]>();
 
   /**
+   * 每个会话桶**首次入桶**的时刻（毫秒时间戳）。
+   *
+   * ## 为什么需要（2026-11-21 长期 goal 任务实测）
+   *
+   * 暂存桶此前只有**数量上限**（`TURN_FLUSH_MAX = 40`）。长 goal 任务里
+   * 抽取是稀疏的（实测 2 小时只抽出 4 条），永远到不了 40，于是这 4 条
+   * 一直在内存里等 `turn/end` —— 而 goal 任务可能跑几小时都不结束轮次。
+   * 一旦进程崩溃，这批内容永久丢失。
+   *
+   * 补一个时间上限后，崩溃丢失窗口从「整轮」收敛到「一个常量」。
+   * 与 LRC v0.11.1 的「孤儿 tmp 超过 N 小时才删」是同一类 TTL 思路。
+   */
+  private turnFactsSince = new Map<string, number>();
+
+  /**
    * 把 Fact **暂存到本轮**（不落库），等 [`Self::flushTurn`] 统一折叠写入。
    *
    * ## 调用方必须保证「轮末一定冲刷」
@@ -727,13 +742,50 @@ export class Offloader {
    */
   accumulate(facts: readonly MemoryFact[]): number {
     if (facts.length === 0) return 0;
+    const now = Date.now();
     for (const fact of facts) {
       const owner = fact.source.sessionId ?? '';
       const list = this.turnFacts.get(owner) ?? [];
+      // 只在「空桶 → 第一条」时打时间戳：后续追加不刷新，
+      // 否则持续有新内容进来会让桶永远「看起来刚建」，时间上限失效。
+      if (list.length === 0) this.turnFactsSince.set(owner, now);
       list.push(fact);
       this.turnFacts.set(owner, list);
     }
     return this.turnPending();
+  }
+
+  /**
+   * 指定暂存桶的最长滞留时长（毫秒）；无暂存返回 0。
+   *
+   * @param owner - 会话 ID（暂存桶按会话分）
+   * @param now - 当前时刻（默认 `Date.now()`；测试可注入未来时刻，免等真实时间）
+   */
+  pendingAgeMs(owner: string, now = Date.now()): number {
+    const since = this.turnFactsSince.get(owner);
+    return since === undefined ? 0 : Math.max(0, now - since);
+  }
+
+  /**
+   * 滞留超过 `maxAgeMs` 的桶（按最老优先）。
+   *
+   * ## 为什么需要（独立审查 major 1）
+   *
+   * 切会话时对旧桶的冲刷是「尽力而为」——失败后桶与时间戳都保留，但此后
+   * 没有任何事件会再碰它：`pendingAgeMs(currentSessionId)` 永远只看当前会话，
+   * 这批数据只能等进程退出时丢。用本方法把孤儿桶按时间扫出来，逐桶补写。
+   *
+   * @param now - 当前时刻（默认 `Date.now()`；仅测试注入）
+   */
+  staleOwners(maxAgeMs: number, now = Date.now()): string[] {
+    const out: Array<{ owner: string; age: number }> = [];
+    for (const [owner, since] of this.turnFactsSince) {
+      const age = now - since;
+      if (age >= maxAgeMs) out.push({ owner, age });
+    }
+    // 最老的先写：崩溃时优先保住更早的数据
+    out.sort((a, b) => b.age - a.age);
+    return out.map((item) => item.owner);
   }
 
   /** 本轮已暂存但未写库的条数（`lrc_status` 用）。 */
@@ -783,13 +835,18 @@ export class Offloader {
     for (const key of keys) {
       const list = this.turnFacts.get(key);
       if (list === undefined || list.length === 0) continue;
+      // 时间戳跟着桶一起走：失败回桶时必须还原，否则这批数据会
+      // 「看起来是刚进来的」，时间上限永远不触发（等于丢数据）。
+      const since = this.turnFactsSince.get(key);
       this.turnFacts.delete(key);
+      this.turnFactsSince.delete(key);
       try {
         results.push(await this.offloadFacts(list, options));
       } catch (error) {
         // 放回桶头（保持原有先后顺序：这批比后来的更新，但也比未来的旧）
         const current = this.turnFacts.get(key) ?? [];
         this.turnFacts.set(key, [...list, ...current]);
+        if (since !== undefined) this.turnFactsSince.set(key, since);
         // 继续处理其它桶：一个会话失败不该阻塞别的会话
         continue;
       }

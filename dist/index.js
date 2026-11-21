@@ -70,15 +70,29 @@ function findFreePort() {
     });
   });
 }
-async function isHealthy(baseUrl, timeoutMs = 3e3) {
+async function probeHealth(baseUrl, timeoutMs = 3e3) {
   try {
     const response = await fetch(`${baseUrl}/health`, {
       signal: AbortSignal.timeout(timeoutMs)
     });
-    return response.ok;
+    if (!response.ok) return { ok: false };
+    try {
+      const body = await response.json();
+      const looksLikeLrc = body.status === "running" || body.service === "loong-recall";
+      if (!looksLikeLrc) return { ok: false };
+      return {
+        ok: true,
+        version: typeof body.version === "string" && body.version.length > 0 ? body.version : void 0
+      };
+    } catch {
+      return { ok: false };
+    }
   } catch {
-    return false;
+    return { ok: false };
   }
+}
+function formatVersion(version) {
+  return version === void 0 ? "" : `（LRC v${version}）`;
 }
 var LrcRuntime = class {
   cacheDir;
@@ -160,18 +174,26 @@ var LrcRuntime = class {
     }
     const explicit = this.explicitBase;
     if (explicit) {
-      if (await isHealthy(explicit)) {
-        this.result = { mode: "external", baseUrl: explicit.replace(/\/+$/, "") };
-        this.log(`[lrc] 复用已有实例：${this.result.baseUrl}`);
+      const probe = await probeHealth(explicit);
+      if (probe.ok) {
+        this.result = {
+          mode: "external",
+          baseUrl: explicit.replace(/\/+$/, ""),
+          version: probe.version
+        };
+        this.log(`[lrc] 复用已有实例：${this.result.baseUrl}${formatVersion(probe.version)}`);
         return this.succeed();
       }
       return this.degrade(explicit, `配置的实例不可用：${explicit}`);
     }
     const local = "http://127.0.0.1:3099";
-    if (this.probeLocal && await isHealthy(local)) {
-      this.result = { mode: "external", baseUrl: local };
-      this.log(`[lrc] 复用本地实例：${local}`);
-      return this.succeed();
+    if (this.probeLocal) {
+      const probe = await probeHealth(local);
+      if (probe.ok) {
+        this.result = { mode: "external", baseUrl: local, version: probe.version };
+        this.log(`[lrc] 复用本地实例：${local}${formatVersion(probe.version)}`);
+        return this.succeed();
+      }
     }
     let binary;
     try {
@@ -194,9 +216,12 @@ var LrcRuntime = class {
       const baseUrl = `http://127.0.0.1:${port}`;
       const deadline = Date.now() + this.healthTimeoutMs;
       while (Date.now() < deadline) {
-        if (await isHealthy(baseUrl, 1e3)) {
-          this.result = { mode: "managed", baseUrl };
-          this.log(`[lrc] 已启动隔离实例：${baseUrl}（数据目录 ${dataDir}）`);
+        const probe = await probeHealth(baseUrl, 1e3);
+        if (probe.ok) {
+          this.result = { mode: "managed", baseUrl, version: probe.version };
+          this.log(
+            `[lrc] 已启动隔离实例：${baseUrl}（数据目录 ${dataDir}）${formatVersion(probe.version)}`
+          );
           return this.succeed();
         }
         await new Promise((resolve) => setTimeout(resolve, 300));
@@ -257,7 +282,8 @@ var LrcRuntime = class {
     return {
       mode: this.result?.mode ?? "idle",
       retryInMs: Math.max(0, this.nextRetryAt - Date.now()),
-      degradeCount: this.degradeCount
+      degradeCount: this.degradeCount,
+      version: this.result?.version
     };
   }
   /**
@@ -2805,6 +2831,20 @@ var Offloader = class {
    */
   turnFacts = /* @__PURE__ */ new Map();
   /**
+   * 每个会话桶**首次入桶**的时刻（毫秒时间戳）。
+   *
+   * ## 为什么需要（2026-11-21 长期 goal 任务实测）
+   *
+   * 暂存桶此前只有**数量上限**（`TURN_FLUSH_MAX = 40`）。长 goal 任务里
+   * 抽取是稀疏的（实测 2 小时只抽出 4 条），永远到不了 40，于是这 4 条
+   * 一直在内存里等 `turn/end` —— 而 goal 任务可能跑几小时都不结束轮次。
+   * 一旦进程崩溃，这批内容永久丢失。
+   *
+   * 补一个时间上限后，崩溃丢失窗口从「整轮」收敛到「一个常量」。
+   * 与 LRC v0.11.1 的「孤儿 tmp 超过 N 小时才删」是同一类 TTL 思路。
+   */
+  turnFactsSince = /* @__PURE__ */ new Map();
+  /**
    * 把 Fact **暂存到本轮**（不落库），等 [`Self::flushTurn`] 统一折叠写入。
    *
    * ## 调用方必须保证「轮末一定冲刷」
@@ -2819,13 +2859,45 @@ var Offloader = class {
    */
   accumulate(facts) {
     if (facts.length === 0) return 0;
+    const now = Date.now();
     for (const fact of facts) {
       const owner = fact.source.sessionId ?? "";
       const list = this.turnFacts.get(owner) ?? [];
+      if (list.length === 0) this.turnFactsSince.set(owner, now);
       list.push(fact);
       this.turnFacts.set(owner, list);
     }
     return this.turnPending();
+  }
+  /**
+   * 指定暂存桶的最长滞留时长（毫秒）；无暂存返回 0。
+   *
+   * @param owner - 会话 ID（暂存桶按会话分）
+   * @param now - 当前时刻（默认 `Date.now()`；测试可注入未来时刻，免等真实时间）
+   */
+  pendingAgeMs(owner, now = Date.now()) {
+    const since = this.turnFactsSince.get(owner);
+    return since === void 0 ? 0 : Math.max(0, now - since);
+  }
+  /**
+   * 滞留超过 `maxAgeMs` 的桶（按最老优先）。
+   *
+   * ## 为什么需要（独立审查 major 1）
+   *
+   * 切会话时对旧桶的冲刷是「尽力而为」——失败后桶与时间戳都保留，但此后
+   * 没有任何事件会再碰它：`pendingAgeMs(currentSessionId)` 永远只看当前会话，
+   * 这批数据只能等进程退出时丢。用本方法把孤儿桶按时间扫出来，逐桶补写。
+   *
+   * @param now - 当前时刻（默认 `Date.now()`；仅测试注入）
+   */
+  staleOwners(maxAgeMs, now = Date.now()) {
+    const out = [];
+    for (const [owner, since] of this.turnFactsSince) {
+      const age = now - since;
+      if (age >= maxAgeMs) out.push({ owner, age });
+    }
+    out.sort((a, b) => b.age - a.age);
+    return out.map((item) => item.owner);
   }
   /** 本轮已暂存但未写库的条数（`lrc_status` 用）。 */
   turnPending(owner) {
@@ -2859,12 +2931,15 @@ var Offloader = class {
     for (const key of keys) {
       const list = this.turnFacts.get(key);
       if (list === void 0 || list.length === 0) continue;
+      const since = this.turnFactsSince.get(key);
       this.turnFacts.delete(key);
+      this.turnFactsSince.delete(key);
       try {
         results.push(await this.offloadFacts(list, options));
       } catch (error) {
         const current = this.turnFacts.get(key) ?? [];
         this.turnFacts.set(key, [...list, ...current]);
+        if (since !== void 0) this.turnFactsSince.set(key, since);
         continue;
       }
     }
@@ -6632,6 +6707,34 @@ ${latestSnapshot}`;
     }
   }
   const TURN_FLUSH_MAX = 40;
+  const TURN_FLUSH_MAX_MS = 30 * 60 * 1e3;
+  let lastTurnFlushAttemptAt = 0;
+  function maybeFlushTurnFacts(stepSessionId) {
+    if (!offloader.connected) return;
+    const stale = offloader.staleOwners(TURN_FLUSH_MAX_MS);
+    if (stale.length === 0) return;
+    const now = Date.now();
+    if (now - lastTurnFlushAttemptAt < 6e4) return;
+    lastTurnFlushAttemptAt = now;
+    const owner = stepSessionId !== void 0 && stepSessionId.length > 0 ? stepSessionId : currentSessionId;
+    for (const sessionId of stale) {
+      const age = offloader.pendingAgeMs(sessionId);
+      const intoPool = sessionId === owner;
+      void offloader.flushTurn(sessionId, { intoPool }).then((result) => {
+        if (result.distilled === 0) return;
+        if (intoPool && result.snapshot.length > 0 && snapshotChanged(latestSnapshot, result.snapshot)) {
+          saveSnapshot(result.snapshot, owner);
+        }
+        ctx.logger.info(
+          `[lrc] 暂存桶已滞留 ${Math.round(age / 6e4)} 分钟${intoPool ? "" : "（旧会话）"}，提前沉淀 ${result.distilled} 条（折叠 ${result.folded ?? 0} 条，写入 ${result.written}）`
+        );
+      }).catch((error) => {
+        ctx.logger.warn(
+          `[lrc] 超时提前沉淀失败（不影响对话）：${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+    }
+  }
   function collectMinutesConclusions(facts, ownerSessionId, label, explicitSlot) {
     if (facts.length === 0) return;
     const slot = explicitSlot ?? (liveTurn !== void 0 && liveTurnSessionId === ownerSessionId ? liveTurn : [...finishingTurns].reverse().find((t) => t.sessionId === ownerSessionId));
@@ -6843,7 +6946,10 @@ ${latestSnapshot}`;
       );
       return;
     }
-    ctx.logger.info(`[lrc] 记忆沉淀已就绪：${client.baseUrl}`);
+    const lrcVersion = runtime.status().version;
+    ctx.logger.info(
+      `[lrc] 记忆沉淀已就绪：${client.baseUrl}` + (lrcVersion === void 0 ? "" : `（LRC v${lrcVersion}）`)
+    );
     void bootstrapSnapshot();
     drainProseBacklog();
   })();
@@ -7406,6 +7512,8 @@ ${latestSnapshot}`;
       retryPendingMinutes();
     }
     maybeWriteStageMinutes();
+    const stepSessionId = payload?.agent?.session?.id;
+    maybeFlushTurnFacts(typeof stepSessionId === "string" ? stepSessionId : void 0);
     const decision = await next();
     if (decision !== null && typeof decision === "object") {
       const d = decision;
@@ -7861,7 +7969,8 @@ ${chunk}${tail}`,
             `- 累计：成功 ${conn.successes} 次 / 失败 ${conn.failures} 次（连续 ${conn.consecutiveFailures}）`
           );
           lines.push(
-            `- 运行时：${rt.mode}｜连续降级 ${rt.degradeCount} 次｜下次重探 ${Math.ceil(rt.retryInMs / 1e3)}s`
+            // 版本只在探测瞬间取一次，服务端热升级后这里不会自动变，故标注「探测时」
+            `- 运行时：${rt.mode}${rt.version === void 0 ? "" : `（探测时 LRC v${rt.version}）`}｜连续降级 ${rt.degradeCount} 次｜下次重探 ${Math.ceil(rt.retryInMs / 1e3)}s`
           );
           if (conn.lastError !== void 0 && conn.state !== "ready") {
             lines.push(`- 最近错误：${conn.lastError}`);
@@ -7890,7 +7999,7 @@ ${chunk}${tail}`,
           lines.push(`查重窗口：${stats.recentWindow} 块`);
           const turnPending = offloader.turnPending();
           if (turnPending > 0) {
-            lines.push(`本轮暂存：${turnPending} 条待轮末沉淀（turn/end 或下次 turn/start 时写入）`);
+            lines.push(`暂存（含旧会话）：${turnPending} 条待轮末沉淀（turn/end 或下次 turn/start 时写入）`);
           }
           if (stats.foldBatches > 0) {
             const ratio = (stats.totalFolded / stats.foldBatches).toFixed(1);
